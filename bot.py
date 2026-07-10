@@ -38,6 +38,8 @@ import database as db
 
 load_dotenv()
 
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -211,6 +213,24 @@ async def process_booking(callback: CallbackQuery):
 
     db.create_booking(user_id=user["id"], game_id=game_id)
 
+# 👇 СЮДА ВСТАВЛЯЕМ КОД УВЕДОМЛЕНИЯ
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+if ADMIN_CHAT_ID:
+    # Получаем данные о пользователе и игре (они у вас уже есть)
+    notification_text = (
+        f"🔔 **Новая заявка!**\n\n"
+        f"👤 Имя: {user_name}\n"
+        f"📞 Телефон: {user_phone}\n"
+        f"🎾 Игра: {game_name}\n"
+        f"📅 Дата: {game_date}\n"
+        f"🆔 ID заявки: {booking_id}"
+    )
+    try:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=notification_text, parse_mode="Markdown")
+    except Exception as e:
+        print(f"Ошибка отправки уведомления: {e}")
+
+# ... дальше ваш код (ответ пользователю, кнопки и т.д.)
     await callback.answer("Заявка отправлена! ✅")
     await callback.message.answer(
         f"Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
