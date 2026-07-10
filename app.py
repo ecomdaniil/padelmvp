@@ -30,6 +30,10 @@ from openpyxl import Workbook
 
 import database as db
 
+import threading
+import asyncio
+from bot import main as bot_main
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -236,6 +240,18 @@ def report_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+def run_bot():
+    """Запуск Telegram-бота в отдельном потоке"""
+    try:
+        asyncio.run(bot_main())
+    except Exception as e:
+        print(f"Ошибка запуска бота: {e}")
 
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+if __name__ == '__main__':
+    # Запускаем бота в фоновом потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    print("Бот запущен в фоновом режиме")
+    
+    # Запускаем Flask-сервер (CRM)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
