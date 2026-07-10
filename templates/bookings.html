@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Заявки</h1>
+    <table>
+        <tr>
+            <th>Игрок</th><th>Телефон</th><th>Игра</th><th>Статус</th><th>Изменить статус</th>
+        </tr>
+        {% for b in bookings %}
+        <tr>
+            <td>{{ b.user_name }}</td>
+            <td>{{ b.user_phone }}</td>
+            <td>{{ b.game_date.strftime('%d.%m.%Y') }} {{ b.game_time.strftime('%H:%M') }} — {{ b.location }}</td>
+            <td>
+                {% if b.status == 'новая' %}
+                    <span class="badge badge-new">новая</span>
+                {% elif b.status == 'подтверждена' %}
+                    <span class="badge badge-confirmed">подтверждена</span>
+                {% else %}
+                    <span class="badge badge-cancelled">{{ b.status }}</span>
+                {% endif %}
+            </td>
+            <td>
+                <form method="post" action="{{ url_for('booking_update_status', booking_id=b.id) }}" style="display:flex; gap:6px;">
+                    <select name="status">
+                        <option value="новая" {% if b.status == 'новая' %}selected{% endif %}>новая</option>
+                        <option value="подтверждена" {% if b.status == 'подтверждена' %}selected{% endif %}>подтверждена</option>
+                        <option value="отменена" {% if b.status == 'отменена' %}selected{% endif %}>отменена</option>
+                    </select>
+                    <button class="btn" type="submit">Сохранить</button>
+                </form>
+            </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">Заявок пока нет.</td></tr>
+        {% endfor %}
+    </table>
+{% endblock %}

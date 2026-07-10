@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Оплаты</h1>
+    <table>
+        <tr>
+            <th>Игрок</th><th>Игра</th><th>Сумма</th><th>Статус</th><th></th>
+        </tr>
+        {% for p in payments %}
+        <tr>
+            <td>{{ p.user_name }}</td>
+            <td>{{ p.game_date.strftime('%d.%m.%Y') }} {{ p.game_time.strftime('%H:%M') }} — {{ p.location }}</td>
+            <td>{{ p.amount }} ₽</td>
+            <td>
+                {% if p.status == 'подтверждена' %}
+                    <span class="badge badge-confirmed">подтверждена</span>
+                {% else %}
+                    <span class="badge badge-new">ожидает</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if p.status != 'подтверждена' %}
+                <form method="post" action="{{ url_for('payment_confirm', payment_id=p.id) }}">
+                    <button class="btn" type="submit">Подтвердить оплату</button>
+                </form>
+                {% endif %}
+            </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">Оплат пока нет.</td></tr>
+        {% endfor %}
+    </table>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Игры</h1>
+    <div class="top-actions">
+        <a class="btn" href="{{ url_for('game_new') }}">+ Создать игру</a>
+        <a class="btn btn-secondary" href="{{ url_for('report_excel') }}">📊 Выгрузить отчёт в Excel</a>
+    </div>
+    <table>
+        <tr>
+            <th>Дата</th><th>Время</th><th>Место</th><th>Цена</th>
+            <th>Мест</th><th>Записалось</th><th>Собрано оплат</th><th></th>
+        </tr>
+        {% for g in games %}
+        <tr>
+            <td>{{ g.game_date.strftime('%d.%m.%Y') }}</td>
+            <td>{{ g.game_time.strftime('%H:%M') }}</td>
+            <td>{{ g.location }}</td>
+            <td>{{ g.price }} ₽</td>
+            <td>{{ g.taken }} / {{ g.total_slots }}</td>
+            <td>{{ g.taken }}</td>
+            <td>{{ g.collected }} ₽</td>
+            <td><a class="btn btn-secondary" href="{{ url_for('game_edit', game_id=g.id) }}">Изменить</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8">Игр пока нет. Создайте первую!</td></tr>
+        {% endfor %}
+    </table>
+{% endblock %}
