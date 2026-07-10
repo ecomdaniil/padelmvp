@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Отзывы</h1>
+    <table>
+        <tr>
+            <th>Игрок</th><th>Оценка</th><th>Текст отзыва</th><th>Дата</th>
+        </tr>
+        {% for r in reviews %}
+        <tr>
+            <td>{{ r.user_name }}</td>
+            <td>{{ '⭐' * r.rating }}</td>
+            <td>{{ r.text }}</td>
+            <td>{{ r.created_at.strftime('%d.%m.%Y') }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4">Отзывов пока нет.</td></tr>
+        {% endfor %}
+    </table>
+{% endblock %}

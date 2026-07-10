@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>{% if game %}Редактировать игру{% else %}Новая игра{% endif %}</h1>
+    <form method="post" style="background:white; padding:20px; border-radius:8px; max-width:400px;">
+        <p>
+            <label>Дата<br>
+            <input type="date" name="game_date" required
+                   value="{{ game.game_date.isoformat() if game else '' }}">
+            </label>
+        </p>
+        <p>
+            <label>Время<br>
+            <input type="time" name="game_time" required
+                   value="{{ game.game_time.strftime('%H:%M') if game else '' }}">
+            </label>
+        </p>
+        <p>
+            <label>Место<br>
+            <input type="text" name="location" required style="width:100%"
+                   value="{{ game.location if game else '' }}">
+            </label>
+        </p>
+        <p>
+            <label>Цена (₽)<br>
+            <input type="number" step="0.01" name="price" required
+                   value="{{ game.price if game else '' }}">
+            </label>
+        </p>
+        <p>
+            <label>Количество мест<br>
+            <input type="number" name="total_slots" required
+                   value="{{ game.total_slots if game else '' }}">
+            </label>
+        </p>
+        <button class="btn" type="submit">Сохранить</button>
+        <a class="btn btn-secondary" href="{{ url_for('games_list') }}">Отмена</a>
+    </form>
+{% endblock %}
