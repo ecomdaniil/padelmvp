@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>О клубе</h1>
+    <div style="background: white; padding: 24px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+        <form method="post" action="{{ url_for('about_club_update') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Название клуба</label>
+                <input type="text" name="name" value="{{ club_info.name if club_info else '' }}" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 16px;">
+            </div>
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Описание</label>
+                <textarea name="description" rows="4" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;">{{ club_info.description if club_info else '' }}</textarea>
+            </div>
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Контактный телефон</label>
+                <input type="text" name="contact_phone" value="{{ club_info.contact_phone if club_info else '' }}" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
+            </div>
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Контактный email</label>
+                <input type="email" name="contact_email" value="{{ club_info.contact_email if club_info else '' }}" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
+            </div>
+            <button type="submit" class="btn">Сохранить изменения</button>
+        </form>
+    </div>
+{% endblock %}

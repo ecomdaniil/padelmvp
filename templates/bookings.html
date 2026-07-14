@@ -1,6 +1,23 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>Заявки</h1>
+    <div style="background: white; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+        <form method="get" style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+                <input type="text" name="search" placeholder="Поиск по имени или телефону..." value="{{ request.args.get('search', '') }}" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div>
+                <select name="status" style="padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="">Все статусы</option>
+                    <option value="новая" {% if request.args.get('status') == 'новая' %}selected{% endif %}>новая</option>
+                    <option value="подтверждена" {% if request.args.get('status') == 'подтверждена' %}selected{% endif %}>подтверждена</option>
+                    <option value="отменена" {% if request.args.get('status') == 'отменена' %}selected{% endif %}>отменена</option>
+                </select>
+            </div>
+            <button type="submit" class="btn">Фильтровать</button>
+            <a href="{{ url_for('bookings_list') }}" class="btn btn-secondary">Сбросить</a>
+        </form>
+    </div>
     <table>
         <tr>
             <th>Игрок</th><th>Телефон</th><th>Игра</th><th>Статус</th><th>Изменить статус</th>
@@ -21,6 +38,7 @@
             </td>
             <td>
                 <form method="post" action="{{ url_for('booking_update_status', booking_id=b.id) }}" style="display:flex; gap:6px;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <select name="status">
                         <option value="новая" {% if b.status == 'новая' %}selected{% endif %}>новая</option>
                         <option value="подтверждена" {% if b.status == 'подтверждена' %}selected{% endif %}>подтверждена</option>
@@ -34,4 +52,5 @@
         <tr><td colspan="5">Заявок пока нет.</td></tr>
         {% endfor %}
     </table>
+    {% include "_pagination.html" %}
 {% endblock %}

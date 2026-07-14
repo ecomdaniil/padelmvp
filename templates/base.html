@@ -2,95 +2,386 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Padel CRM</title>
     <style>
+        :root {
+            --bg: linear-gradient(135deg, #eef6ff 0%, #f8fbff 100%);
+            --panel: rgba(255,255,255,0.94);
+            --panel-strong: #ffffff;
+            --text: #0f172a;
+            --muted: #64748b;
+            --primary: #2563eb;
+            --primary-2: #1d4ed8;
+            --border: rgba(37,99,235,0.18);
+            --shadow: 0 18px 48px rgba(15,23,42,0.12);
+            --nav: linear-gradient(135deg, #07182f 0%, #0b3d87 42%, #1362e1 100%);
+            --court: rgba(37,99,235,0.14);
+            --court-strong: rgba(255,255,255,0.48);
+            --accent: rgba(37,99,235,0.12);
+            --surface: rgba(255,255,255,0.78);
+            --surface-2: rgba(248,250,252,0.96);
+            --hover-glow: rgba(37,99,235,0.12);
+            --grid-line: rgba(37,99,235,0.10);
+            --grid-line-2: rgba(255,255,255,0.45);
+            --glass-bg: linear-gradient(135deg, rgba(255,255,255,0.78), rgba(248,250,252,0.62));
+            --glass-border: rgba(255,255,255,0.38);
+            --glass-shadow: inset 0 1px 0 rgba(255,255,255,0.45), 0 16px 44px rgba(15,23,42,0.12);
+        }
         * { box-sizing: border-box; }
+        html {
+            background: var(--bg);
+            min-height: 100%;
+        }
         body {
             font-family: -apple-system, "Segoe UI", Arial, sans-serif;
-            background: #f4f6f8;
+            background: var(--bg);
             margin: 0;
-            color: #1f2937;
+            color: var(--text);
+            position: relative;
+            min-height: 100vh;
+            overflow-x: hidden;
         }
+        html, body { min-height: 100%; }
+        html { color-scheme: light; }
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(90deg, var(--grid-line) 1px, transparent 1px),
+                linear-gradient(0deg, var(--grid-line-2) 1px, transparent 1px);
+            background-size: 44px 44px, 44px 44px;
+            opacity: 0.42;
+            mask-image: linear-gradient(180deg, rgba(0,0,0,0.95), rgba(0,0,0,0.34));
+        }
+        body::after {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at top right, rgba(79,140,255,0.18), transparent 34%), radial-gradient(circle at bottom left, rgba(125,211,252,0.12), transparent 28%);
+            opacity: 0.9;
+        }
+        .cursor-glow { display: none; }
+        nav, .container { position: relative; z-index: 1; }
         nav {
-            background: #14532d;
-            padding: 14px 24px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            background: var(--nav);
+            padding: 16px 24px;
             display: flex;
             align-items: center;
-            gap: 20px;
+            gap: 10px;
+            box-shadow: 0 10px 36px rgba(0,0,0,0.18);
+            flex-wrap: wrap;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            overflow: hidden;
+        }
+        nav::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        .nav-links {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+            flex: 1;
+        }
+        .nav-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-left: auto;
+        }
+        .nav-toggle {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            width: 40px;
+            height: 40px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(255,255,255,0.1);
+            color: #ffffff;
+            cursor: pointer;
+            margin-left: auto;
         }
         nav a {
-            color: #e5f5ea;
+            color: #e8edf5;
             text-decoration: none;
-            font-weight: 500;
+            font-weight: 600;
+            padding: 8px 12px;
+            border-radius: 999px;
+            transition: background 0.2s ease, color 0.2s ease, transform 0.2s ease;
+            font-size: 14px;
+            position: relative;
         }
-        nav a:hover { color: #ffffff; }
-        nav .brand { font-weight: 700; font-size: 18px; color: #fff; margin-right: 10px; }
-        nav .spacer { flex: 1; }
-        .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
-        h1 { font-size: 22px; margin-bottom: 20px; }
+        nav a:hover {
+            color: #ffffff;
+            background: rgba(255,255,255,0.08);
+            transform: translateY(-1px);
+        }
+        nav .brand-block {
+            display: flex;
+            flex-direction: column;
+            margin-right: 8px;
+            min-width: 190px;
+            padding: 6px 10px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.09);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        nav .brand {
+            font-weight: 800;
+            font-size: 15px;
+            color: #fff;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        nav .brand-sub {
+            font-size: 10px;
+            color: rgba(255,255,255,0.74);
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+            margin-top: 2px;
+        }
+        @media (max-width: 980px) {
+            nav {
+                padding: 14px 16px;
+                gap: 8px;
+            }
+            .nav-toggle {
+                display: inline-flex;
+            }
+            .nav-links {
+                display: none;
+                width: 100%;
+                order: 4;
+                flex-direction: column;
+                align-items: flex-start;
+                padding-top: 10px;
+                border-top: 1px solid rgba(255,255,255,0.12);
+            }
+            .nav-links.open {
+                display: flex;
+            }
+            .nav-actions {
+                margin-left: 0;
+                margin-right: 8px;
+            }
+        }
+        @media (max-width: 640px) {
+            .nav-actions {
+                width: 100%;
+                justify-content: flex-end;
+                margin-top: 4px;
+            }
+            .container {
+                padding: 0 14px;
+            }
+        }
+        .theme-toggle {
+            display: none;
+        }
+        .container {
+            max-width: 1280px;
+            margin: 28px auto 44px;
+            padding: 0 22px;
+            animation: pageEnter 0.7s cubic-bezier(.2,.8,.2,1) both;
+            background: transparent;
+        }
+        @keyframes pageEnter {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        h1 { font-size: 24px; margin-bottom: 16px; color: var(--primary); }
         table {
             width: 100%;
             border-collapse: collapse;
-            background: white;
-            border-radius: 8px;
+            background: var(--panel-strong);
+            border-radius: 12px;
             overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+            box-shadow: var(--shadow);
+            border: 1px solid var(--border);
         }
         th, td {
             text-align: left;
-            padding: 10px 12px;
-            border-bottom: 1px solid #eee;
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
             font-size: 14px;
+            color: var(--text);
         }
-        th { background: #f0f2f4; font-weight: 600; }
+        th {
+            background: rgba(125,211,252,0.08);
+            font-weight: 700;
+            color: var(--primary);
+        }
         .btn {
             display: inline-block;
-            background: #14532d;
+            background: linear-gradient(90deg, var(--primary) 0%, var(--primary-2) 100%);
             color: white;
             padding: 8px 14px;
-            border-radius: 6px;
+            border-radius: 999px;
             text-decoration: none;
             font-size: 14px;
             border: none;
             cursor: pointer;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.2s ease;
+            box-shadow: 0 10px 20px rgba(37, 99, 235, 0.16);
         }
-        .btn:hover { background: #0f3d21; }
-        .btn-secondary { background: #6b7280; }
-        .btn-secondary:hover { background: #52525b; }
-        .top-actions { margin-bottom: 16px; display: flex; gap: 10px; }
+        .btn:hover { transform: translateY(-1px); filter: brightness(1.04); }
+        .btn-secondary { background: #64748b; box-shadow: none; }
+        .btn-secondary:hover { background: #475569; }
+        .top-actions { margin-bottom: 16px; display: flex; gap: 10px; flex-wrap: wrap; }
         .flash {
-            background: #fef3c7;
-            border: 1px solid #f59e0b;
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
             padding: 10px 14px;
-            border-radius: 6px;
+            border-radius: 12px;
             margin-bottom: 16px;
+            color: var(--text);
+            box-shadow: var(--glass-shadow);
         }
-        select, input {
-            padding: 6px 8px;
-            border-radius: 4px;
-            border: 1px solid #ccc;
+        select, input, textarea {
+            padding: 8px 10px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
             font-size: 14px;
+            background: #ffffff;
+            color: #0f172a;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
+        }
+        select:focus, input:focus, textarea:focus {
+            outline: none;
+            border-color: rgba(37,99,235,0.45);
+            background: #ffffff;
+            box-shadow: 0 0 0 2px rgba(37,99,235,0.14);
+        }
+        input:-webkit-autofill,
+        input:-webkit-autofill:hover,
+        input:-webkit-autofill:focus {
+            -webkit-text-fill-color: #0f172a;
+            -webkit-box-shadow: 0 0 0px 1000px #ffffff inset;
+            box-shadow: 0 0 0px 1000px #ffffff inset;
+            border-color: rgba(37,99,235,0.35);
         }
         .badge {
-            padding: 3px 8px;
-            border-radius: 12px;
+            padding: 4px 10px;
+            border-radius: 999px;
             font-size: 12px;
-            font-weight: 600;
+            font-weight: 700;
         }
-        .badge-new { background: #dbeafe; color: #1e40af; }
+        .badge-new { background: #dbeafe; color: #1d4ed8; }
         .badge-confirmed { background: #dcfce7; color: #166534; }
         .badge-cancelled { background: #fee2e2; color: #991b1b; }
+        .card, .stat-card {
+            transition: box-shadow 0.16s ease, border-color 0.16s ease;
+        }
+        .card:hover, .stat-card:hover {
+            box-shadow: 0 10px 28px rgba(0,0,0,0.12);
+            border-color: rgba(37,99,235,0.16);
+            background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%);
+        }
+        .card, .stat-card, .flash {
+            animation: panelEnter 0.6s cubic-bezier(.2,.8,.2,1) both;
+        }
+        @keyframes panelEnter {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .card {
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 22px;
+            box-shadow: var(--glass-shadow);
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: linear-gradient(135deg, var(--glass-bg) 0%, #f8fbff 100%);
+            border: 1px solid var(--glass-border);
+            border-radius: 22px;
+            padding: 16px;
+            box-shadow: var(--glass-shadow);
+            position: relative;
+            overflow: hidden;
+        }
+        .stat-card .label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+        .stat-card .value { font-size: 24px; font-weight: 800; color: var(--primary); margin-top: 6px; }
+        .card,
+        .stat-card,
+        table,
+        .flash,
+        select,
+        input,
+        textarea {
+            background-color: var(--panel-strong);
+            color: var(--text);
+            border-color: var(--border);
+        }
+        a, button, input, select, textarea, .card, .stat-card, table, .btn {
+            position: relative;
+        }
+        a:hover, button:hover, input:hover, select:hover, textarea:hover, .card:hover, .stat-card:hover, table:hover, .btn:hover {
+            box-shadow: 0 0 0 1px rgba(255,255,255,0.02), 0 10px 24px rgba(0,0,0,0.16);
+        }
+        nav a:hover, .theme-toggle:hover {
+            box-shadow: none;
+        }
+        th,
+        td {
+            color: var(--text);
+            border-color: var(--border);
+        }
+        .btn-secondary {
+            background: #64748b;
+            color: #ffffff;
+        }
     </style>
 </head>
 <body>
+    <div class="cursor-glow" aria-hidden="true"></div>
     <nav>
-        <span class="brand">🎾 Padel CRM</span>
-        <a href="{{ url_for('games_list') }}">Игры</a>
-        <a href="{{ url_for('bookings_list') }}">Заявки</a>
-        <a href="{{ url_for('payments_list') }}">Оплаты</a>
-        <a href="{{ url_for('reviews_list') }}">Отзывы</a>
-        <div class="spacer"></div>
-        <a href="{{ url_for('logout') }}">Выйти</a>
+        <div class="brand-block">
+            <span class="brand">Padel Clubs Moscow</span>
+            <span class="brand-sub">Private club operations</span>
+        </div>
+        <button class="nav-toggle" type="button" aria-label="Открыть меню">☰</button>
+        <div class="nav-links">
+            <a href="{{ url_for('index') }}">Главная</a>
+            <a href="{{ url_for('games_list') }}">Игры</a>
+            <a href="{{ url_for('bookings_list') }}">Заявки</a>
+            <a href="{{ url_for('payments_list') }}">Оплаты</a>
+            <a href="{{ url_for('visits_list') }}">Посещения</a>
+            <a href="{{ url_for('clubs_list') }}">Клубы</a>
+            <a href="{{ url_for('logs_list') }}">Журнал</a>
+            <a href="{{ url_for('about_club') }}">О клубе</a>
+            <a href="{{ url_for('reviews_list') }}">Отзывы</a>
+        </div>
+        <div class="nav-actions">
+            <form method="post" action="{{ url_for('logout') }}" style="margin:0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" style="background:none; border:none; color:#e8edf5; font-weight:600; font-size:14px; cursor:pointer; padding:8px 12px;">Выйти</button>
+            </form>
+        </div>
     </nav>
     <div class="container">
         {% with messages = get_flashed_messages() %}
@@ -102,5 +393,14 @@
         {% endwith %}
         {% block content %}{% endblock %}
     </div>
+    <script>
+        const navToggle = document.querySelector('.nav-toggle');
+        const navLinks = document.querySelector('.nav-links');
+        if (navToggle && navLinks) {
+            navToggle.addEventListener('click', function () {
+                navLinks.classList.toggle('open');
+            });
+        }
+    </script>
 </body>
 </html>
