@@ -13,6 +13,7 @@ database.py
 import logging
 import os
 import threading
+import time
 
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
@@ -97,6 +98,40 @@ class _PooledConnection:
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
+
+
+_keepalive_started = False
+_keepalive_lock = threading.Lock()
+
+
+def start_keepalive_thread(interval_seconds: int = 180) -> None:
+    """Фоновый поток, держащий БД "тёплой" для CRM — тот же смысл, что и
+    database_async.keepalive_loop() для бота: Neon приостанавливает
+    вычислительный узел после простоя, и без периодических запросов первая
+    открытая после паузы страница CRM ждала бы "холодный старт" (секунды).
+    Idempotent — повторный вызов (например, если WSGI-обёртка импортирует
+    модуль дважды) не запустит второй поток."""
+    global _keepalive_started
+    with _keepalive_lock:
+        if _keepalive_started:
+            return
+        _keepalive_started = True
+
+    def _loop():
+        while True:
+            time.sleep(interval_seconds)
+            try:
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
+                conn.close()
+            except Exception:
+                # Сеть/БД могли на секунду моргнуть — следующая попытка
+                # через interval_seconds всё исправит, поток не должен упасть.
+                pass
+
+    threading.Thread(target=_loop, daemon=True, name="db-keepalive").start()
 
 
 def get_connection():
@@ -337,6 +372,13 @@ def _migrate_admin_logs_table(cur):
     """)
     cur.execute("ALTER TABLE admin_logs ADD COLUMN IF NOT EXISTS old_value TEXT;")
     cur.execute("ALTER TABLE admin_logs ADD COLUMN IF NOT EXISTS new_value TEXT;")
+    # description — человекочитаемый текст на русском ("Игра №9 создана: ...")
+    # для отображения в /logs. Раньше туда же пытались показывать old_value/
+    # new_value (JSON всей строки сущности) — нечитаемо для админа. Старые
+    # записи (созданные до этого изменения) description не имеют — logs.html
+    # для них показывает old_value/new_value как раньше, с пометкой
+    # «устаревший формат».
+    cur.execute("ALTER TABLE admin_logs ADD COLUMN IF NOT EXISTS description TEXT;")
 
 
 def _migrate_bookings_table(cur):
@@ -774,7 +816,8 @@ def update_booking_status(booking_id: int, status: str):
 
 def update_booking_status_and_get(booking_id: int, status: str):
     """Меняет статус заявки и возвращает обновлённую строку + старый статус
-    за 1 round-trip (вместо отдельных get_booking_by_id + update_booking_status).
+    + имя игрока за 1 round-trip (вместо отдельных get_booking_by_id +
+    update_booking_status + запроса имени для журнала действий).
     old_status берётся из подзапроса на состояние ДО обновления — Postgres
     вычисляет его атомарно в рамках одного UPDATE, так что это безопасно."""
     conn = get_connection()
@@ -783,9 +826,14 @@ def update_booking_status_and_get(booking_id: int, status: str):
         """
         UPDATE bookings AS b
         SET status = %s
-        FROM (SELECT status FROM bookings WHERE id = %s) AS old
+        FROM (
+            SELECT bk.status, u.name AS user_name
+            FROM bookings bk
+            JOIN users u ON u.id = bk.user_id
+            WHERE bk.id = %s
+        ) AS old
         WHERE b.id = %s
-        RETURNING b.*, old.status AS old_status
+        RETURNING b.*, old.status AS old_status, old.user_name AS user_name
         """,
         (status, booking_id, booking_id),
     )
@@ -1131,6 +1179,32 @@ def confirm_payment(payment_id: int):
     conn.close()
 
 
+def get_payment_notification_context(payment_id: int):
+    """Данные, нужные, чтобы уведомить игрока в Telegram сразу после того,
+    как админ подтвердил его оплату в CRM: telegram_id игрока + когда/где
+    игра. Один запрос с джойнами вместо нескольких точечных выборок."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT p.id AS payment_id, p.amount, p.status,
+               u.telegram_id, u.name AS user_name,
+               b.id AS booking_id, b.slots_count,
+               g.game_date, g.game_time, g.location
+        FROM payments p
+        JOIN bookings b ON b.id = p.booking_id
+        JOIN users u ON u.id = b.user_id
+        JOIN games g ON g.id = b.game_id
+        WHERE p.id = %s
+        """,
+        (payment_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
 def get_confirmed_payments_sum_for_game(game_id: int):
     conn = get_connection()
     cur = conn.cursor()
@@ -1192,6 +1266,34 @@ def mark_booking_visited(booking_id: int):
     conn.commit()
     cur.close()
     conn.close()
+
+
+def mark_booking_visited_and_get(booking_id: int):
+    """Как mark_booking_visited, но сразу возвращает обновлённую строку и имя
+    игрока (для человекочитаемой записи в журнале действий) — без отдельного
+    запроса имени."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE bookings AS b
+        SET status = 'посещена'
+        FROM (
+            SELECT u.name AS user_name
+            FROM bookings bk
+            JOIN users u ON u.id = bk.user_id
+            WHERE bk.id = %s
+        ) AS info
+        WHERE b.id = %s
+        RETURNING b.*, info.user_name AS user_name
+        """,
+        (booking_id, booking_id),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
 
 
 def get_all_visits():
@@ -1329,20 +1431,24 @@ def log_action(
     action: str,
     entity_type: str = None,
     entity_id: int = None,
+    description: str = None,
     old_value: str = None,
     new_value: str = None,
     details: str = None,
 ):
     """Записывает действие администратора в журнал (admin_logs).
 
-    old_value/new_value — строковое (обычно JSON) представление сущности до
-    и после изменения; details — свободный текст, если нужен доп. комментарий."""
+    description — человекочитаемый текст на русском ("Игра №9 создана: ...",
+    "Статус оплаты для брони №5 изменён с «ожидает» на «подтверждена»") —
+    именно он показывается в /logs. old_value/new_value оставлены для
+    редких случаев, когда нужно сохранить простое старое/новое значение
+    (например статус) отдельно от текста; details — свободный комментарий."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO admin_logs (action, entity_type, entity_id, old_value, new_value, details)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
-        (action, entity_type, entity_id, old_value, new_value, details),
+        """INSERT INTO admin_logs (action, entity_type, entity_id, description, old_value, new_value, details)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+        (action, entity_type, entity_id, description, old_value, new_value, details),
     )
     conn.commit()
     cur.close()

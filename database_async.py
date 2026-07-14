@@ -75,6 +75,35 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
+async def keepalive_loop(interval_seconds: int = 180) -> None:
+    """Не даёт БД "заснуть" между сообщениями пользователей.
+
+    Neon (как и большинство serverless Postgres) отключает вычислительный
+    узел после нескольких минут без активных запросов, чтобы не тратить
+    ресурсы впустую. Это и есть причина задержки ~5 секунд на /start или
+    первое сообщение после долгого перерыва — Neon поднимает узел заново
+    ("холодный старт"), и первый же запрос к БД ждёт этого пробуждения.
+    Приложение здесь ничего "не тормозит" — простой SELECT 1 каждые
+    interval_seconds не даёт простою наступить, и все запросы (включая
+    самый первый после паузы) остаются быстрыми.
+
+    Запускается как фоновая задача сразу после старта пула (см. bot.py:main
+    и app.py:run_bot). interval_seconds=180 (3 минуты) — с запасом меньше
+    типичного тайм-аута автоотключения (обычно 5 минут)."""
+    pool = await get_pool()
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Сеть/БД могли на секунду моргнуть — не роняем фоновую задачу,
+            # следующая попытка через interval_seconds всё исправит.
+            pass
+        await asyncio.sleep(interval_seconds)
+
+
 async def close_pool() -> None:
     global _pool
     if _pool is not None:

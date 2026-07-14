@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import secrets
+import urllib.request
 from datetime import datetime
 from functools import wraps
 
@@ -105,6 +106,37 @@ if not ADMIN_LOGIN or not ADMIN_PASSWORD:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 
+
+def send_telegram_message(chat_id, text: str) -> bool:
+    """Отправляет сообщение игроку прямо из CRM через HTTPS Bot API — в
+    обход bot_instance/bot_loop (см. run_bot()) специально: те существуют
+    только если RUN_BOT_IN_BACKGROUND=1 и бот уже успел стартовать в этом же
+    процессе, а прямой вызов Bot API работает всегда, независимо от того,
+    как и где запущен бот (в этом же процессе, отдельным сервисом,
+    webhook/long polling). Синхронный urllib с коротким таймаутом — здесь
+    не нужен отдельный HTTP-клиент только для одного вызова в секунду.
+    Ошибка не должна ронять действие админа (подтверждение оплаты и т.п.),
+    поэтому она только логируется, исключение наружу не уходит."""
+    if not BOT_TOKEN or not chat_id:
+        return False
+    try:
+        payload = json.dumps({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception as e:
+        logger.error("Не удалось отправить сообщение игроку (chat_id=%s): %s", chat_id, e)
+        return False
+
 DEFAULT_PAGE_SIZE = int(os.getenv("CRM_PAGE_SIZE", "20"))
 
 # Тот же набор уровней, что и в боте (см. bot.py: VALID_LEVELS) — продублирован
@@ -123,25 +155,117 @@ bot_loop = None
 # ---------------------------------------------------------------------------
 # Журнал действий администратора (admin_logs)
 # ---------------------------------------------------------------------------
+#
+# Раньше в new_value/old_value писался json.dumps() всей строки сущности —
+# в /logs это выглядело как нечитаемый {"game": {"id": 9, ...}}. Теперь
+# каждый вызывающий код сам формирует человекочитаемый текст на русском
+# (description) — что именно произошло, — а не сырой снимок объекта.
+# Переводы кодов action/entity_type для колонок журнала:
+ACTION_LABELS = {
+    "create": "Создание",
+    "update": "Редактирование",
+    "delete": "Удаление",
+    "update_status": "Изменение статуса",
+    "confirm": "Подтверждение оплаты",
+    "mark_visited": "Отметка посещения",
+}
+ENTITY_LABELS = {
+    "game": "Игра",
+    "booking": "Бронирование",
+    "payment": "Оплата",
+    "club": "Клуб",
+    "club_info": "Информация о клубе",
+}
+app.jinja_env.filters["action_label"] = lambda a: ACTION_LABELS.get(a, a or "—")
+app.jinja_env.filters["entity_label"] = lambda e: ENTITY_LABELS.get(e, e) if e else "—"
 
-def _json_dump(value):
-    """dict/список -> JSON-строка для old_value/new_value; None остаётся None.
-    default=str — чтобы date/time/Decimal из psycopg2 не роняли json.dumps."""
-    if value is None:
-        return None
-    return json.dumps(value, ensure_ascii=False, default=str)
+
+def _ru_plural(n, one: str, few: str, many: str) -> str:
+    """Русское склонение по числу: 1 место / 2 места / 5 мест."""
+    n = abs(int(n))
+    if n % 100 in (11, 12, 13, 14):
+        return many
+    last = n % 10
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
 
 
-def log_admin_action(action, entity_type=None, entity_id=None, old=None, new=None, details=None):
-    """Тонкая обёртка над db.log_action: сериализует old/new в JSON и никогда
-    не роняет основной запрос, если запись в журнал вдруг не удалась."""
+def _fmt_money(value) -> str:
+    return f"{float(value):.0f}"
+
+
+def _fmt_date(d) -> str:
+    return d.strftime("%d.%m.%Y") if d else "—"
+
+
+def _fmt_time(t) -> str:
+    return str(t)[:5] if t else "—"
+
+
+def _describe_game_diff(old: dict, new: dict) -> str:
+    """Список изменённых полей игры в формате "поле изменено с X на Y" —
+    используется в описании действия "update"/"game" в журнале."""
+    changes = []
+    if old.get("game_date") != new.get("game_date"):
+        changes.append(f"дата изменена с {_fmt_date(old.get('game_date'))} на {_fmt_date(new.get('game_date'))}")
+    if old.get("game_time") != new.get("game_time"):
+        changes.append(f"время изменено с {_fmt_time(old.get('game_time'))} на {_fmt_time(new.get('game_time'))}")
+    if (old.get("location") or "") != (new.get("location") or ""):
+        changes.append(f"место изменено с «{old.get('location') or '—'}» на «{new.get('location') or '—'}»")
+    if float(old.get("price") or 0) != float(new.get("price") or 0):
+        changes.append(f"цена изменена с {_fmt_money(old.get('price') or 0)} на {_fmt_money(new.get('price') or 0)} руб.")
+    if old.get("total_slots") != new.get("total_slots"):
+        changes.append(f"количество мест изменено с {old.get('total_slots')} на {new.get('total_slots')}")
+    if (old.get("duration_minutes") or 90) != (new.get("duration_minutes") or 90):
+        changes.append(
+            f"длительность изменена с {old.get('duration_minutes') or 90} "
+            f"на {new.get('duration_minutes') or 90} мин."
+        )
+    if (old.get("level") or "") != (new.get("level") or ""):
+        changes.append(f"уровень изменён с «{old.get('level') or '—'}» на «{new.get('level') or '—'}»")
+    return "; ".join(changes) if changes else "без изменений"
+
+
+def _describe_club_diff(old: dict, new: dict) -> str:
+    changes = []
+    if old.get("name") != new.get("name"):
+        changes.append(f"название изменено с «{old.get('name')}» на «{new.get('name')}»")
+    if old.get("address") != new.get("address"):
+        changes.append(f"адрес изменён с «{old.get('address')}» на «{new.get('address')}»")
+    if old.get("phone") != new.get("phone"):
+        changes.append(f"телефон изменён с «{old.get('phone')}» на «{new.get('phone')}»")
+    if (old.get("description") or "") != (new.get("description") or ""):
+        changes.append("описание изменено")
+    return "; ".join(changes) if changes else "без изменений"
+
+
+def _describe_club_info_diff(old: dict, new: dict) -> str:
+    labels = [("name", "название"), ("description", "описание"), ("contact_phone", "телефон"), ("contact_email", "email")]
+    changes = []
+    for key, label in labels:
+        if (old.get(key) or "") != (new.get(key) or ""):
+            changes.append(f"{label} изменён(о)")
+    return "; ".join(changes) if changes else "без изменений"
+
+
+def log_admin_action(action, entity_type=None, entity_id=None, description=None, old=None, new=None, details=None):
+    """Тонкая обёртка над db.log_action: description — человекочитаемый
+    текст на русском ("Игра №9 создана: ...") — именно он показывается в
+    журнале (/logs). old/new здесь — только простые строковые значения
+    (например статус "ожидает"/"подтверждена"), НЕ целые объекты — полные
+    словари сущностей туда больше не передаются, чтобы не плодить JSON.
+    Никогда не роняет основной запрос, если запись в журнал вдруг не удалась."""
     try:
         db.log_action(
             action=action,
             entity_type=entity_type,
             entity_id=entity_id,
-            old_value=_json_dump(old),
-            new_value=_json_dump(new),
+            description=description,
+            old_value=str(old) if old is not None else None,
+            new_value=str(new) if new is not None else None,
             details=details,
         )
     except Exception as e:
@@ -398,7 +522,13 @@ def game_new():
         # явного сброса здесь новая игра была видна в боте только после
         # истечения TTL кэша или перезапуска процесса бота.
         cache.invalidate_games_cache()
-        log_admin_action("create", "game", game["id"], new=dict(game))
+        description = (
+            f"Игра №{game['id']} создана: {game['location']}, "
+            f"{_fmt_date(game['game_date'])} {_fmt_time(game['game_time'])}, "
+            f"{game['total_slots']} {_ru_plural(game['total_slots'], 'место', 'места', 'мест')}, "
+            f"{_fmt_money(game['price'])} руб."
+        )
+        log_admin_action("create", "game", game["id"], description=description)
         flash("Игра создана")
         return redirect(url_for("games_list"))
 
@@ -445,7 +575,8 @@ def game_edit(game_id):
             level=parsed["level"],
         )
         cache.invalidate_games_cache()
-        log_admin_action("update", "game", game_id, old=old_snapshot, new=dict(updated))
+        description = f"Игра №{game_id} отредактирована: {_describe_game_diff(old_snapshot, dict(updated))}"
+        log_admin_action("update", "game", game_id, description=description)
         flash("Игра обновлена")
         return redirect(url_for("games_list"))
 
@@ -468,7 +599,11 @@ def game_delete(game_id):
     # число занятых мест по другим играм не меняется, но кэш списка игр,
     # который видит бот, всё равно нужно сбросить.
     cache.invalidate_games_cache()
-    log_admin_action("delete", "game", game_id, old=dict(game))
+    description = (
+        f"Игра №{game_id} удалена: {game['location']}, "
+        f"{_fmt_date(game['game_date'])} {_fmt_time(game['game_time'])}"
+    )
+    log_admin_action("delete", "game", game_id, description=description)
     flash("Игра удалена")
     return redirect(url_for("games_list"))
 
@@ -520,7 +655,15 @@ def booking_update_status(booking_id):
     # Смена статуса (особенно на/с "отменена") меняет число занятых мест,
     # которое бот показывает рядом с игрой — сбрасываем тот же кэш.
     cache.invalidate_games_cache()
-    log_admin_action("update_status", "booking", booking_id, old=old_status, new=new_status)
+    user_name = updated.get("user_name") or "—"
+    if new_status == "отменена":
+        description = f"Бронирование №{booking_id} отменено (игрок: {user_name})"
+    else:
+        description = (
+            f"Статус бронирования №{booking_id} изменён с «{old_status}» "
+            f"на «{new_status}» (игрок: {user_name})"
+        )
+    log_admin_action("update_status", "booking", booking_id, description=description, old=old_status, new=new_status)
 
     flash("Статус заявки обновлён")
     return redirect(url_for("bookings_list"))
@@ -548,8 +691,32 @@ def payments_list():
 @app.route("/payments/<int:payment_id>/confirm", methods=["POST"])
 @login_required
 def payment_confirm(payment_id):
+    # Контекст для уведомления игрока получаем ДО confirm_payment — если
+    # что-то пойдёт не так с отправкой сообщения, это не должно повлиять
+    # на сам факт подтверждения оплаты в базе.
+    context = db.get_payment_notification_context(payment_id)
     db.confirm_payment(payment_id)
-    log_admin_action("confirm", "payment", payment_id, old="ожидает", new="подтверждена")
+    if context:
+        description = (
+            f"Статус оплаты для брони №{context['booking_id']} изменён с «ожидает» "
+            f"на «подтверждена» (игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
+        )
+    else:
+        description = f"Статус оплаты №{payment_id} изменён с «ожидает» на «подтверждена»"
+    log_admin_action("confirm", "payment", payment_id, description=description, old="ожидает", new="подтверждена")
+
+    if context and context.get("telegram_id"):
+        game_dt = f"{context['game_date'].strftime('%d.%m.%Y')} в {str(context['game_time'])[:5]}"
+        text = (
+            "✅ <b>Оплата подтверждена!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 Сумма: {float(context['amount']):.0f} ₽\n"
+            f"📅 {game_dt}\n"
+            f"📍 {context['location']}\n\n"
+            "Ждём тебя на корте! 🎾"
+        )
+        send_telegram_message(context["telegram_id"], text)
+
     flash("Оплата подтверждена")
     return redirect(url_for("payments_list"))
 
@@ -569,8 +736,12 @@ def visits_list():
 @app.route("/visits/<int:booking_id>/mark", methods=["POST"])
 @login_required
 def visit_mark(booking_id):
-    db.mark_booking_visited(booking_id)
-    log_admin_action("mark_visited", "booking", booking_id, new="посещена")
+    updated = db.mark_booking_visited_and_get(booking_id)
+    if not updated:
+        flash("Заявка не найдена")
+        return redirect(url_for("visits_list"))
+    description = f"Посещение отмечено для брони №{booking_id} (игрок: {updated.get('user_name') or '—'})"
+    log_admin_action("mark_visited", "booking", booking_id, description=description, new="посещена")
     flash("Посещение отмечено")
     return redirect(url_for("visits_list"))
 
@@ -597,7 +768,8 @@ def club_new():
             phone=request.form["phone"],
             description=request.form.get("description", ""),
         )
-        log_admin_action("create", "club", club["id"], new=dict(club))
+        description = f"Клуб «{club['name']}» добавлен ({club['address']})"
+        log_admin_action("create", "club", club["id"], description=description)
         flash("Клуб добавлен")
         return redirect(url_for("clubs_list"))
     return render_template("club_form.html", club=None)
@@ -621,7 +793,8 @@ def club_edit(club_id):
             description=request.form.get("description", ""),
         )
         updated = db.get_club_by_id(club_id)
-        log_admin_action("update", "club", club_id, old=old_snapshot, new=dict(updated))
+        description = f"Клуб «{updated['name']}» отредактирован: {_describe_club_diff(old_snapshot, dict(updated))}"
+        log_admin_action("update", "club", club_id, description=description)
         flash("Клуб обновлён")
         return redirect(url_for("clubs_list"))
 
@@ -662,11 +835,11 @@ def about_club_update():
         contact_email=request.form.get("contact_email", ""),
     )
     new_info = db.get_club_info()
+    description = f"Информация о клубе обновлена: {_describe_club_info_diff(dict(old_info) if old_info else {}, dict(new_info) if new_info else {})}"
     log_admin_action(
         "update", "club_info",
         old_info["id"] if old_info else None,
-        old=dict(old_info) if old_info else None,
-        new=dict(new_info) if new_info else None,
+        description=description,
     )
     flash("Информация о клубе обновлена")
     return redirect(url_for("about_club"))
@@ -812,6 +985,9 @@ def run_bot():
 
     async def _startup():
         await db_async.get_pool()
+        # Держит БД "тёплой", чтобы /start и первое сообщение после паузы
+        # не ждали холодный старт Neon (~5с) — см. database_async.py:keepalive_loop.
+        asyncio.create_task(db_async.keepalive_loop())
         await setup_bot_commands(bot_instance)
 
         # Интервал 15 минут — чтобы надёжно попадать в более узкое окно
@@ -867,6 +1043,12 @@ def start_background_services():
     bot_thread.start()
     logger.info("Бот запущен в фоновом режиме")
 
+
+# Держит БД CRM "тёплой" независимо от того, запущен ли бот в этом же
+# процессе — тот же смысл, что и database_async.keepalive_loop() для бота
+# (см. её docstring): без этого первая страница CRM после долгого простоя
+# ждала бы холодный старт Neon.
+db.start_keepalive_thread()
 
 start_background_services()
 

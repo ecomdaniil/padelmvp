@@ -1468,6 +1468,9 @@ async def main():
     # Пул соединений asyncpg создаётся один раз на процесс бота, до старта
     # диспетчера — все обработчики дальше просто берут соединения из пула.
     await db.get_pool()
+    # Держит БД "тёплой", чтобы /start и первое сообщение после паузы не
+    # ждали холодный старт Neon (~5с) — см. db.keepalive_loop.
+    asyncio.create_task(db.keepalive_loop())
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
