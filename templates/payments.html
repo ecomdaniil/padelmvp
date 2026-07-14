@@ -19,13 +19,22 @@
     </div>
     <table>
         <tr>
-            <th>Игрок</th><th>Игра</th><th>Сумма</th><th>Статус</th><th></th>
+            <th>Игрок</th><th>Игра</th><th>Сумма</th><th>Способ</th><th>Статус</th><th></th>
         </tr>
         {% for p in payments %}
         <tr>
             <td>{{ p.user_name }}</td>
             <td>{{ p.game_date.strftime('%d.%m.%Y') }} {{ p.game_time.strftime('%H:%M') }} — {{ p.location }}</td>
             <td>{{ p.amount }} ₽</td>
+            <td>
+                {% if p.method == 'card' %}
+                    💳 Карта
+                {% elif p.method == 'sbp' %}
+                    📱 СБП
+                {% else %}
+                    <span style="color: #6b7280;">—</span>
+                {% endif %}
+            </td>
             <td>
                 {% if p.status == 'подтверждена' %}
                     <span class="badge badge-confirmed">подтверждена</span>
@@ -45,7 +54,7 @@
             </td>
         </tr>
         {% else %}
-        <tr><td colspan="5">Оплат пока нет.</td></tr>
+        <tr><td colspan="6">Оплат пока нет.</td></tr>
         {% endfor %}
     </table>
     {% include "_pagination.html" %}

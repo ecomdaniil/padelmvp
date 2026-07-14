@@ -34,6 +34,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openpyxl import Workbook
 
+import cache
 import database as db
 
 import threading
@@ -198,6 +199,10 @@ def game_new():
             price=request.form["price"],
             total_slots=request.form["total_slots"],
         )
+        # Бот кэширует список ближайших игр (см. cache.py/bot.py) — без
+        # явного сброса здесь новая игра была видна в боте только после
+        # истечения TTL кэша или перезапуска процесса бота.
+        cache.invalidate_games_cache()
         flash("Игра создана")
         return redirect(url_for("games_list"))
     return render_template("game_form.html", game=None)
@@ -220,6 +225,7 @@ def game_edit(game_id):
             price=request.form["price"],
             total_slots=request.form["total_slots"],
         )
+        cache.invalidate_games_cache()
         flash("Игра обновлена")
         return redirect(url_for("games_list"))
 
@@ -248,11 +254,21 @@ def booking_update_status(booking_id):
     new_status = request.form["status"]
     db.update_booking_status(booking_id, new_status)
 
-    # Если заявку подтвердили — сразу создаём запись об ожидаемой оплате
-    if new_status == "подтверждена":
+    # Если заявку подтвердили и оплаты для неё ещё нет — создаём запись об
+    # ожидаемой оплате. Проверка на существование обязательна: с тех пор,
+    # как бот сам предлагает оплату сразу после записи (см.
+    # process_booking_confirm в bot.py), платёж почти всегда уже существует
+    # к этому моменту — без проверки здесь создавался бы дублирующий
+    # payment на ту же заявку.
+    if new_status == "подтверждена" and not db.get_payment_for_booking(booking_id):
         booking = db.get_booking_by_id(booking_id)
         game = db.get_game_by_id(booking["game_id"])
-        db.create_payment(booking_id, game["price"])
+        amount = float(game["price"]) * booking.get("slots_count", 1)
+        db.create_payment(booking_id, amount)
+
+    # Смена статуса (особенно на/с "отменена") меняет число занятых мест,
+    # которое бот показывает рядом с игрой — сбрасываем тот же кэш.
+    cache.invalidate_games_cache()
 
     flash("Статус заявки обновлён")
     return redirect(url_for("bookings_list"))
@@ -480,8 +496,8 @@ def run_bot():
     через run_coroutine_threadsafe и использовать один и тот же asyncpg-пул."""
     global bot_instance, dp_instance, bot_loop
 
-    from bot import router, send_reminders
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from bot import router, send_reminders, setup_bot_commands
     import database_async as db_async
 
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -494,11 +510,25 @@ def run_bot():
     dp_instance = Dispatcher(storage=MemoryStorage())
     dp_instance.include_router(router)
 
+    scheduler = BackgroundScheduler()
+
+    def _reminders_job():
+        # BackgroundScheduler работает в СВОЁМ отдельном потоке — не может
+        # напрямую вызвать async send_reminders(), поэтому передаём корутину
+        # в event loop бота (см. bot.py:_make_reminder_job — тот же приём).
+        future = asyncio.run_coroutine_threadsafe(send_reminders(bot_instance), loop)
+        try:
+            future.result(timeout=60)
+        except Exception as e:
+            logger.error("Ошибка задачи напоминаний: %s", e)
+
     async def _startup():
         await db_async.get_pool()
+        await setup_bot_commands(bot_instance)
 
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(send_reminders, "interval", hours=1, args=[bot_instance])
+        # Интервал 15 минут — чтобы надёжно попадать в более узкое окно
+        # 2-часового напоминания (1ч45м-2ч15м), см. send_reminders в bot.py.
+        scheduler.add_job(_reminders_job, "interval", minutes=15)
         scheduler.start()
 
         if WEBHOOK_URL:
@@ -515,6 +545,7 @@ def run_bot():
     except Exception as e:
         logger.error("Ошибка запуска бота: %s", e)
     finally:
+        scheduler.shutdown(wait=False)
         try:
             loop.run_until_complete(db_async.close_pool())
         except Exception:
@@ -523,10 +554,25 @@ def run_bot():
 
 
 def start_background_services():
-    """Запускает бота в фоне только если явно разрешено в .env."""
+    """Запускает бота в фоне только если явно разрешено в .env.
+
+    Раньше здесь была проверка `if __name__ != "__main__": return`, из-за
+    которой фоновый бот фактически НИКОГДА не запускался под gunicorn
+    (gunicorn импортирует модуль как "app", а не выполняет его как скрипт,
+    поэтому __name__ всегда отличен от "__main__") — то есть
+    RUN_BOT_IN_BACKGROUND=1 из .env.example/deploy.md под gunicorn ничего
+    не делал, и webhook отвечал {"status": "bot not ready"}.
+
+    ВАЖНО про несколько gunicorn worker-процессов: каждый worker — это
+    отдельный процесс со своей памятью, поэтому при --workers>1 в каждом из
+    них поднимется собственный поток бота, свой APScheduler (напоминания
+    будут слаться по разу от каждого воркера) и свой in-memory кэш (см.
+    cache.py). Поэтому при RUN_BOT_IN_BACKGROUND=1 нужно либо запускать
+    gunicorn с --workers 1 (см. docker-compose.yml), либо переносить бота в
+    отдельный сервис/процесс (RUN_BOT_IN_BACKGROUND=0 + отдельный `python
+    bot.py`), и в обоих случаях — задавать REDIS_URL, если процессов больше
+    одного, чтобы кэш и rate-limit были общими."""
     if os.getenv("RUN_BOT_IN_BACKGROUND", "0").lower() in {"0", "false", "no"}:
-        return
-    if __name__ != "__main__":
         return
 
     bot_thread = threading.Thread(target=run_bot, daemon=True, name="padel-bot")
