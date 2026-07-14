@@ -12,7 +12,12 @@ services:
     # из другого воркера со старым кэшем. Если нужно больше 1 воркера для
     # пропускной способности CRM — задайте REDIS_URL (общий кэш/лимиты) и
     # выносите бота в отдельный сервис с RUN_BOT_IN_BACKGROUND=0.
-    command: gunicorn --workers 1 --bind 0.0.0.0:8000 app:app
+    #
+    # --worker-class gthread --threads 4: один процесс (см. выше), но
+    # несколько потоков — иначе gunicorn обрабатывает запросы СТРОГО по
+    # одному, и пока идёт медленный запрос (например, отправка сообщений в
+    # Telegram при бронировании), CRM-панель не отвечает вообще ни на что.
+    command: gunicorn --workers 1 --worker-class gthread --threads 4 --timeout 60 --bind 0.0.0.0:8000 app:app
     ports:
       - "8000:8000"
     env_file:

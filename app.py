@@ -17,6 +17,7 @@ CRM (веб-панель администратора) на Flask.
 """
 
 import io
+import json
 import logging
 import os
 import secrets
@@ -106,12 +107,45 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 
 DEFAULT_PAGE_SIZE = int(os.getenv("CRM_PAGE_SIZE", "20"))
 
+# Тот же набор уровней, что и в боте (см. bot.py: VALID_LEVELS) — продублирован
+# здесь, чтобы не тянуть в CRM тяжёлые импорты aiogram/бота только за одной
+# константой. Если список уровней поменяется — обновите его в обоих местах.
+GAME_LEVELS = ["Новичок", "Любитель", "Продвинутый", "Профессионал"]
+
 # Глобальные переменные для бота: единственные Bot/Dispatcher на процесс
 # (раньше bot.py создавал свою отдельную пару внутри main(), что приводило
 # к путанице — теперь webhook всегда обслуживается вот этими инстансами).
 bot_instance = None
 dp_instance = None
 bot_loop = None
+
+
+# ---------------------------------------------------------------------------
+# Журнал действий администратора (admin_logs)
+# ---------------------------------------------------------------------------
+
+def _json_dump(value):
+    """dict/список -> JSON-строка для old_value/new_value; None остаётся None.
+    default=str — чтобы date/time/Decimal из psycopg2 не роняли json.dumps."""
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def log_admin_action(action, entity_type=None, entity_id=None, old=None, new=None, details=None):
+    """Тонкая обёртка над db.log_action: сериализует old/new в JSON и никогда
+    не роняет основной запрос, если запись в журнал вдруг не удалась."""
+    try:
+        db.log_action(
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            old_value=_json_dump(old),
+            new_value=_json_dump(new),
+            details=details,
+        )
+    except Exception as e:
+        logger.error("Не удалось записать действие в журнал (%s %s#%s): %s", action, entity_type, entity_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -155,19 +189,31 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(err):
+    """Раньше необработанное исключение в любом роуте отдавало голый 500
+    (или, в неудачных случаях, вешало страницу до таймаута gunicorn) — для
+    админа это выглядело как «сайт упал». Теперь логируем полную трассировку
+    для отладки и возвращаем понятную страницу, СЕССИЯ (логин) при этом не
+    трогается — обновление страницы просто вернёт админа туда же."""
+    from werkzeug.exceptions import HTTPException
+
+    if isinstance(err, HTTPException):
+        return err
+    logger.exception("Необработанная ошибка при обработке %s %s", request.method, request.path)
+    try:
+        return render_template("error.html", message=str(err) if app.debug else None), 500
+    except Exception:
+        return "Произошла ошибка на сервере. Попробуйте обновить страницу.", 500
+
+
 @app.route("/")
 @login_required
 def index():
-    # Раньше здесь читались все строки каждой таблицы только чтобы посчитать
-    # len(...) — теперь используются лёгкие COUNT(*)-запросы.
-    summary = {
-        "games": db.count_games(),
-        "bookings": db.count_active_bookings(),
-        "pending_payments": db.count_pending_payments(),
-        "visits": db.count_visits(),
-        "clubs": db.count_clubs(),
-        "logs": db.count_logs(),
-    }
+    # Один запрос с 6 подзапросами вместо 6 отдельных round-trip'ов к БД
+    # (см. db.get_dashboard_summary) — на управляемом Postgres каждый лишний
+    # round-trip добавлял заметную задержку к открытию главной страницы.
+    summary = db.get_dashboard_summary()
     return render_template("dashboard.html", summary=summary)
 
 
@@ -176,36 +222,190 @@ def health_check():
     return {"status": "ok"}, 200
 
 
+@app.route("/api/activity")
+@login_required
+def api_activity():
+    """Лёгкий эндпоинт для поллинга с bookings.html/payments.html — фронтенд
+    раз в несколько секунд сверяет счётчики с тем, что было при загрузке
+    страницы, и если что-то новое появилось (например, бронирование и
+    оплата из бота), показывает баннер «Обновить». Одна простая агрегатная
+    выборка (см. db.get_latest_activity_marker), не создаёт заметной
+    нагрузки даже при частом опросе."""
+    return db.get_latest_activity_marker(), 200
+
+
 # ---------------------------------------------------------------------------
 # Игры
 # ---------------------------------------------------------------------------
+
+def _game_values_from_form(form):
+    """Сырые строковые значения формы (и при GET со старой игрой, и при
+    повторном показе формы после ошибки валидации используется один и тот же
+    формат — см. _game_values_from_row)."""
+    return {
+        "game_date": form.get("game_date", "").strip(),
+        "game_time": form.get("game_time", "").strip(),
+        "city": form.get("city", "").strip(),
+        "club_id": form.get("club_id", "").strip(),
+        "address": form.get("address", "").strip(),
+        "price": form.get("price", "").strip(),
+        "total_slots": form.get("total_slots", "").strip(),
+        "duration_minutes": form.get("duration_minutes", "").strip(),
+        "level": form.get("level", "").strip(),
+    }
+
+
+def _game_values_from_row(game):
+    """Тот же формат значений, но из строки БД (для GET /games/new и .../edit)."""
+    if not game:
+        return {
+            "game_date": "", "game_time": "", "city": "", "club_id": "",
+            "address": "", "price": "", "total_slots": "",
+            "duration_minutes": "90", "level": "",
+        }
+    return {
+        "game_date": game["game_date"].isoformat(),
+        "game_time": game["game_time"].strftime("%H:%M"),
+        "city": game.get("city") or "",
+        "club_id": str(game["club_id"]) if game.get("club_id") else "",
+        "address": game.get("address") or "",
+        "price": str(game["price"]),
+        "total_slots": str(game["total_slots"]),
+        "duration_minutes": str(game.get("duration_minutes") or 90),
+        "level": game.get("level") or "",
+    }
+
+
+def _validate_game_values(values, clubs_by_id):
+    """Валидирует все поля формы игры. Возвращает (errors, parsed) — при
+    непустом errors значения в parsed могут быть неполными/некорректными,
+    использовать их для сохранения в БД нельзя."""
+    errors = []
+    parsed = {}
+
+    try:
+        parsed["game_date"] = datetime.strptime(values["game_date"], "%Y-%m-%d").date()
+    except ValueError:
+        errors.append("Укажите корректную дату игры.")
+
+    try:
+        parsed["game_time"] = datetime.strptime(values["game_time"], "%H:%M").time()
+    except ValueError:
+        errors.append("Укажите корректное время игры.")
+
+    if not values["city"]:
+        errors.append("Укажите город.")
+    parsed["city"] = values["city"][:100]
+
+    parsed["club_id"] = None
+    if values["club_id"]:
+        try:
+            club_id_int = int(values["club_id"])
+        except ValueError:
+            errors.append("Некорректно выбран клуб.")
+        else:
+            if club_id_int not in clubs_by_id:
+                errors.append("Выбранный клуб не найден.")
+            else:
+                parsed["club_id"] = club_id_int
+
+    if not values["address"]:
+        errors.append("Укажите адрес.")
+    parsed["address"] = values["address"][:255]
+
+    try:
+        price = float(values["price"].replace(",", "."))
+        if price <= 0:
+            errors.append("Цена за место должна быть больше нуля.")
+        parsed["price"] = price
+    except (ValueError, AttributeError):
+        errors.append("Укажите корректную цену за место.")
+
+    try:
+        total_slots = int(values["total_slots"])
+        if not (1 <= total_slots <= 100):
+            errors.append("Количество мест должно быть от 1 до 100.")
+        parsed["total_slots"] = total_slots
+    except ValueError:
+        errors.append("Укажите корректное количество мест (целое число).")
+
+    try:
+        duration = int(values["duration_minutes"])
+        if not (15 <= duration <= 480):
+            errors.append("Длительность должна быть от 15 до 480 минут.")
+        parsed["duration_minutes"] = duration
+    except ValueError:
+        errors.append("Укажите корректную длительность в минутах.")
+
+    if values["level"] and values["level"] not in GAME_LEVELS:
+        errors.append("Некорректно выбран уровень.")
+    parsed["level"] = values["level"] if values["level"] in GAME_LEVELS else None
+
+    return errors, parsed
+
+
+def _build_game_location(parsed, clubs_by_id):
+    """Собирает человекочитаемое location из клуба/города/адреса — его
+    продолжают читать бот и старые запросы/шаблоны (см. _migrate_games_table
+    в database.py)."""
+    club_name = clubs_by_id[parsed["club_id"]]["name"] if parsed.get("club_id") else None
+    parts = [p for p in [club_name, parsed["city"], parsed["address"]] if p]
+    return ", ".join(parts)
+
 
 @app.route("/games")
 @login_required
 def games_list():
     page = request.args.get("page", 1, type=int)
-    result = db.get_games_paginated(page=page, per_page=DEFAULT_PAGE_SIZE)
-    return render_template("games.html", games=result["items"], pagination=result)
+    level = request.args.get("level", "")
+    result = db.get_games_paginated(page=page, per_page=DEFAULT_PAGE_SIZE, level=level)
+    return render_template(
+        "games.html", games=result["items"], pagination=result,
+        levels=GAME_LEVELS, selected_level=level,
+    )
 
 
 @app.route("/games/new", methods=["GET", "POST"])
 @login_required
 def game_new():
+    clubs = db.get_all_clubs()
+    clubs_by_id = {c["id"]: c for c in clubs}
+
     if request.method == "POST":
-        db.create_game(
-            game_date=request.form["game_date"],
-            game_time=request.form["game_time"],
-            location=request.form["location"],
-            price=request.form["price"],
-            total_slots=request.form["total_slots"],
+        values = _game_values_from_form(request.form)
+        errors, parsed = _validate_game_values(values, clubs_by_id)
+        if errors:
+            for e in errors:
+                flash(e)
+            return render_template(
+                "game_form.html", game=None, values=values, clubs=clubs, levels=GAME_LEVELS
+            )
+
+        location = _build_game_location(parsed, clubs_by_id)
+        game = db.create_game(
+            game_date=parsed["game_date"],
+            game_time=parsed["game_time"],
+            location=location,
+            price=parsed["price"],
+            total_slots=parsed["total_slots"],
+            city=parsed["city"],
+            club_id=parsed["club_id"],
+            address=parsed["address"],
+            duration_minutes=parsed["duration_minutes"],
+            level=parsed["level"],
         )
         # Бот кэширует список ближайших игр (см. cache.py/bot.py) — без
         # явного сброса здесь новая игра была видна в боте только после
         # истечения TTL кэша или перезапуска процесса бота.
         cache.invalidate_games_cache()
+        log_admin_action("create", "game", game["id"], new=dict(game))
         flash("Игра создана")
         return redirect(url_for("games_list"))
-    return render_template("game_form.html", game=None)
+
+    return render_template(
+        "game_form.html", game=None, values=_game_values_from_row(None),
+        clubs=clubs, levels=GAME_LEVELS,
+    )
 
 
 @app.route("/games/<int:game_id>/edit", methods=["GET", "POST"])
@@ -216,20 +416,61 @@ def game_edit(game_id):
         flash("Игра не найдена")
         return redirect(url_for("games_list"))
 
+    clubs = db.get_all_clubs()
+    clubs_by_id = {c["id"]: c for c in clubs}
+
     if request.method == "POST":
-        db.update_game(
+        values = _game_values_from_form(request.form)
+        errors, parsed = _validate_game_values(values, clubs_by_id)
+        if errors:
+            for e in errors:
+                flash(e)
+            return render_template(
+                "game_form.html", game=game, values=values, clubs=clubs, levels=GAME_LEVELS
+            )
+
+        location = _build_game_location(parsed, clubs_by_id)
+        old_snapshot = dict(game)
+        updated = db.update_game(
             game_id=game_id,
-            game_date=request.form["game_date"],
-            game_time=request.form["game_time"],
-            location=request.form["location"],
-            price=request.form["price"],
-            total_slots=request.form["total_slots"],
+            game_date=parsed["game_date"],
+            game_time=parsed["game_time"],
+            location=location,
+            price=parsed["price"],
+            total_slots=parsed["total_slots"],
+            city=parsed["city"],
+            club_id=parsed["club_id"],
+            address=parsed["address"],
+            duration_minutes=parsed["duration_minutes"],
+            level=parsed["level"],
         )
         cache.invalidate_games_cache()
+        log_admin_action("update", "game", game_id, old=old_snapshot, new=dict(updated))
         flash("Игра обновлена")
         return redirect(url_for("games_list"))
 
-    return render_template("game_form.html", game=game)
+    return render_template(
+        "game_form.html", game=game, values=_game_values_from_row(game),
+        clubs=clubs, levels=GAME_LEVELS,
+    )
+
+
+@app.route("/games/<int:game_id>/delete", methods=["POST"])
+@login_required
+def game_delete(game_id):
+    game = db.get_game_by_id(game_id)
+    if not game:
+        flash("Игра не найдена")
+        return redirect(url_for("games_list"))
+
+    db.delete_game(game_id)
+    # Удаление игры каскадно удаляет её заявки и оплаты (ON DELETE CASCADE) —
+    # число занятых мест по другим играм не меняется, но кэш списка игр,
+    # который видит бот, всё равно нужно сбросить.
+    cache.invalidate_games_cache()
+    log_admin_action("delete", "game", game_id, old=dict(game))
+    flash("Игра удалена")
+    return redirect(url_for("games_list"))
 
 
 # ---------------------------------------------------------------------------
@@ -245,30 +486,41 @@ def bookings_list():
     result = db.get_bookings_paginated(
         search=search, status=status_filter, page=page, per_page=DEFAULT_PAGE_SIZE
     )
-    return render_template("bookings.html", bookings=result["items"], pagination=result)
+    activity = db.get_latest_activity_marker()
+    return render_template(
+        "bookings.html", bookings=result["items"], pagination=result, activity=activity
+    )
 
 
 @app.route("/bookings/<int:booking_id>/status", methods=["POST"])
 @login_required
 def booking_update_status(booking_id):
     new_status = request.form["status"]
-    db.update_booking_status(booking_id, new_status)
+    # Один запрос вместо двух (get_booking_by_id + update_booking_status) —
+    # old_status получаем прямо из UPDATE, см. update_booking_status_and_get.
+    updated = db.update_booking_status_and_get(booking_id, new_status)
+    if not updated:
+        flash("Заявка не найдена")
+        return redirect(url_for("bookings_list"))
+    old_status = updated["old_status"]
 
     # Если заявку подтвердили и оплаты для неё ещё нет — создаём запись об
     # ожидаемой оплате. Проверка на существование обязательна: с тех пор,
     # как бот сам предлагает оплату сразу после записи (см.
     # process_booking_confirm в bot.py), платёж почти всегда уже существует
     # к этому моменту — без проверки здесь создавался бы дублирующий
-    # payment на ту же заявку.
-    if new_status == "подтверждена" and not db.get_payment_for_booking(booking_id):
-        booking = db.get_booking_by_id(booking_id)
-        game = db.get_game_by_id(booking["game_id"])
-        amount = float(game["price"]) * booking.get("slots_count", 1)
-        db.create_payment(booking_id, amount)
+    # payment на ту же заявку. get_payment_check_for_booking отдаёт
+    # payment_id/цену/slots_count одним запросом вместо трёх.
+    if new_status == "подтверждена":
+        check = db.get_payment_check_for_booking(booking_id)
+        if check and not check["payment_id"]:
+            amount = float(check["game_price"]) * (check.get("slots_count") or 1)
+            db.create_payment(booking_id, amount)
 
     # Смена статуса (особенно на/с "отменена") меняет число занятых мест,
     # которое бот показывает рядом с игрой — сбрасываем тот же кэш.
     cache.invalidate_games_cache()
+    log_admin_action("update_status", "booking", booking_id, old=old_status, new=new_status)
 
     flash("Статус заявки обновлён")
     return redirect(url_for("bookings_list"))
@@ -287,13 +539,17 @@ def payments_list():
     result = db.get_payments_paginated(
         search=search, status=status_filter, page=page, per_page=DEFAULT_PAGE_SIZE
     )
-    return render_template("payments.html", payments=result["items"], pagination=result)
+    activity = db.get_latest_activity_marker()
+    return render_template(
+        "payments.html", payments=result["items"], pagination=result, activity=activity
+    )
 
 
 @app.route("/payments/<int:payment_id>/confirm", methods=["POST"])
 @login_required
 def payment_confirm(payment_id):
     db.confirm_payment(payment_id)
+    log_admin_action("confirm", "payment", payment_id, old="ожидает", new="подтверждена")
     flash("Оплата подтверждена")
     return redirect(url_for("payments_list"))
 
@@ -314,6 +570,7 @@ def visits_list():
 @login_required
 def visit_mark(booking_id):
     db.mark_booking_visited(booking_id)
+    log_admin_action("mark_visited", "booking", booking_id, new="посещена")
     flash("Посещение отмечено")
     return redirect(url_for("visits_list"))
 
@@ -334,12 +591,13 @@ def clubs_list():
 @login_required
 def club_new():
     if request.method == "POST":
-        db.create_club(
+        club = db.create_club(
             name=request.form["name"],
             address=request.form["address"],
             phone=request.form["phone"],
             description=request.form.get("description", ""),
         )
+        log_admin_action("create", "club", club["id"], new=dict(club))
         flash("Клуб добавлен")
         return redirect(url_for("clubs_list"))
     return render_template("club_form.html", club=None)
@@ -354,6 +612,7 @@ def club_edit(club_id):
         return redirect(url_for("clubs_list"))
 
     if request.method == "POST":
+        old_snapshot = dict(club)
         db.update_club(
             club_id=club_id,
             name=request.form["name"],
@@ -361,6 +620,8 @@ def club_edit(club_id):
             phone=request.form["phone"],
             description=request.form.get("description", ""),
         )
+        updated = db.get_club_by_id(club_id)
+        log_admin_action("update", "club", club_id, old=old_snapshot, new=dict(updated))
         flash("Клуб обновлён")
         return redirect(url_for("clubs_list"))
 
@@ -393,11 +654,19 @@ def about_club():
 @app.route("/about/update", methods=["POST"])
 @login_required
 def about_club_update():
+    old_info = db.get_club_info()
     db.update_club_info(
         name=request.form["name"],
         description=request.form["description"],
         contact_phone=request.form["contact_phone"],
         contact_email=request.form.get("contact_email", ""),
+    )
+    new_info = db.get_club_info()
+    log_admin_action(
+        "update", "club_info",
+        old_info["id"] if old_info else None,
+        old=dict(old_info) if old_info else None,
+        new=dict(new_info) if new_info else None,
     )
     flash("Информация о клубе обновлена")
     return redirect(url_for("about_club"))
@@ -473,18 +742,37 @@ def webhook():
     Обработка передаётся в event loop бот-потока через
     run_coroutine_threadsafe, а не через asyncio.run() — иначе каждый запрос
     создавал бы новый event loop, в котором нельзя использовать asyncpg-пул,
-    созданный в другом loop."""
+    созданный в другом loop.
+
+    ВАЖНО: раньше здесь стоял future.result(timeout=10) — запрос ждал ДО 10
+    секунд обработки в другом потоке, прежде чем ответить. При
+    `gunicorn --workers 1` (см. deploy.md/docker-compose.yml) это означает,
+    что ЕДИНСТВЕННЫЙ обработчик запросов был занят все эти секунды и не мог
+    ответить ни на один запрос к CRM — при активном использовании бота
+    (несколько параллельных бронирований, оплата с генерацией QR и т.п.)
+    админ-панель выглядела зависшей/упавшей, а при превышении таймаута
+    gunicorn ("--timeout", по умолчанию 30с) воркер вообще убивался и
+    перезапускался. Telegram не ждёт результата обработки — ему достаточно
+    ответа 200 OK, поэтому теперь мы отвечаем СРАЗУ, а обработку отправляем
+    в фон (ошибки не теряются — их ловит done-callback ниже)."""
     if bot_instance and dp_instance and bot_loop:
         try:
             update = Update.model_validate(request.json)
-            future = asyncio.run_coroutine_threadsafe(
-                dp_instance.feed_webhook_update(bot_instance, update), bot_loop
-            )
-            future.result(timeout=10)
-            return {"status": "ok"}
         except Exception as e:
-            logger.error("Ошибка обработки webhook: %s", e)
-            return {"status": "error"}, 500
+            logger.error("Ошибка разбора webhook-обновления: %s", e)
+            return {"status": "error"}, 400
+
+        future = asyncio.run_coroutine_threadsafe(
+            dp_instance.feed_webhook_update(bot_instance, update), bot_loop
+        )
+
+        def _log_webhook_failure(fut):
+            exc = fut.exception() if fut.done() else None
+            if exc:
+                logger.error("Ошибка фоновой обработки webhook-обновления: %s", exc)
+
+        future.add_done_callback(_log_webhook_failure)
+        return {"status": "ok"}
     return {"status": "bot not ready"}, 503
 
 
