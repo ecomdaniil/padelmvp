@@ -5,9 +5,15 @@ Telegram-бот для игроков в падел.
 
 Что умеет:
 - /start — расширенная анкета (имя, возраст, город, опыт, инвентарь, правила, телефон)
-- показывает список ближайших игр и позволяет записаться
+- /menu — главное меню, /help — написать администратору
+- показывает список ближайших игр, спрашивает количество мест (1-4) и
+  позволяет записаться с автоматическим расчётом цены
+- после записи предлагает оплату (карта / СБП QR — интерфейс рабочий,
+  провайдер — заглушка, см. payment_provider.py)
 - /my_bookings — список своих записей с возможностью отмены
-- автоматически шлёт напоминание за 24 часа до игры
+- автоматически шлёт напоминания за 24 и за 2 часа до игры с кнопкой
+  «Не смогу» (отменяет заявку и освобождает место)
+- /help пересылает сообщение администратору с кнопкой «Ответить»
 
 Запуск (когда виртуальное окружение активировано):
     python bot.py
@@ -19,7 +25,7 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from dotenv import load_dotenv
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -28,19 +34,24 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
     Message,
     CallbackQuery,
+    PreCheckoutQuery,
     TelegramObject,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
 import cache
 import database_async as db
+import payment_provider
 from bot_content import (
     BTN_ABOUT_PADEL,
     BTN_COACHES,
@@ -68,12 +79,30 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-GAMES_CACHE_KEY = "games:upcoming_with_slots"
-GAMES_CACHE_TTL = 30  # секунд — баланс между свежестью данных и нагрузкой на БД
-LEVELS_CACHE_KEY = "levels:list"
-LEVELS_CACHE_TTL = 3600
+# Ключи/TTL кэша живут в cache.py — там же их читает app.py (CRM), чтобы
+# сбрасывать кэш игр при создании/редактировании игры или заявки. Раньше
+# CRM ничего не знала об этом кэше, из-за чего бот мог до 30 сек (или до
+# перезапуска процесса, если бот и CRM — разные процессы без Redis)
+# показывать устаревший список игр после изменений в CRM.
+GAMES_CACHE_KEY = cache.GAMES_CACHE_KEY
+GAMES_CACHE_TTL = cache.GAMES_CACHE_TTL
+LEVELS_CACHE_KEY = cache.LEVELS_CACHE_KEY
+LEVELS_CACHE_TTL = cache.LEVELS_CACHE_TTL
 
 RATE_LIMIT_PER_SECOND = int(os.getenv("BOT_RATE_LIMIT_PER_SECOND", "10"))
+
+# Команды бота (меню "/" в Telegram-клиенте) — регистрируются через
+# setMyCommands при старте (см. setup_bot_commands(), вызывается и из
+# main() здесь, и из run_bot() в app.py, если бот встроен в CRM-процесс).
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Начать / открыть анкету"),
+    BotCommand(command="menu", description="Главное меню"),
+    BotCommand(command="help", description="Написать администратору"),
+]
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    await bot.set_my_commands(BOT_COMMANDS)
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -174,6 +203,15 @@ class RegistrationForm(StatesGroup):
 
 class AdminContact(StatesGroup):
     waiting_for_message = State()
+
+
+class AdminReply(StatesGroup):
+    """FSM-состояние для чата администратора: используется, когда админ
+    нажимает «↩️ Ответить» на переданное игроком сообщение (/help)."""
+    waiting_for_reply = State()
+
+
+MAX_SLOTS_PER_BOOKING = 4
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -538,21 +576,64 @@ async def process_phone(message: Message, state: FSMContext):
 async def _get_upcoming_games_cached() -> list:
     """Список ближайших игр с количеством занятых мест — одним агрегирующим
     запросом (без N+1) и с коротким TTL-кэшем, чтобы не бить в БД при каждом
-    открытии раздела «Игры». Кэш инвалидируется сразу после записи/отмены."""
+    открытии раздела «Игры». Кэш инвалидируется сразу после записи/отмены
+    (в боте) и после создания/редактирования игры или смены статуса заявки
+    (в CRM, см. app.py) — обе стороны используют один и тот же ключ/backend
+    из cache.py."""
     cached = cache.get(GAMES_CACHE_KEY)
     if cached is not None:
+        logger.debug("Список игр отдан из кэша (%s)", cache.backend_name())
         return cached
+    t0 = time.monotonic()
     games = await db.get_upcoming_games_with_slots()
+    logger.debug("Запрос списка игр к БД занял %.3f с", time.monotonic() - t0)
     cache.set(GAMES_CACHE_KEY, games, GAMES_CACHE_TTL)
     return games
 
 
 def _invalidate_games_cache() -> None:
-    cache.delete(GAMES_CACHE_KEY)
+    cache.invalidate_games_cache()
+
+
+def _game_card(game: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    taken = game["taken"]
+    free_slots = game["total_slots"] - taken
+
+    text = (
+        f"📅 <b>{game['game_date'].strftime('%d.%m.%Y')}</b> в {str(game['game_time'])[:5]}\n"
+        f"📍 {game['location']}\n"
+        f"💰 {game['price']} ₽\n"
+        f"👥 Свободно мест: <b>{free_slots}</b> из {game['total_slots']}"
+    )
+
+    if free_slots > 0:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Записаться", callback_data=f"book:{game['id']}")]
+        ])
+    else:
+        text += "\n\n❌ <b>Мест нет</b>"
+        keyboard = None
+
+    return text, keyboard
+
+
+async def _send_answer(message: Message, text: str, keyboard: Optional[InlineKeyboardMarkup]) -> None:
+    """Обёртка вокруг message.answer(), приведённая к настоящей корутине.
+
+    message.answer() в установленной версии aiogram — синхронный метод,
+    который сразу возвращает объект запроса SendMessage (он awaitable через
+    __await__, но это не корутина). asyncio.gather() у таких объектов не
+    работает: они на основе pydantic и не хэшируемы, из-за чего gather()
+    падал с `TypeError: unhashable type: 'SendMessage'` ДО того, как успевал
+    отправить хоть один запрос — то есть все карточки после заголовочного
+    сообщения молча пропадали. Оборачиваем в async def, чтобы gather() имел
+    дело с обычными корутинами."""
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def _show_games(message: Message):
     """Показывает список ближайших игр."""
+    t_start = time.monotonic()
     user = await _require_registered(message.from_user.id)
     if not user:
         await message.answer(
@@ -577,26 +658,19 @@ async def _show_games(message: Message):
         "Выбери игру и нажми «Записаться»:",
         parse_mode="HTML",
     )
-    for game in games:
-        taken = game["taken"]
-        free_slots = game["total_slots"] - taken
 
-        text = (
-            f"📅 <b>{game['game_date'].strftime('%d.%m.%Y')}</b> в {str(game['game_time'])[:5]}\n"
-            f"📍 {game['location']}\n"
-            f"💰 {game['price']} ₽\n"
-            f"👥 Свободно мест: <b>{free_slots}</b> из {game['total_slots']}"
-        )
+    # Раньше карточки игр отправлялись последовательно (await в цикле), то
+    # есть каждая дополнительная игра добавляла ещё один сетевой round-trip
+    # до Telegram (~100-400 мс) к общему времени ответа. Отправляем все
+    # карточки конкурентно — суммарное время ≈ время одного round-trip,
+    # а не N.
+    sends = [_send_answer(message, *_game_card(game)) for game in games]
+    results = await asyncio.gather(*sends, return_exceptions=True)
+    for game, result in zip(games, results):
+        if isinstance(result, Exception):
+            logger.error("Не удалось отправить карточку игры #%s: %s", game.get("id"), result)
 
-        if free_slots > 0:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Записаться", callback_data=f"book:{game['id']}")]
-            ])
-        else:
-            text += "\n\n❌ <b>Мест нет</b>"
-            keyboard = None
-
-        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    logger.debug("_show_games: всего %.3f с, %d игр", time.monotonic() - t_start, len(games))
 
 
 async def _show_my_bookings(message: Message):
@@ -625,17 +699,27 @@ async def _show_my_bookings(message: Message):
         "Нажми «Отменить», если не сможешь прийти:",
         parse_mode="HTML",
     )
-    for b in bookings:
+
+    def _booking_card(b: dict) -> tuple[str, InlineKeyboardMarkup]:
         status_emoji = "✅" if b['status'] == 'подтверждена' else "⏳"
         text = (
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {b['location']}\n"
+            f"👥 Мест: {b.get('slots_count', 1)}\n"
             f"📌 Статус: {status_emoji} {b['status']}"
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel:{b['id']}")]
         ])
-        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        return text, keyboard
+
+    # Как и в _show_games, отправляем карточки конкурентно, а не по одной,
+    # оборачивая каждый answer() в настоящую корутину (см. _send_answer).
+    sends = [_send_answer(message, *_booking_card(b)) for b in bookings]
+    results = await asyncio.gather(*sends, return_exceptions=True)
+    for b, result in zip(bookings, results):
+        if isinstance(result, Exception):
+            logger.error("Не удалось отправить карточку записи #%s: %s", b.get("id"), result)
 
 
 def _format_statistics(stats: dict) -> str:
@@ -664,6 +748,7 @@ def _coaches_list_keyboard() -> InlineKeyboardMarkup:
 
 
 @router.message(F.text == BTN_MAIN_MENU)
+@router.message(Command("menu"))
 async def menu_main(message: Message, state: FSMContext):
     await state.clear()
     user = await _require_registered(message.from_user.id)
@@ -759,6 +844,7 @@ async def show_coach_detail(callback: CallbackQuery):
 
 
 @router.message(F.text == BTN_CONTACT_ADMIN)
+@router.message(Command("help"))
 async def menu_contact_admin(message: Message, state: FSMContext):
     user = await _require_registered(message.from_user.id)
     if not user:
@@ -807,15 +893,24 @@ async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
 
     if ADMIN_CHAT_ID:
         admin_text = (
-            "💬 <b>Сообщение от игрока</b>\n"
+            "💬 <b>Сообщение от игрока (/help)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 {user['name']}\n"
             f"📞 {user['phone']}\n"
             f"🆔 Telegram ID: {message.from_user.id}\n\n"
             f"📝 {user_message}"
         )
+        # Кнопка «Ответить» — нажатие запускает FSM-диалог AdminReply прямо
+        # в чате администратора (см. admin_reply_start/admin_reply_send):
+        # он пишет обычный текст, бот сам находит нужного игрока по
+        # telegram_id, зашитому в callback_data, и пересылает ответ.
+        admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply_to:{message.from_user.id}")]
+        ])
         try:
-            await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
+            await bot.send_message(
+                ADMIN_CHAT_ID, admin_text, parse_mode="HTML", reply_markup=admin_keyboard
+            )
             await message.answer(
                 "✅ Сообщение отправлено администратору!\n\n"
                 "Ответ придёт в этот чат.",
@@ -836,6 +931,48 @@ async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
         )
 
 
+@router.callback_query(F.data.startswith("reply_to:"))
+async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
+    """Админ нажал «↩️ Ответить» под сообщением игрока — просим текст
+    ответа. Кнопка существует только в сообщениях, отправленных в
+    ADMIN_CHAT_ID, поэтому нажать её может только тот, у кого есть доступ к
+    этому чату (Telegram не позволяет «нажать» инлайн-кнопку в чужом чате)."""
+    target_telegram_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(reply_target_telegram_id=target_telegram_id)
+    await state.set_state(AdminReply.waiting_for_reply)
+    await callback.answer()
+    await callback.message.answer(
+        "✏️ Напиши ответ игроку — я перешлю его в бот.\n"
+        "<i>Для отмены отправь /cancel</i>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(StateFilter(AdminReply.waiting_for_reply))
+async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    target_telegram_id = data.get("reply_target_telegram_id")
+    await state.clear()
+
+    reply_text = _safe_text(message)
+    if not target_telegram_id or not reply_text:
+        await message.answer("❌ Ответ не отправлен: пустое сообщение.")
+        return
+
+    try:
+        await bot.send_message(
+            target_telegram_id,
+            f"💬 <b>Ответ администратора:</b>\n\n{reply_text}",
+            parse_mode="HTML",
+        )
+        await message.answer("✅ Ответ отправлен игроку.")
+    except Exception as e:
+        logger.error("Не удалось отправить ответ игроку %s: %s", target_telegram_id, e)
+        await message.answer(
+            "❌ Не удалось отправить ответ — возможно, игрок заблокировал бота."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Список игр и запись
 # ---------------------------------------------------------------------------
@@ -845,7 +982,9 @@ async def _require_registered(telegram_id: int):
     return await db.get_user_by_telegram_id(telegram_id)
 
 
-async def _notify_admin_new_booking(bot: Bot, user: dict, game: dict, booking_id: int):
+async def _notify_admin_new_booking(
+    bot: Bot, user: dict, game: dict, booking_id: int, slots_count: int, total_price: float,
+):
     """Отправляет админу уведомление о новой записи игрока на корт."""
     if not ADMIN_CHAT_ID:
         logger.warning("ADMIN_CHAT_ID не задан — уведомление о записи пропущено")
@@ -861,7 +1000,8 @@ async def _notify_admin_new_booking(bot: Bot, user: dict, game: dict, booking_id
         f"📞 Телефон: {user['phone']}\n"
         f"📅 Дата и время: {game_datetime}\n"
         f"📍 Корт / площадка: {game['location']}\n"
-        f"💰 Стоимость: {game['price']} ₽\n"
+        f"👥 Мест: {slots_count}\n"
+        f"💰 К оплате: {total_price:.0f} ₽\n"
         f"🆔 ID заявки: {booking_id}"
     )
     try:
@@ -884,8 +1024,18 @@ async def cmd_games(message: Message):
     await _show_games(message)
 
 
+def _slots_choice_keyboard(game_id: int, max_slots: int) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=str(n), callback_data=f"book_slots:{game_id}:{n}")
+        for n in range(1, max_slots + 1)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
 @router.callback_query(F.data.startswith("book:"))
-async def process_booking(callback: CallbackQuery):
+async def process_booking_ask_slots(callback: CallbackQuery):
+    """Первый шаг записи: показываем игру и спрашиваем, на сколько мест
+    бронировать (1-4), прежде чем создавать заявку."""
     user = await _require_registered(callback.from_user.id)
     if not user:
         await callback.answer("Сначала заполни анкету: отправь /start", show_alert=True)
@@ -893,42 +1043,265 @@ async def process_booking(callback: CallbackQuery):
 
     game_id = int(callback.data.split(":")[1])
     game = await db.get_game_by_id(game_id)
-
     if not game:
         await callback.answer("Эта игра больше не доступна.", show_alert=True)
         return
 
+    taken = await db.count_bookings_for_game(game_id)
+    free_slots = game["total_slots"] - taken
+    if free_slots <= 0:
+        await callback.answer("К сожалению, места уже закончились.", show_alert=True)
+        return
+
+    max_choice = min(MAX_SLOTS_PER_BOOKING, free_slots)
+    await callback.answer()
+    await callback.message.answer(
+        "👥 <b>Сколько мест забронировать?</b>\n"
+        f"Свободно: {free_slots} из {game['total_slots']}\n"
+        f"Цена за место: {game['price']} ₽\n\n"
+        "Выбери количество:",
+        reply_markup=_slots_choice_keyboard(game_id, max_choice),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("book_slots:"))
+async def process_booking_confirm(callback: CallbackQuery):
+    """Второй шаг записи: пользователь выбрал количество мест — создаём
+    заявку, считаем итоговую цену и предлагаем способ оплаты."""
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала заполни анкету: отправь /start", show_alert=True)
+        return
+
+    _, game_id_str, slots_str = callback.data.split(":")
+    game_id = int(game_id_str)
+    slots_count = int(slots_str)
+
     # Проверка мест и вставка заявки выполняются атомарно в одной транзакции
     # с блокировкой строки игры — это исключает race condition, когда два
     # игрока одновременно проходят проверку на последнее свободное место.
-    result = await db.create_booking_safe(user_id=user["id"], game_id=game_id)
+    # Игру отдельно заранее не запрашиваем: create_booking_safe уже читает
+    # её внутри транзакции и возвращает нам эти же данные — раньше здесь был
+    # лишний round-trip к БД на каждую попытку записи.
+    result = await db.create_booking_safe(user_id=user["id"], game_id=game_id, slots_count=slots_count)
 
     if result["status"] == "not_found":
         await callback.answer("Эта игра больше не доступна.", show_alert=True)
         return
     if result["status"] == "full":
-        await callback.answer("К сожалению, места уже закончились.", show_alert=True)
+        await callback.answer("К сожалению, свободных мест уже меньше, чем ты выбрал.", show_alert=True)
         return
     if result["status"] == "duplicate":
         await callback.answer("Ты уже записан на эту игру.", show_alert=True)
         return
 
     booking = result["booking"]
+    game = result["game"]
     booking_id = booking["id"]
+    total_price = float(game["price"]) * slots_count
     _invalidate_games_cache()
 
-    await _notify_admin_new_booking(callback.bot, user, game, booking_id)
+    # Заявка создаётся сразу со «своим» платежом (статус «ожидает», способ
+    # оплаты пока не выбран) — так администратор в CRM видит ожидаемую
+    # оплату даже если игрок не пройдёт шаги ниже до конца (например,
+    # оплатит наличными на месте).
+    payment = await db.create_payment(booking_id, total_price)
+
+    # Ответ пользователю не должен ждать отправки уведомления админу —
+    # раньше это был await ДО ответа пользователю, то есть каждая запись на
+    # игру платила ещё одним полным сетевым round-trip до Telegram сверху.
+    # Запускаем как fire-and-forget задачу; ошибки уже логируются внутри
+    # _notify_admin_new_booking и не могут сломать ответ игроку.
+    asyncio.create_task(
+        _notify_admin_new_booking(callback.bot, user, game, booking_id, slots_count, total_price)
+    )
 
     await callback.answer("Заявка отправлена! ✅")
     await callback.message.answer(
         f"✅ Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
         f"в {str(game['game_time'])[:5]}!\n\n"
-        "📌 Статус заявки: <b>новая</b>\n"
-        "Администратор подтвердит её после оплаты.\n\n"
+        f"👥 Мест: <b>{slots_count}</b>\n"
+        f"💰 К оплате: <b>{total_price:.0f} ₽</b>\n"
+        "📌 Статус заявки: <b>новая</b>\n\n"
         "Посмотреть записи: «📋 Мои записи» в меню",
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
     )
+    await callback.message.answer(
+        _payment_prompt_text(total_price),
+        reply_markup=_payment_method_keyboard(payment["id"]),
+        parse_mode="HTML",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Оплата (интерфейс — рабочий; провайдер — заглушка, см. payment_provider.py)
+# ---------------------------------------------------------------------------
+
+def _payment_prompt_text(amount: float) -> str:
+    return (
+        "💳 <b>Оплата</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Сумма к оплате: <b>{amount:.0f} ₽</b>\n\n"
+        "Выбери способ оплаты:"
+    )
+
+
+def _payment_method_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить картой", callback_data=f"pay_card:{payment_id}")],
+        [InlineKeyboardButton(text="📱 Оплатить по СБП (QR)", callback_data=f"pay_sbp:{payment_id}")],
+    ])
+
+
+def _paid_notify_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_notify:{payment_id}")]
+    ])
+
+
+@router.callback_query(F.data.startswith("pay_card:"))
+async def process_pay_card(callback: CallbackQuery):
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.get_payment_by_id(payment_id)
+    if not payment:
+        await callback.answer("Платёж не найден.", show_alert=True)
+        return
+
+    await db.set_payment_method(payment_id, "card")
+    await callback.answer()
+
+    if payment_provider.is_card_provider_configured():
+        # Настоящий Telegram Payments API — сработает, если в .env указан
+        # реальный (или тестовый) PAYMENT_PROVIDER_TOKEN, подключённый через
+        # @BotFather. Подтверждение оплаты — в process_successful_payment.
+        await callback.message.answer_invoice(
+            title="Оплата игры в падел",
+            description=f"Бронирование #{payment['booking_id']} на {float(payment['amount']):.0f} ₽",
+            payload=f"payment:{payment_id}",
+            provider_token=os.getenv("PAYMENT_PROVIDER_TOKEN"),
+            currency="RUB",
+            prices=[LabeledPrice(label="Игра в падел", amount=int(round(float(payment["amount"]) * 100)))],
+        )
+        return
+
+    reference = payment_provider.generate_stub_reference("CARD", payment_id)
+    await callback.message.answer(
+        "💳 <b>Оплата картой (демо-режим)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Платёжный провайдер пока не подключён — это временная заглушка "
+        "интерфейса оплаты (см. PAYMENT_PROVIDER_TOKEN в .env).\n\n"
+        f"Сумма: <b>{float(payment['amount']):.0f} ₽</b>\n"
+        f"Референс операции: <code>{reference}</code>\n\n"
+        "Оплати администратору на месте/переводом и нажми кнопку ниже:",
+        reply_markup=_paid_notify_keyboard(payment_id),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("pay_sbp:"))
+async def process_pay_sbp(callback: CallbackQuery):
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.get_payment_by_id(payment_id)
+    if not payment:
+        await callback.answer("Платёж не найден.", show_alert=True)
+        return
+
+    await db.set_payment_method(payment_id, "sbp")
+    await callback.answer()
+
+    # СБП не входит в стандартный Telegram Payments API — реального
+    # приёма нет, показываем интерфейс (QR с тестовыми данными) и просим
+    # игрока подтвердить оплату самостоятельно, как и при оплате картой без
+    # подключённого провайдера.
+    reference = payment_provider.generate_stub_reference("SBP", payment_id)
+    qr_payload = payment_provider.build_sbp_payload(float(payment["amount"]), reference)
+    qr_bytes = payment_provider.make_qr_image_bytes(qr_payload)
+
+    await callback.message.answer_photo(
+        BufferedInputFile(qr_bytes, filename="sbp_qr.png"),
+        caption=(
+            "📱 <b>Оплата по СБП (демо-режим)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Реальный приём платежей по СБП пока не подключён — это заглушка "
+            "интерфейса (сгенерирован тестовый QR).\n\n"
+            f"Сумма: <b>{float(payment['amount']):.0f} ₽</b>\n"
+            f"Референс операции: <code>{reference}</code>\n\n"
+            "Оплати администратору на месте/переводом и нажми кнопку ниже:"
+        ),
+        reply_markup=_paid_notify_keyboard(payment_id),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("paid_notify:"))
+async def process_paid_notify(callback: CallbackQuery):
+    """Игрок сообщает, что оплатил (наличными/переводом/по заглушке QR) —
+    окончательное подтверждение всё равно делает администратор в CRM,
+    чтобы нельзя было просто нажать кнопку и получить статус «оплачено»
+    без реальной проверки оплаты."""
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.get_payment_by_id(payment_id)
+    if not payment:
+        await callback.answer("Платёж не найден.", show_alert=True)
+        return
+
+    await callback.answer("Спасибо! Администратор проверит оплату.", show_alert=True)
+    await callback.message.answer(
+        "⏳ Мы получили твоё уведомление об оплате.\n"
+        "Администратор подтвердит её в ближайшее время."
+    )
+
+    if ADMIN_CHAT_ID:
+        try:
+            await callback.bot.send_message(
+                ADMIN_CHAT_ID,
+                "💰 <b>Игрок сообщил об оплате</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🆔 Платёж #{payment_id}\n"
+                f"💳 Способ: {payment.get('method') or '—'}\n"
+                f"💰 Сумма: {payment['amount']} ₽\n\n"
+                "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить админа об оплате #%s: %s", payment_id, e)
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    """Telegram требует ответить в течение 10 секунд, иначе платёж
+    отклоняется — здесь можно было бы ещё раз проверить наличие мест, но
+    места уже были зарезервированы на шаге создания заявки, поэтому просто
+    подтверждаем."""
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    """Срабатывает только при настоящей интеграции Telegram Payments
+    (PAYMENT_PROVIDER_TOKEN задан) — Telegram сам подтверждает, что деньги
+    списаны, поэтому здесь можно сразу помечать оплату подтверждённой без
+    участия администратора."""
+    payload = message.successful_payment.invoice_payload
+    try:
+        payment_id = int(payload.split(":", 1)[1])
+    except (IndexError, ValueError):
+        logger.error("Некорректный payload успешного платежа: %s", payload)
+        return
+
+    await db.confirm_payment(payment_id)
+    await message.answer("✅ Оплата картой прошла успешно! Спасибо 🎾")
+
+    if ADMIN_CHAT_ID:
+        try:
+            await message.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"💳 Оплата #{payment_id} подтверждена автоматически (Telegram Payments).",
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить админа об автооплате #%s: %s", payment_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1372,7 @@ async def fallback_message(message: Message, state: FSMContext):
 
     if message.text.startswith('/'):
         await message.answer(
-            "ℹ️ Я понимаю команды /start, /games, /my_bookings и /cancel.\n"
+            "ℹ️ Я понимаю команды /start, /menu, /games, /my_bookings, /help и /cancel.\n"
             "Для навигации используй кнопки меню ниже.",
             reply_markup=main_menu_keyboard(),
         )
@@ -1015,26 +1388,77 @@ async def fallback_message(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Напоминания за 24 часа до игры
+# Напоминания за 24 часа и за 2 часа до игры
 # ---------------------------------------------------------------------------
 
-async def send_reminders(bot: Bot):
-    """Эта функция запускается автоматически каждый час планировщиком APScheduler."""
-    games = await db.get_games_needing_reminder()
+async def _send_reminder_batch(bot: Bot, games: list, label: str, mark_sent) -> None:
+    """Рассылает напоминание с кнопкой «Не смогу» участникам списка игр и
+    помечает игру как обработанную. Кнопка использует существующий callback
+    cancel:<booking_id> (см. process_cancel) — отдельный обработчик не
+    нужен, отмена брони работает одинаково откуда угодно."""
     for game in games:
         participants = await db.get_participants_for_game(game["id"])
-        for p in participants:
-            try:
-                await bot.send_message(
-                    p["telegram_id"],
-                    f"⏰ Напоминание! Завтра у тебя игра в падел:\n"
-                    f"📅 {game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}\n"
-                    f"📍 {game['location']}\n\n"
-                    "До встречи на корте! 🎾"
+        game_dt = f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+        text = (
+            f"⏰ <b>Напоминание!</b> {label} у тебя игра в падел:\n"
+            f"📅 {game_dt}\n"
+            f"📍 {game['location']}\n\n"
+            "Если не сможешь прийти — нажми «Не смогу», место освободится "
+            "для других игроков.\n\n"
+            "До встречи на корте! 🎾"
+        )
+
+        def _reminder_keyboard(booking_id: int) -> InlineKeyboardMarkup:
+            # Клавиатура своя для каждого участника — у каждого свой
+            # booking_id, чтобы кнопка отменяла именно ЕГО заявку.
+            return InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Не смогу", callback_data=f"cancel:{booking_id}")]
+            ])
+
+        # Bot.send_message — настоящая корутина (в отличие от message.answer),
+        # поэтому её можно безопасно передавать в asyncio.gather напрямую.
+        sends = [
+            bot.send_message(
+                p["telegram_id"], text, reply_markup=_reminder_keyboard(p["booking_id"]), parse_mode="HTML"
+            )
+            for p in participants
+        ]
+        results = await asyncio.gather(*sends, return_exceptions=True)
+        for p, result in zip(participants, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Не удалось отправить напоминание пользователю %s: %s",
+                    p["telegram_id"], result,
                 )
-            except Exception as e:
-                logger.error(f"Не удалось отправить напоминание пользователю {p['telegram_id']}: {e}")
-        await db.mark_reminder_sent(game["id"])
+        await mark_sent(game["id"])
+
+
+async def send_reminders(bot: Bot):
+    """Запускается планировщиком (см. main()/app.py:run_bot) каждые 15
+    минут: проверяет, кому пора напомнить за 24 и за 2 часа до игры."""
+    games_24h = await db.get_games_needing_reminder_24h()
+    await _send_reminder_batch(bot, games_24h, "Через 24 часа", db.mark_reminder_24h_sent)
+
+    games_2h = await db.get_games_needing_reminder_2h()
+    await _send_reminder_batch(bot, games_2h, "Через 2 часа", db.mark_reminder_2h_sent)
+
+
+def _make_reminder_job(bot: Bot, loop: asyncio.AbstractEventLoop):
+    """APScheduler (BackgroundScheduler) работает в СВОЁМ отдельном потоке
+    и не умеет напрямую вызывать async-функции — job должен быть обычной
+    (синхронной) функцией. Передаём корутину в event loop бота через
+    run_coroutine_threadsafe и ждём результат с таймаутом: так планировщик
+    не блокирует ни свой поток, ни event loop бота, а БД/сеть по-прежнему
+    работают через тот же asyncpg-пул, что и остальные обработчики."""
+
+    def _job() -> None:
+        future = asyncio.run_coroutine_threadsafe(send_reminders(bot), loop)
+        try:
+            future.result(timeout=60)
+        except Exception as e:
+            logger.error("Ошибка задачи напоминаний: %s", e)
+
+    return _job
 
 
 async def main():
@@ -1049,9 +1473,17 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Планировщик проверяет раз в час, кому пора отправить напоминание за 24 часа
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_reminders, "interval", hours=1, args=[bot])
+    await setup_bot_commands(bot)
+
+    # Планировщик — в отдельном потоке (BackgroundScheduler), а не в event
+    # loop бота (как было раньше с AsyncIOScheduler): даже если задача
+    # напоминаний зависнет или БД будет медленно отвечать, это не заблокирует
+    # обработку сообщений пользователей ботом. Интервал 15 минут (а не 1 час,
+    # как было для 24ч-напоминания) — чтобы надёжно попадать в более узкое
+    # окно 2-часового напоминания (1ч45м-2ч15м).
+    loop = asyncio.get_running_loop()
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_make_reminder_job(bot, loop), "interval", minutes=15)
     scheduler.start()
 
     try:

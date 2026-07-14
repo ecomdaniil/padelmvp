@@ -20,13 +20,14 @@
     </div>
     <table>
         <tr>
-            <th>Игрок</th><th>Телефон</th><th>Игра</th><th>Статус</th><th>Изменить статус</th>
+            <th>Игрок</th><th>Телефон</th><th>Игра</th><th>Мест</th><th>Статус</th><th>Изменить статус</th>
         </tr>
         {% for b in bookings %}
         <tr>
             <td>{{ b.user_name }}</td>
             <td>{{ b.user_phone }}</td>
             <td>{{ b.game_date.strftime('%d.%m.%Y') }} {{ b.game_time.strftime('%H:%M') }} — {{ b.location }}</td>
+            <td>{{ b.slots_count or 1 }}</td>
             <td>
                 {% if b.status == 'новая' %}
                     <span class="badge badge-new">новая</span>
@@ -49,7 +50,7 @@
             </td>
         </tr>
         {% else %}
-        <tr><td colspan="5">Заявок пока нет.</td></tr>
+        <tr><td colspan="6">Заявок пока нет.</td></tr>
         {% endfor %}
     </table>
     {% include "_pagination.html" %}

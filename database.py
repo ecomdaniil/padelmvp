@@ -170,6 +170,32 @@ def _migrate_users_table(cur):
         )
 
 
+def _migrate_games_table(cur):
+    """reminder_2h_sent — отдельный флаг для напоминания за 2 часа до игры,
+    независимый от reminder_sent (используется для напоминания за 24 часа —
+    имя оставлено как есть, чтобы не переименовывать существующий столбец и
+    не ломать старые данные/индекс на нём)."""
+    cur.execute(
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS reminder_2h_sent BOOLEAN NOT NULL DEFAULT FALSE;"
+    )
+
+
+def _migrate_bookings_table(cur):
+    """slots_count — сколько мест занимает одна заявка (фича «Сколько мест?
+    (1-4)» в боте). DEFAULT 1 — старые заявки, созданные до этой миграции,
+    корректно продолжают считаться как 1 занятое место."""
+    cur.execute(
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS slots_count INTEGER NOT NULL DEFAULT 1;"
+    )
+
+
+def _migrate_payments_table(cur):
+    """method — способ оплаты, выбранный игроком в боте (card/sbp), для
+    отображения в CRM. NULL — способ ещё не выбран (например, заявку
+    оплатили наличными на месте без похода через бота)."""
+    cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT;")
+
+
 def _create_indexes(cur):
     """Создаёт индексы для самых частых и тяжёлых запросов.
     CREATE INDEX IF NOT EXISTS — безопасно вызывать повторно."""
@@ -177,6 +203,7 @@ def _create_indexes(cur):
         # games: список ближайших игр сортируется/фильтруется по дате и времени
         "CREATE INDEX IF NOT EXISTS idx_games_date_time ON games (game_date, game_time);",
         "CREATE INDEX IF NOT EXISTS idx_games_reminder_pending ON games (reminder_sent) WHERE reminder_sent = FALSE;",
+        "CREATE INDEX IF NOT EXISTS idx_games_reminder_2h_pending ON games (reminder_2h_sent) WHERE reminder_2h_sent = FALSE;",
 
         # bookings: почти все запросы фильтруют по user_id, game_id и/или status
         "CREATE INDEX IF NOT EXISTS idx_bookings_user_id ON bookings (user_id);",
@@ -205,6 +232,9 @@ def migrate_db():
     conn = get_connection()
     cur = conn.cursor()
     _migrate_users_table(cur)
+    _migrate_games_table(cur)
+    _migrate_bookings_table(cur)
+    _migrate_payments_table(cur)
     _create_indexes(cur)
     conn.commit()
     cur.close()
@@ -324,7 +354,10 @@ def get_games_paginated(page: int = 1, per_page: int = 20):
                COALESCE(pm.collected, 0) AS collected
         FROM games g
         LEFT JOIN (
-            SELECT game_id, COUNT(*) AS taken
+            -- SUM(slots_count), а не COUNT(*): одна заявка теперь может
+            -- занимать сразу несколько мест (фича «Сколько мест? (1-4)»
+            -- в боте), поэтому число заявок больше не равно числу мест.
+            SELECT game_id, SUM(slots_count) AS taken
             FROM bookings
             WHERE status != 'отменена'
             GROUP BY game_id
@@ -360,7 +393,7 @@ def get_all_games_with_stats():
                COALESCE(pm.collected, 0) AS collected
         FROM games g
         LEFT JOIN (
-            SELECT game_id, COUNT(*) AS taken
+            SELECT game_id, SUM(slots_count) AS taken
             FROM bookings
             WHERE status != 'отменена'
             GROUP BY game_id
@@ -711,6 +744,24 @@ def create_payment(booking_id: int, amount):
     )
     payment = cur.fetchone()
     conn.commit()
+    cur.close()
+    conn.close()
+    return payment
+
+
+def get_payment_for_booking(booking_id: int):
+    """Есть ли уже оплата для этой заявки. Начиная с фичи оплаты через бота
+    (см. bot.py) запись о платеже создаётся сразу при бронировании — эта
+    функция нужна, чтобы CRM не создавала дублирующую оплату, когда
+    администратор вручную подтверждает заявку (см. booking_update_status
+    в app.py)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM payments WHERE booking_id = %s ORDER BY id LIMIT 1",
+        (booking_id,),
+    )
+    payment = cur.fetchone()
     cur.close()
     conn.close()
     return payment

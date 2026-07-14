@@ -105,6 +105,19 @@ class _RedisCache:
 
 _backend = _RedisCache(_redis_client) if _redis_client else _InMemoryCache()
 
+# Ключи и TTL общие для bot.py (пишет/читает список игр) и app.py/CRM (обязан
+# сбрасывать кэш при создании/редактировании игр и заявок). Держим их здесь,
+# а не дублируем в каждом модуле — иначе легко забыть про инвалидацию при
+# правке одного из модулей и получить рассинхронизацию, как это и произошло:
+# CRM создавала игры через database.py и вообще не знала о существовании
+# этого кэша, поэтому бот мог показывать устаревший список до истечения TTL
+# или перезапуска процесса.
+GAMES_CACHE_KEY = "games:upcoming_with_slots"
+GAMES_CACHE_TTL = 15  # секунд — короткое окно на случай, если инвалидация
+                      # ниже не сработает (например, разные процессы без Redis)
+LEVELS_CACHE_KEY = "levels:list"
+LEVELS_CACHE_TTL = 3600
+
 
 def get(key: str) -> Any:
     return _backend.get(key)
@@ -120,6 +133,13 @@ def delete(key: str) -> None:
 
 def delete_prefix(prefix: str) -> None:
     _backend.delete_prefix(prefix)
+
+
+def invalidate_games_cache() -> None:
+    """Сбрасывает кэш списка игр. Вызывать из ЛЮБОГО места, где меняются
+    игры или количество занятых мест: создание/редактирование игры в CRM,
+    запись/отмена в боте, смена статуса заявки в CRM (влияет на taken)."""
+    delete(GAMES_CACHE_KEY)
 
 
 def get_or_set(key: str, loader: Callable[[], Any], ttl: Optional[float] = None) -> Any:

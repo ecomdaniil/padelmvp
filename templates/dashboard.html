@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>📊 Главная панель CRM</h1>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="label">Ближайшие игры</div>
+            <div class="value">{{ summary.games }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Активные заявки</div>
+            <div class="value">{{ summary.bookings }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Ожидают оплаты</div>
+            <div class="value">{{ summary.pending_payments }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Посещений</div>
+            <div class="value">{{ summary.visits }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Клубы</div>
+            <div class="value">{{ summary.clubs }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Записей в журнале</div>
+            <div class="value">{{ summary.logs }}</div>
+        </div>
+    </div>
+    <div class="card">
+        <h2 style="margin-top: 0; color: #1d4ed8;">🚀 Что доступно в CRM</h2>
+        <ul>
+            <li>Управление играми, заявками и оплатами</li>
+            <li>Отметка посещений и просмотр отзывов</li>
+            <li>Управление клубами и настройками карточки клуба</li>
+            <li>Экспорт отчёта по играм в Excel</li>
+        </ul>
+    </div>
+{% endblock %}

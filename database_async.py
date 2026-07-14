@@ -63,7 +63,12 @@ async def get_pool() -> asyncpg.Pool:
             _pool = await asyncpg.create_pool(
                 dsn=dsn,
                 ssl=ssl_option,
-                min_size=1,
+                # min_size=2 держит пару соединений всегда открытыми, чтобы
+                # обычный запрос не платил цену TCP+TLS хендшейка с БД
+                # (нередко 100-300 мс на управляемых Postgres-провайдерах),
+                # который иначе случался бы при каждом "холодном" всплеске
+                # активности после периода простоя.
+                min_size=2,
                 max_size=10,
                 command_timeout=10,
             )
@@ -155,14 +160,18 @@ async def get_upcoming_games() -> list:
 
 async def get_upcoming_games_with_slots() -> list:
     """Один агрегирующий запрос вместо N+1: сразу считает занятые места
-    для каждой ближайшей игры. Результат кладётся в кэш в bot.py."""
+    для каждой ближайшей игры. Результат кладётся в кэш в bot.py.
+
+    SUM(slots_count), а не COUNT(*): с фичей «Сколько мест? (1-4)» одна
+    заявка может занимать сразу несколько мест, поэтому число заявок больше
+    не равно числу занятых мест."""
     pool = await get_pool()
     rows = await pool.fetch(
         """
         SELECT g.*, COALESCE(bk.taken, 0) AS taken
         FROM games g
         LEFT JOIN (
-            SELECT game_id, COUNT(*) AS taken
+            SELECT game_id, SUM(slots_count) AS taken
             FROM bookings
             WHERE status != 'отменена'
             GROUP BY game_id
@@ -181,14 +190,19 @@ async def get_game_by_id(game_id: int) -> Optional[dict]:
 
 
 async def count_bookings_for_game(game_id: int) -> int:
+    """Сколько мест уже занято на игре (SUM(slots_count), не число заявок)."""
     pool = await get_pool()
-    return await pool.fetchval(
-        "SELECT COUNT(*) FROM bookings WHERE game_id = $1 AND status != 'отменена'",
+    taken = await pool.fetchval(
+        "SELECT COALESCE(SUM(slots_count), 0) FROM bookings WHERE game_id = $1 AND status != 'отменена'",
         game_id,
     )
+    return int(taken)
 
 
-async def get_games_needing_reminder() -> list:
+async def get_games_needing_reminder_24h() -> list:
+    """Игры, для которых пора отправить напоминание за 24 часа (окно
+    23-25ч, чтобы точно поймать нужный момент при ежечасной/более частой
+    проверке планировщиком) и оно ещё не было отправлено."""
     pool = await get_pool()
     rows = await pool.fetch(
         """
@@ -201,23 +215,61 @@ async def get_games_needing_reminder() -> list:
     return _to_dict_list(rows)
 
 
-async def mark_reminder_sent(game_id: int) -> None:
+async def get_games_needing_reminder_2h() -> list:
+    """Аналогично get_games_needing_reminder_24h, но для напоминания за 2
+    часа. Окно уже (1ч45м-2ч15м), поэтому планировщик должен проверять чаще
+    (см. main() в bot.py/app.py — интервал 15 минут)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT * FROM games
+        WHERE reminder_2h_sent = FALSE
+          AND (game_date + game_time) BETWEEN NOW() + INTERVAL '1 hour 45 minutes'
+                                            AND NOW() + INTERVAL '2 hours 15 minutes'
+        """
+    )
+    return _to_dict_list(rows)
+
+
+async def mark_reminder_24h_sent(game_id: int) -> None:
     pool = await get_pool()
     await pool.execute("UPDATE games SET reminder_sent = TRUE WHERE id = $1", game_id)
+
+
+async def mark_reminder_2h_sent(game_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE games SET reminder_2h_sent = TRUE WHERE id = $1", game_id)
 
 
 # ---------------------------------------------------------------------------
 # BOOKINGS
 # ---------------------------------------------------------------------------
 
-async def create_booking_safe(user_id: int, game_id: int) -> dict:
+MAX_SLOTS_PER_BOOKING = 4
+
+
+async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) -> dict:
     """Атомарно проверяет наличие свободных мест и создаёт заявку в одной
     транзакции с блокировкой строки игры (SELECT ... FOR UPDATE), чтобы
     исключить race condition при одновременной записи нескольких игроков
     на последнее свободное место.
 
-    Возвращает dict {"status": "ok"|"full"|"duplicate"|"not_found", "booking": ...}
+    slots_count — сколько мест игрок бронирует за один раз (фича «Сколько
+    мест? (1-4)» в боте). Валидируем диапазон и здесь же, а не только в
+    интерфейсе бота — это защита на уровне данных на случай ошибки/подмены
+    callback_data.
+
+    Возвращает dict {"status": "ok"|"full"|"duplicate"|"not_found",
+    "booking": ..., "game": ...}.
+
+    Отдаём game здесь же (мы и так уже сходили за ней в БД внутри
+    транзакции) — раньше bot.py делал отдельный предварительный
+    get_game_by_id() перед вызовом этой функции только чтобы получить те же
+    данные для текста сообщения/уведомления админу, то есть на каждую
+    заявку тратился лишний round-trip к БД.
     """
+    slots_count = max(1, min(MAX_SLOTS_PER_BOOKING, int(slots_count)))
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -225,7 +277,8 @@ async def create_booking_safe(user_id: int, game_id: int) -> dict:
                 "SELECT * FROM games WHERE id = $1 FOR UPDATE", game_id
             )
             if game is None:
-                return {"status": "not_found", "booking": None}
+                return {"status": "not_found", "booking": None, "game": None}
+            game_dict = _to_dict(game)
 
             existing = await conn.fetchrow(
                 """SELECT * FROM bookings
@@ -233,21 +286,21 @@ async def create_booking_safe(user_id: int, game_id: int) -> dict:
                 user_id, game_id,
             )
             if existing is not None:
-                return {"status": "duplicate", "booking": _to_dict(existing)}
+                return {"status": "duplicate", "booking": _to_dict(existing), "game": game_dict}
 
             taken = await conn.fetchval(
-                "SELECT COUNT(*) FROM bookings WHERE game_id = $1 AND status != 'отменена'",
+                "SELECT COALESCE(SUM(slots_count), 0) FROM bookings WHERE game_id = $1 AND status != 'отменена'",
                 game_id,
             )
-            if taken >= game["total_slots"]:
-                return {"status": "full", "booking": None}
+            if taken + slots_count > game["total_slots"]:
+                return {"status": "full", "booking": None, "game": game_dict}
 
             booking = await conn.fetchrow(
-                """INSERT INTO bookings (user_id, game_id, status)
-                   VALUES ($1, $2, 'новая') RETURNING *""",
-                user_id, game_id,
+                """INSERT INTO bookings (user_id, game_id, status, slots_count)
+                   VALUES ($1, $2, 'новая', $3) RETURNING *""",
+                user_id, game_id, slots_count,
             )
-            return {"status": "ok", "booking": _to_dict(booking)}
+            return {"status": "ok", "booking": _to_dict(booking), "game": game_dict}
 
 
 async def get_active_bookings_for_user(user_id: int) -> list:
@@ -306,6 +359,40 @@ async def get_participants_for_game(game_id: int) -> list:
         game_id,
     )
     return _to_dict_list(rows)
+
+
+# ---------------------------------------------------------------------------
+# PAYMENTS — оплата через бота (см. payment_provider.py и bot.py)
+# ---------------------------------------------------------------------------
+
+async def create_payment(booking_id: int, amount: float, method: Optional[str] = None) -> dict:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """INSERT INTO payments (booking_id, amount, status, method)
+           VALUES ($1, $2, 'ожидает', $3) RETURNING *""",
+        booking_id, amount, method,
+    )
+    return _to_dict(row)
+
+
+async def get_payment_by_id(payment_id: int) -> Optional[dict]:
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
+    return _to_dict(row)
+
+
+async def set_payment_method(payment_id: int, method: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE payments SET method = $1 WHERE id = $2", method, payment_id)
+
+
+async def confirm_payment(payment_id: int) -> None:
+    """Используется автоматическим подтверждением оплаты картой через
+    реальный Telegram Payments provider (см. process_successful_payment в
+    bot.py) — если провайдер не подключён, подтверждение делает
+    администратор вручную в CRM (db.confirm_payment в database.py)."""
+    pool = await get_pool()
+    await pool.execute("UPDATE payments SET status = 'подтверждена' WHERE id = $1", payment_id)
 
 
 # ---------------------------------------------------------------------------
