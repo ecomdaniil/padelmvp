@@ -1,0 +1,16 @@
+{% if pagination and pagination.total_pages > 1 %}
+<div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-top:18px; flex-wrap:wrap;">
+    {% set args = request.args.to_dict() %}
+    {% if pagination.has_prev %}
+        {% set _ = args.update({'page': pagination.page - 1}) %}
+        <a class="btn btn-secondary" href="{{ url_for(request.endpoint, **args) }}">← Назад</a>
+    {% endif %}
+    <span style="font-size:14px; color:var(--muted);">
+        Страница {{ pagination.page }} из {{ pagination.total_pages }} · всего записей: {{ pagination.total }}
+    </span>
+    {% if pagination.has_next %}
+        {% set _ = args.update({'page': pagination.page + 1}) %}
+        <a class="btn btn-secondary" href="{{ url_for(request.endpoint, **args) }}">Вперёд →</a>
+    {% endif %}
+</div>
+{% endif %}

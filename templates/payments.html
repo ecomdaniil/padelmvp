@@ -1,6 +1,22 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>Оплаты</h1>
+    <div style="background: white; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+        <form method="get" style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+                <input type="text" name="search" placeholder="Поиск по имени игрока..." value="{{ request.args.get('search', '') }}" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div>
+                <select name="status" style="padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="">Все статусы</option>
+                    <option value="ожидает" {% if request.args.get('status') == 'ожидает' %}selected{% endif %}>ожидает</option>
+                    <option value="подтверждена" {% if request.args.get('status') == 'подтверждена' %}selected{% endif %}>подтверждена</option>
+                </select>
+            </div>
+            <button type="submit" class="btn">Фильтровать</button>
+            <a href="{{ url_for('payments_list') }}" class="btn btn-secondary">Сбросить</a>
+        </form>
+    </div>
     <table>
         <tr>
             <th>Игрок</th><th>Игра</th><th>Сумма</th><th>Статус</th><th></th>
@@ -20,8 +36,11 @@
             <td>
                 {% if p.status != 'подтверждена' %}
                 <form method="post" action="{{ url_for('payment_confirm', payment_id=p.id) }}">
-                    <button class="btn" type="submit">Подтвердить оплату</button>
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="btn" type="submit">✓ Подтвердить</button>
                 </form>
+                {% else %}
+                <span style="color: #6b7280; font-size: 13px;">Оплачено</span>
                 {% endif %}
             </td>
         </tr>
@@ -29,4 +48,5 @@
         <tr><td colspan="5">Оплат пока нет.</td></tr>
         {% endfor %}
     </table>
+    {% include "_pagination.html" %}
 {% endblock %}

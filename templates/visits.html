@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Посещения</h1>
+    <table>
+        <tr>
+            <th>Игрок</th><th>Телефон</th><th>Игра</th><th>Дата</th>
+        </tr>
+        {% for v in visits %}
+        <tr>
+            <td>{{ v.user_name }}</td>
+            <td>{{ v.user_phone }}</td>
+            <td>{{ v.location }}</td>
+            <td>{{ v.game_date.strftime('%d.%m.%Y') }} {{ v.game_time.strftime('%H:%M') }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4">Посещений пока нет.</td></tr>
+        {% endfor %}
+    </table>
+    {% include "_pagination.html" %}
+{% endblock %}
