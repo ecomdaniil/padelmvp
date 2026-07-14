@@ -16,5 +16,5 @@ if __name__ == "__main__":
     migrate_db()
     print(
         "Готово! Таблицы users, games, bookings, payments, reviews, clubs, "
-        "action_logs, club_info и индексы созданы (или уже существовали)."
+        "admin_logs, club_info и индексы созданы (или уже существовали)."
     )

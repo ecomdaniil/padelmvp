@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Что-то пошло не так</h1>
+    <div class="card">
+        <p>Произошла временная ошибка на сервере. Ваш вход в систему сохранён — просто обновите страницу или вернитесь на главную.</p>
+        {% if message %}
+            <p style="color:#991b1b; font-family: monospace; font-size: 13px;">{{ message }}</p>
+        {% endif %}
+        <a href="{{ url_for('index') }}" class="btn">На главную</a>
+    </div>
+{% endblock %}

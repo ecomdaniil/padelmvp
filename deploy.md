@@ -50,7 +50,7 @@ python init_db.py
 ## 5. Запуск через Gunicorn
 ```bash
 source venv/bin/activate
-gunicorn --workers 1 --bind 0.0.0.0:8000 app:app
+gunicorn --workers 1 --worker-class gthread --threads 4 --timeout 60 --bind 0.0.0.0:8000 app:app
 ```
 
 > Важно: при `RUN_BOT_IN_BACKGROUND=1` бот запускается фоновым потоком
@@ -60,6 +60,12 @@ gunicorn --workers 1 --bind 0.0.0.0:8000 app:app
 > кэши списка игр между воркерами. Если нужно больше воркеров для CRM —
 > задайте `REDIS_URL` (общий кэш/rate-limit) и запускайте бота отдельным
 > сервисом (`RUN_BOT_IN_BACKGROUND=0` + отдельный процесс `python bot.py`).
+>
+> `--worker-class gthread --threads 4` обязателен именно с одним воркером:
+> базовый sync-воркер gunicorn обрабатывает запросы строго по одному, и на
+> время обработки webhook от Telegram (или любого другого медленного
+> запроса) вся CRM-панель перестаёт отвечать. Потоки решают это без второго
+> процесса — общий кэш/бот/планировщик остаются одним экземпляром.
 
 Для стабильности лучше запускать через systemd. Пример сервиса:
 ```bash
@@ -71,7 +77,7 @@ After=network.target
 [Service]
 WorkingDirectory=/var/www/padel_mvp
 Environment=PATH=/var/www/padel_mvp/venv/bin
-ExecStart=/var/www/padel_mvp/venv/bin/gunicorn --workers 1 --bind 0.0.0.0:8000 app:app
+ExecStart=/var/www/padel_mvp/venv/bin/gunicorn --workers 1 --worker-class gthread --threads 4 --timeout 60 --bind 0.0.0.0:8000 app:app
 Restart=always
 User=www-data
 

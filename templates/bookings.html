@@ -1,6 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>Заявки</h1>
+    <div id="live-banner" class="live-banner">
+        <span>🔔 Появились новые заявки — список мог обновиться.</span>
+        <button type="button" class="btn" onclick="window.location.reload()">Обновить</button>
+    </div>
     <div style="background: white; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
         <form method="get" style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
             <div style="flex: 1; min-width: 200px;">
@@ -54,4 +58,12 @@
         {% endfor %}
     </table>
     {% include "_pagination.html" %}
+{% endblock %}
+{% block extra_scripts %}
+<script>
+    startLiveActivityPoll({
+        initial: {{ (activity.max_booking_id ~ ':' ~ activity.bookings_count) | tojson }},
+        extract: function (d) { return d.max_booking_id + ':' + d.bookings_count; }
+    });
+</script>
 {% endblock %}

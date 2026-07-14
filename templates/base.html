@@ -194,12 +194,58 @@
         .theme-toggle {
             display: none;
         }
+        nav a.active {
+            color: #ffffff;
+            background: rgba(255,255,255,0.16);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.22);
+        }
+        .icon-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(255,255,255,0.08);
+            color: #e8edf5;
+            cursor: pointer;
+            padding: 0;
+            transition: background 0.2s ease, transform 0.15s ease;
+        }
+        .icon-btn:hover {
+            background: rgba(255,255,255,0.18);
+            color: #ffffff;
+            transform: translateY(-1px);
+        }
+        .icon-btn svg {
+            width: 18px;
+            height: 18px;
+            stroke: currentColor;
+            fill: none;
+        }
         .container {
             max-width: 1280px;
             margin: 28px auto 44px;
             padding: 0 22px;
             animation: pageEnter 0.7s cubic-bezier(.2,.8,.2,1) both;
             background: transparent;
+        }
+        .table-scroll {
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            border-radius: 12px;
+        }
+        .table-scroll table {
+            min-width: 560px;
+        }
+        @media (max-width: 600px) {
+            h1 { font-size: 20px; }
+            .card, .stat-card { padding: 14px; border-radius: 16px; }
+            th, td { padding: 9px 10px; font-size: 13px; }
+            .btn { padding: 7px 12px; font-size: 13px; }
+            .container { margin: 18px auto 28px; }
         }
         @keyframes pageEnter {
             from { opacity: 0; transform: translateY(10px); }
@@ -355,6 +401,23 @@
             background: #64748b;
             color: #ffffff;
         }
+        .live-banner {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            background: linear-gradient(90deg, #ecfdf5 0%, #f0fdf4 100%);
+            border: 1px solid #86efac;
+            color: #166534;
+            padding: 10px 16px;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            font-size: 14px;
+            font-weight: 600;
+            animation: panelEnter 0.4s cubic-bezier(.2,.8,.2,1) both;
+        }
+        .live-banner.show { display: flex; }
+        .live-banner .btn { padding: 6px 14px; font-size: 13px; }
     </style>
 </head>
 <body>
@@ -366,20 +429,25 @@
         </div>
         <button class="nav-toggle" type="button" aria-label="Открыть меню">☰</button>
         <div class="nav-links">
-            <a href="{{ url_for('index') }}">Главная</a>
-            <a href="{{ url_for('games_list') }}">Игры</a>
-            <a href="{{ url_for('bookings_list') }}">Заявки</a>
-            <a href="{{ url_for('payments_list') }}">Оплаты</a>
-            <a href="{{ url_for('visits_list') }}">Посещения</a>
-            <a href="{{ url_for('clubs_list') }}">Клубы</a>
-            <a href="{{ url_for('logs_list') }}">Журнал</a>
-            <a href="{{ url_for('about_club') }}">О клубе</a>
-            <a href="{{ url_for('reviews_list') }}">Отзывы</a>
+            <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint == 'index' }}">Главная</a>
+            <a href="{{ url_for('games_list') }}" class="{{ 'active' if request.endpoint in ['games_list', 'game_new', 'game_edit'] }}">Игры</a>
+            <a href="{{ url_for('bookings_list') }}" class="{{ 'active' if request.endpoint == 'bookings_list' }}">Заявки</a>
+            <a href="{{ url_for('payments_list') }}" class="{{ 'active' if request.endpoint == 'payments_list' }}">Оплаты</a>
+            <a href="{{ url_for('visits_list') }}" class="{{ 'active' if request.endpoint == 'visits_list' }}">Посещения</a>
+            <a href="{{ url_for('clubs_list') }}" class="{{ 'active' if request.endpoint in ['clubs_list', 'club_new', 'club_edit'] }}">Клубы</a>
+            <a href="{{ url_for('logs_list') }}" class="{{ 'active' if request.endpoint == 'logs_list' }}">Журнал</a>
+            <a href="{{ url_for('reviews_list') }}" class="{{ 'active' if request.endpoint == 'reviews_list' }}">Отзывы</a>
         </div>
         <div class="nav-actions">
             <form method="post" action="{{ url_for('logout') }}" style="margin:0;">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <button type="submit" style="background:none; border:none; color:#e8edf5; font-weight:600; font-size:14px; cursor:pointer; padding:8px 12px;">Выйти</button>
+                <button type="submit" class="icon-btn" title="Выйти" aria-label="Выйти">
+                    <svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                        <polyline points="16 17 21 12 16 7"></polyline>
+                        <line x1="21" y1="12" x2="9" y2="12"></line>
+                    </svg>
+                </button>
             </form>
         </div>
     </nav>
@@ -401,6 +469,48 @@
                 navLinks.classList.toggle('open');
             });
         }
+
+        // Оборачиваем все таблицы в горизонтально скроллящийся контейнер —
+        // единая точка адаптивности для страниц со списками (заявки, оплаты,
+        // посещения, клубы, журнал, отзывы), не переделывая каждый шаблон.
+        document.querySelectorAll('.container table').forEach(function (table) {
+            if (table.parentElement.classList.contains('table-scroll')) return;
+            const wrapper = document.createElement('div');
+            wrapper.className = 'table-scroll';
+            table.parentNode.insertBefore(wrapper, table);
+            wrapper.appendChild(table);
+        });
+
+        // Поллинг «свежести» данных для страниц заявок/оплат — см.
+        // /api/activity и вызовы startLiveActivityPoll() в bookings.html /
+        // payments.html. Если что-то новое появилось (например, бронирование
+        // из бота) и админ ничем не занят (не выбирает статус в форме),
+        // страница обновляется сама; если занят — просто показываем баннер.
+        window.startLiveActivityPoll = function (opts) {
+            const banner = document.getElementById('live-banner');
+            if (!banner) return;
+            let known = opts.initial;
+            const check = function () {
+                fetch('/api/activity', { headers: { 'Accept': 'application/json' } })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (data) {
+                        if (!data) return;
+                        const current = opts.extract(data);
+                        if (current !== known) {
+                            const active = document.activeElement;
+                            const busy = active && ['SELECT', 'INPUT', 'TEXTAREA'].includes(active.tagName);
+                            if (busy) {
+                                banner.classList.add('show');
+                            } else {
+                                window.location.reload();
+                            }
+                        }
+                    })
+                    .catch(function () { /* сеть недоступна — просто пропускаем цикл */ });
+            };
+            setInterval(check, opts.intervalMs || 6000);
+        };
     </script>
+    {% block extra_scripts %}{% endblock %}
 </body>
 </html>

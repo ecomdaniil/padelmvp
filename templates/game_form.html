@@ -1,39 +1,109 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>{% if game %}Редактировать игру{% else %}Новая игра{% endif %}</h1>
-    <form method="post" style="background:white; padding:20px; border-radius:8px; max-width:400px;">
+    <form method="post" class="card" style="max-width:520px;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <p>
-            <label>Дата<br>
-            <input type="date" name="game_date" required
-                   value="{{ game.game_date.isoformat() if game else '' }}">
-            </label>
-        </p>
-        <p>
-            <label>Время<br>
-            <input type="time" name="game_time" required
-                   value="{{ game.game_time.strftime('%H:%M') if game else '' }}">
-            </label>
-        </p>
-        <p>
-            <label>Место<br>
-            <input type="text" name="location" required style="width:100%"
-                   value="{{ game.location if game else '' }}">
-            </label>
-        </p>
-        <p>
-            <label>Цена (₽)<br>
-            <input type="number" step="0.01" name="price" required
-                   value="{{ game.price if game else '' }}">
-            </label>
-        </p>
-        <p>
-            <label>Количество мест<br>
-            <input type="number" name="total_slots" required
-                   value="{{ game.total_slots if game else '' }}">
-            </label>
-        </p>
-        <button class="btn" type="submit">Сохранить</button>
-        <a class="btn btn-secondary" href="{{ url_for('games_list') }}">Отмена</a>
+
+        <div class="form-row">
+            <label for="game_date">Дата *</label>
+            <input type="date" id="game_date" name="game_date" required
+                   value="{{ values.game_date }}">
+        </div>
+
+        <div class="form-row">
+            <label for="game_time">Время *</label>
+            <input type="time" id="game_time" name="game_time" required
+                   value="{{ values.game_time }}">
+        </div>
+
+        <div class="form-row">
+            <label for="duration_minutes">Длительность (мин.) *</label>
+            <input type="number" id="duration_minutes" name="duration_minutes" required
+                   min="15" max="480" step="15"
+                   value="{{ values.duration_minutes }}">
+        </div>
+
+        <div class="form-row">
+            <label for="city">Город *</label>
+            <input type="text" id="city" name="city" required maxlength="100"
+                   placeholder="Например, Москва"
+                   value="{{ values.city }}">
+        </div>
+
+        <div class="form-row">
+            <label for="club_id">Клуб</label>
+            <select id="club_id" name="club_id" data-autofill-address>
+                <option value="">— не выбран —</option>
+                {% for c in clubs %}
+                <option value="{{ c.id }}" data-address="{{ c.address }}"
+                        {% if values.club_id == c.id|string %}selected{% endif %}>{{ c.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="form-row">
+            <label for="address">Адрес *</label>
+            <input type="text" id="address" name="address" required maxlength="255"
+                   placeholder="Улица, дом, корт"
+                   value="{{ values.address }}">
+        </div>
+
+        <div class="form-row">
+            <label for="price">Цена за место (₽) *</label>
+            <input type="number" id="price" name="price" required
+                   step="0.01" min="0.01"
+                   value="{{ values.price }}">
+        </div>
+
+        <div class="form-row">
+            <label for="total_slots">Макс. игроков *</label>
+            <input type="number" id="total_slots" name="total_slots" required
+                   min="1" max="100" step="1"
+                   value="{{ values.total_slots }}">
+        </div>
+
+        <div class="form-row">
+            <label for="level">Уровень</label>
+            <select id="level" name="level">
+                <option value="" {% if not values.level %}selected{% endif %}>Любой уровень</option>
+                {% for lvl in levels %}
+                <option value="{{ lvl }}" {% if values.level == lvl %}selected{% endif %}>{{ lvl }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="form-actions">
+            <button class="btn" type="submit">Сохранить</button>
+            <a class="btn btn-secondary" href="{{ url_for('games_list') }}">Отмена</a>
+        </div>
     </form>
+
+    <style>
+        .form-row { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
+        .form-row label { font-weight: 600; font-size: 13px; color: var(--muted); }
+        .form-row input, .form-row select { width: 100%; }
+        .form-actions { margin-top: 8px; display: flex; gap: 10px; flex-wrap: wrap; }
+        @media (min-width: 560px) {
+            form.card { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+            .form-actions { grid-column: 1 / -1; }
+        }
+    </style>
+
+    <script>
+        // Подсказка адреса из карточки выбранного клуба — заполняет поле
+        // "Адрес" только если оно ещё пустое, чтобы не перетирать то, что
+        // администратор уже ввёл вручную.
+        (function () {
+            const clubSelect = document.getElementById('club_id');
+            const addressInput = document.getElementById('address');
+            if (!clubSelect || !addressInput) return;
+            clubSelect.addEventListener('change', function () {
+                const opt = clubSelect.options[clubSelect.selectedIndex];
+                const addr = opt ? opt.getAttribute('data-address') : '';
+                if (addr && !addressInput.value.trim()) {
+                    addressInput.value = addr;
+                }
+            });
+        })();
+    </script>
 {% endblock %}

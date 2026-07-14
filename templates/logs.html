@@ -3,7 +3,8 @@
     <h1>Журнал действий</h1>
     <table>
         <tr>
-            <th>Дата</th><th>Действие</th><th>Тип сущности</th><th>ID</th><th>Детали</th>
+            <th>Дата</th><th>Действие</th><th>Тип сущности</th><th>ID</th>
+            <th>Было</th><th>Стало</th><th>Детали</th>
         </tr>
         {% for log in logs %}
         <tr>
@@ -11,10 +12,12 @@
             <td>{{ log.action }}</td>
             <td>{{ log.entity_type or '—' }}</td>
             <td>{{ log.entity_id or '—' }}</td>
+            <td style="max-width:260px; white-space:pre-wrap; word-break:break-word; font-size:12px;">{{ log.old_value or '—' }}</td>
+            <td style="max-width:260px; white-space:pre-wrap; word-break:break-word; font-size:12px;">{{ log.new_value or '—' }}</td>
             <td>{{ log.details or '—' }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="5">Записей в журнале пока нет.</td></tr>
+        <tr><td colspan="7">Записей в журнале пока нет.</td></tr>
         {% endfor %}
     </table>
     {% include "_pagination.html" %}

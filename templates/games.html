@@ -5,25 +5,103 @@
         <a class="btn" href="{{ url_for('game_new') }}">+ Создать игру</a>
         <a class="btn btn-secondary" href="{{ url_for('report_excel') }}">📊 Выгрузить отчёт в Excel</a>
     </div>
-    <table>
-        <tr>
-            <th>Дата</th><th>Время</th><th>Место</th><th>Цена</th>
-            <th>Мест</th><th>Записалось</th><th>Собрано оплат</th><th></th>
-        </tr>
+
+    <div class="card" style="margin-bottom:18px; padding:14px 16px;">
+        <form method="get" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+            <div style="min-width:200px;">
+                <select name="level" style="width:100%;">
+                    <option value="" {% if not selected_level %}selected{% endif %}>Все уровни</option>
+                    {% for lvl in levels %}
+                    <option value="{{ lvl }}" {% if selected_level == lvl %}selected{% endif %}>{{ lvl }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="submit" class="btn">Фильтровать</button>
+            <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
+        </form>
+    </div>
+
+    <div class="game-grid">
         {% for g in games %}
-        <tr>
-            <td>{{ g.game_date.strftime('%d.%m.%Y') }}</td>
-            <td>{{ g.game_time.strftime('%H:%M') }}</td>
-            <td>{{ g.location }}</td>
-            <td>{{ g.price }} ₽</td>
-            <td>{{ g.taken }} / {{ g.total_slots }}</td>
-            <td>{{ g.taken }}</td>
-            <td>{{ g.collected }} ₽</td>
-            <td><a class="btn btn-secondary" href="{{ url_for('game_edit', game_id=g.id) }}">Изменить</a></td>
-        </tr>
+        <div class="card game-card">
+            <div class="game-card-head">
+                <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
+                {% if g.level %}
+                <span class="badge badge-new">{{ g.level }}</span>
+                {% else %}
+                <span class="badge" style="background:#eef2f7; color:#475569;">любой уровень</span>
+                {% endif %}
+            </div>
+
+            <div class="game-card-location">
+                📍 {{ g.location }}
+                {% if g.club_name %}<div class="muted-line">Клуб: {{ g.club_name }}</div>{% endif %}
+                <div class="muted-line">Длительность: {{ g.duration_minutes or 90 }} мин.</div>
+            </div>
+
+            <div class="game-card-stats">
+                <div class="stat-box">
+                    <div class="stat-box-label">Цена за место</div>
+                    <div class="stat-box-value">{{ g.price }} ₽</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-box-label">Забронировано мест</div>
+                    <div class="stat-box-value">{{ g.taken }} / {{ g.total_slots }}</div>
+                    <div class="slots-bar">
+                        <div class="slots-bar-fill" style="width: {{ (g.taken / g.total_slots * 100) if g.total_slots else 0 }}%;"></div>
+                    </div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-box-label">Собрано оплат</div>
+                    <div class="stat-box-value">{{ g.collected }} ₽</div>
+                </div>
+            </div>
+
+            <div class="game-card-actions">
+                <a class="btn btn-secondary" href="{{ url_for('game_edit', game_id=g.id) }}">Изменить</a>
+                <form method="post" action="{{ url_for('game_delete', game_id=g.id) }}"
+                      onsubmit="return confirm('Удалить эту игру? Все заявки и оплаты по ней тоже будут удалены.');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn" style="background:#dc2626; box-shadow:none;">Удалить</button>
+                </form>
+            </div>
+        </div>
         {% else %}
-        <tr><td colspan="8">Игр пока нет. Создайте первую!</td></tr>
+        <div class="card">Игр пока нет. Создайте первую!</div>
         {% endfor %}
-    </table>
+    </div>
+
     {% include "_pagination.html" %}
+
+    <style>
+        .game-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px;
+        }
+        .game-card { display: flex; flex-direction: column; gap: 10px; }
+        .game-card-head {
+            display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+        }
+        .game-card-date { font-weight: 700; color: var(--primary); font-size: 15px; }
+        .game-card-location { font-size: 14px; color: var(--text); }
+        .muted-line { font-size: 12px; color: var(--muted); margin-top: 2px; }
+        .game-card-stats {
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+        }
+        .stat-box {
+            background: rgba(37,99,235,0.06);
+            border-radius: 12px;
+            padding: 8px 10px;
+        }
+        .stat-box-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+        .stat-box-value { font-size: 15px; font-weight: 700; color: var(--text); margin-top: 2px; }
+        .slots-bar { height: 5px; border-radius: 999px; background: rgba(37,99,235,0.12); margin-top: 6px; overflow: hidden; }
+        .slots-bar-fill { height: 100%; background: var(--primary); border-radius: 999px; }
+        .game-card-actions { display: flex; gap: 8px; margin-top: auto; }
+        .game-card-actions form { margin: 0; }
+        @media (max-width: 480px) {
+            .game-card-stats { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
 {% endblock %}
