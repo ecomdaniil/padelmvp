@@ -1255,10 +1255,21 @@ async def process_paid_notify(callback: CallbackQuery):
 
     if ADMIN_CHAT_ID:
         try:
+            # Имя берём из профиля в БД (то, что игрок указал при регистрации
+            # в боте, — надёжнее, чем Telegram-имя, которое человек может
+            # менять как угодно); username — только из Telegram, в профиле
+            # его не храним, и брать его больше не откуда.
+            db_user = await db.get_user_by_telegram_id(callback.from_user.id)
+            display_name = (db_user["name"] if db_user else None) or callback.from_user.full_name or "Игрок"
+            username = callback.from_user.username
+            username_part = f" (@{username})" if username else ""
+
             await callback.bot.send_message(
                 ADMIN_CHAT_ID,
                 "💰 <b>Игрок сообщил об оплате</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Пользователь {display_name}{username_part} сообщил об оплате "
+                f"брони №{payment['booking_id']}\n\n"
                 f"🆔 Платёж #{payment_id}\n"
                 f"💳 Способ: {payment.get('method') or '—'}\n"
                 f"💰 Сумма: {payment['amount']} ₽\n\n"
