@@ -22,13 +22,14 @@ import logging
 import os
 import secrets
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime, time as time_type
+from decimal import Decimal
 from functools import wraps
 
 from dotenv import load_dotenv
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, session, flash, send_file
+    url_for, session, flash, send_file, jsonify
 )
 from flask_compress import Compress
 from flask_wtf import CSRFProtect
@@ -361,6 +362,42 @@ def api_activity():
     выборка (см. db.get_latest_activity_marker), не создаёт заметной
     нагрузки даже при частом опросе."""
     return db.get_latest_activity_marker(), 200
+
+
+def _json_value(value):
+    """psycopg2 отдаёт Decimal/date/time/datetime, которые стандартный JSON
+    не умеет сериализовать сам — приводим к простым JSON-совместимым типам."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y %H:%M")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, time_type):
+        return str(value)[:5]
+    return value
+
+
+def _json_row(row):
+    if row is None:
+        return None
+    return {key: _json_value(value) for key, value in dict(row).items()}
+
+
+@app.route("/api/games/<int:game_id>/details")
+@login_required
+def api_game_details(game_id):
+    """Полные сведения об игре (все поля + список участников с оплатами) —
+    используется модальным окном "Подробнее" на карточке игры в /games:
+    клик по иконке игры (в отличие от кнопки "Изменить") не переходит на
+    другую страницу, а подгружает эти данные через fetch()."""
+    details = db.get_game_details(game_id)
+    if not details:
+        return jsonify({"error": "Игра не найдена"}), 404
+    return jsonify({
+        "game": _json_row(details["game"]),
+        "participants": [_json_row(p) for p in details["participants"]],
+    })
 
 
 # ---------------------------------------------------------------------------

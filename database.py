@@ -992,6 +992,64 @@ def get_bookings_paginated(search: str = "", status: str = "", page: int = 1, pe
     return result
 
 
+def get_game_details(game_id: int):
+    """Полная информация об игре для карточки "Подробнее" в CRM: сама игра
+    (с клубом, реальным числом занятых мест из bookings, собранными оплатами)
+    плюс список участников с их статусом брони/оплаты. Используется
+    api_game_details в app.py."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT g.*, c.name AS club_name,
+               COALESCE(bk.taken, 0) AS taken,
+               COALESCE(pm.collected, 0) AS collected
+        FROM games g
+        LEFT JOIN clubs c ON c.id = g.club_id
+        LEFT JOIN (
+            SELECT game_id, SUM(slots_count) AS taken
+            FROM bookings
+            WHERE status != 'отменена'
+            GROUP BY game_id
+        ) bk ON bk.game_id = g.id
+        LEFT JOIN (
+            SELECT b.game_id, SUM(p.amount) AS collected
+            FROM payments p
+            JOIN bookings b ON b.id = p.booking_id
+            WHERE p.status = 'подтверждена'
+            GROUP BY b.game_id
+        ) pm ON pm.game_id = g.id
+        WHERE g.id = %s
+        """,
+        (game_id,),
+    )
+    game = cur.fetchone()
+    if not game:
+        cur.close()
+        conn.close()
+        return None
+
+    cur.execute(
+        """
+        SELECT b.id AS booking_id, b.status AS booking_status, b.slots_count,
+               b.created_at AS booked_at,
+               u.name AS user_name, u.phone AS user_phone, u.level AS user_level,
+               u.telegram_id,
+               p.status AS payment_status, p.amount AS payment_amount, p.method AS payment_method
+        FROM bookings b
+        JOIN users u ON u.id = b.user_id
+        LEFT JOIN payments p ON p.booking_id = b.id
+        WHERE b.game_id = %s
+        ORDER BY b.created_at
+        """,
+        (game_id,),
+    )
+    participants = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {"game": game, "participants": participants}
+
+
 def get_participants_for_game(game_id: int):
     """Список игроков, записанных на конкретную игру (для напоминаний)."""
     conn = get_connection()

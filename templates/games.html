@@ -51,7 +51,12 @@
         {% for g in games %}
         <div class="card game-card">
             <div class="game-card-head">
-                <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
+                <button type="button" class="game-icon-btn" data-game-id="{{ g.id }}"
+                        title="Подробнее об игре №{{ g.id }}">🎾</button>
+                <div class="game-card-head-main">
+                    <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
+                    <div class="game-card-number">№{{ g.id }}</div>
+                </div>
                 {% if g.level %}
                 <span class="badge badge-new">{{ g.level }}</span>
                 {% else %}
@@ -78,6 +83,10 @@
                     </div>
                 </div>
                 <div class="stat-box">
+                    <div class="stat-box-label">Занято мест (вручную)</div>
+                    <div class="stat-box-value">{{ g.booked_places or 0 }} / {{ g.total_slots }}</div>
+                </div>
+                <div class="stat-box">
                     <div class="stat-box-label">Собрано оплат</div>
                     <div class="stat-box-value">{{ g.collected }} ₽</div>
                 </div>
@@ -99,6 +108,13 @@
 
     {% include "_pagination.html" %}
 
+    <div id="game-details-modal" class="modal-overlay">
+        <div class="modal-box">
+            <button type="button" class="modal-close" id="game-details-close" aria-label="Закрыть">×</button>
+            <div id="game-details-content"></div>
+        </div>
+    </div>
+
     <style>
         .filter-label {
             display: block;
@@ -117,11 +133,25 @@
         .game-card-head {
             display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
         }
+        .game-card-head-main { flex: 1; min-width: 0; }
+        .game-icon-btn {
+            flex: 0 0 auto;
+            width: 36px; height: 36px;
+            border-radius: 50%;
+            border: none;
+            background: rgba(37,99,235,0.10);
+            font-size: 18px;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: background 0.15s ease;
+        }
+        .game-icon-btn:hover { background: rgba(37,99,235,0.2); }
         .game-card-date { font-weight: 700; color: var(--primary); font-size: 15px; }
+        .game-card-number { font-size: 12px; color: var(--muted); font-weight: 600; }
         .game-card-location { font-size: 14px; color: var(--text); }
         .muted-line { font-size: 12px; color: var(--muted); margin-top: 2px; }
         .game-card-stats {
-            display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
         }
         .stat-box {
             background: rgba(37,99,235,0.06);
@@ -137,5 +167,140 @@
         @media (max-width: 480px) {
             .game-card-stats { grid-template-columns: 1fr 1fr; }
         }
+
+        .modal-overlay {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(15, 23, 42, 0.5);
+            align-items: center; justify-content: center;
+            padding: 16px;
+            z-index: 1000;
+        }
+        .modal-overlay.open { display: flex; }
+        .modal-box {
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
+            max-width: 640px;
+            width: 100%;
+            max-height: 85vh;
+            overflow-y: auto;
+            position: relative;
+            box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+        }
+        .modal-close {
+            position: absolute; top: 14px; right: 14px;
+            width: 32px; height: 32px;
+            border-radius: 50%;
+            border: none;
+            background: #f1f5f9;
+            font-size: 18px;
+            cursor: pointer;
+        }
+        .modal-close:hover { background: #e2e8f0; }
+        .details-grid { display: grid; gap: 6px; margin: 14px 0 18px; }
+        .detail-row { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; padding: 4px 0; border-bottom: 1px dashed #e2e8f0; }
+        .detail-label { color: var(--muted); }
+        .detail-value { font-weight: 600; text-align: right; }
+        .details-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .details-table th, .details-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #eef2f7; }
+        .details-table th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
     </style>
+
+    <script>
+        (function () {
+            const modal = document.getElementById('game-details-modal');
+            const content = document.getElementById('game-details-content');
+            const closeBtn = document.getElementById('game-details-close');
+            if (!modal || !content || !closeBtn) return;
+
+            function esc(value) {
+                const div = document.createElement('div');
+                div.textContent = (value === null || value === undefined || value === '') ? '—' : String(value);
+                return div.innerHTML;
+            }
+
+            function detailRow(label, value) {
+                return '<div class="detail-row"><span class="detail-label">' + esc(label) +
+                       '</span><span class="detail-value">' + esc(value) + '</span></div>';
+            }
+
+            function renderDetails(data) {
+                const g = data.game;
+                const participants = data.participants || [];
+
+                let html = '<h2 style="margin-top:0;">Игра №' + esc(g.id) + '</h2>';
+                html += '<div class="details-grid">';
+                html += detailRow('Дата и время', g.game_date + ' в ' + g.game_time);
+                html += detailRow('Город', g.city);
+                html += detailRow('Клуб', g.club_name);
+                html += detailRow('Адрес', g.address || g.location);
+                html += detailRow('Длительность', (g.duration_minutes || 90) + ' мин.');
+                html += detailRow('Уровень', g.level || 'любой уровень');
+                html += detailRow('Цена за место', g.price + ' ₽');
+                html += detailRow('Макс. игроков', g.total_slots);
+                html += detailRow('Занято по бронированиям', g.taken + ' из ' + g.total_slots);
+                html += detailRow('Занято мест (вручную)', (g.booked_places || 0) + ' из ' + g.total_slots);
+                html += detailRow('Собрано оплат', g.collected + ' ₽');
+                html += '</div>';
+
+                html += '<h3>Участники (' + participants.length + ')</h3>';
+                if (!participants.length) {
+                    html += '<p class="muted-line">Пока никто не записался.</p>';
+                } else {
+                    html += '<table class="details-table"><thead><tr>' +
+                        '<th>Игрок</th><th>Телефон</th><th>Уровень</th><th>Мест</th>' +
+                        '<th>Статус брони</th><th>Оплата</th><th>Записан</th>' +
+                        '</tr></thead><tbody>';
+                    participants.forEach(function (p) {
+                        const paymentText = p.payment_status
+                            ? esc(p.payment_status) + (p.payment_amount ? ' (' + esc(p.payment_amount) + ' ₽)' : '')
+                            : '—';
+                        html += '<tr>' +
+                            '<td>' + esc(p.user_name) + '</td>' +
+                            '<td>' + esc(p.user_phone) + '</td>' +
+                            '<td>' + esc(p.user_level) + '</td>' +
+                            '<td>' + esc(p.slots_count) + '</td>' +
+                            '<td>' + esc(p.booking_status) + '</td>' +
+                            '<td>' + paymentText + '</td>' +
+                            '<td>' + esc(p.booked_at) + '</td>' +
+                            '</tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                return html;
+            }
+
+            function openModal() { modal.classList.add('open'); }
+            function closeModal() { modal.classList.remove('open'); content.innerHTML = ''; }
+
+            closeBtn.addEventListener('click', closeModal);
+            modal.addEventListener('click', function (e) {
+                if (e.target === modal) closeModal();
+            });
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && modal.classList.contains('open')) closeModal();
+            });
+
+            document.querySelectorAll('.game-icon-btn').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    const gameId = btn.getAttribute('data-game-id');
+                    content.innerHTML = '<p>Загрузка…</p>';
+                    openModal();
+                    fetch('/api/games/' + gameId + '/details')
+                        .then(function (r) { return r.json(); })
+                        .then(function (data) {
+                            if (data.error) {
+                                content.innerHTML = '<p>' + esc(data.error) + '</p>';
+                                return;
+                            }
+                            content.innerHTML = renderDetails(data);
+                        })
+                        .catch(function () {
+                            content.innerHTML = '<p>Не удалось загрузить сведения об игре.</p>';
+                        });
+                });
+            });
+        })();
+    </script>
 {% endblock %}
