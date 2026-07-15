@@ -226,6 +226,11 @@ def _describe_game_diff(old: dict, new: dict) -> str:
         )
     if (old.get("level") or "") != (new.get("level") or ""):
         changes.append(f"уровень изменён с «{old.get('level') or '—'}» на «{new.get('level') or '—'}»")
+    if (old.get("booked_places") or 0) != (new.get("booked_places") or 0):
+        changes.append(
+            f"занято мест (вручную) изменено с {old.get('booked_places') or 0} "
+            f"на {new.get('booked_places') or 0}"
+        )
     return "; ".join(changes) if changes else "без изменений"
 
 
@@ -376,6 +381,7 @@ def _game_values_from_form(form):
         "total_slots": form.get("total_slots", "").strip(),
         "duration_minutes": form.get("duration_minutes", "").strip(),
         "level": form.get("level", "").strip(),
+        "booked_places": form.get("booked_places", "").strip(),
     }
 
 
@@ -385,7 +391,7 @@ def _game_values_from_row(game):
         return {
             "game_date": "", "game_time": "", "city": "", "club_id": "",
             "address": "", "price": "", "total_slots": "",
-            "duration_minutes": "90", "level": "",
+            "duration_minutes": "90", "level": "", "booked_places": "0",
         }
     return {
         "game_date": game["game_date"].isoformat(),
@@ -397,6 +403,7 @@ def _game_values_from_row(game):
         "total_slots": str(game["total_slots"]),
         "duration_minutes": str(game.get("duration_minutes") or 90),
         "level": game.get("level") or "",
+        "booked_places": str(game.get("booked_places") or 0),
     }
 
 
@@ -452,6 +459,16 @@ def _validate_game_values(values, clubs_by_id):
         parsed["total_slots"] = total_slots
     except ValueError:
         errors.append("Укажите корректное количество мест (целое число).")
+
+    try:
+        booked_places = int(values.get("booked_places") or 0)
+        if booked_places < 0:
+            errors.append("Занято мест не может быть отрицательным.")
+        elif "total_slots" in parsed and booked_places > parsed["total_slots"]:
+            errors.append("Занято мест не может превышать максимальное количество игроков.")
+        parsed["booked_places"] = booked_places
+    except ValueError:
+        errors.append("Укажите корректное число занятых мест (целое число).")
 
     try:
         duration = int(values["duration_minutes"])
@@ -552,6 +569,7 @@ def game_new():
             address=parsed["address"],
             duration_minutes=parsed["duration_minutes"],
             level=parsed["level"],
+            booked_places=parsed["booked_places"],
         )
         # Бот кэширует список ближайших игр (см. cache.py/bot.py) — без
         # явного сброса здесь новая игра была видна в боте только после
@@ -591,7 +609,8 @@ def game_edit(game_id):
             for e in errors:
                 flash(e)
             return render_template(
-                "game_form.html", game=game, values=values, clubs=clubs, levels=GAME_LEVELS
+                "game_form.html", game=game, values=values, clubs=clubs, levels=GAME_LEVELS,
+                actual_taken=db.count_bookings_for_game(game_id),
             )
 
         location = _build_game_location(parsed, clubs_by_id)
@@ -608,16 +627,32 @@ def game_edit(game_id):
             address=parsed["address"],
             duration_minutes=parsed["duration_minutes"],
             level=parsed["level"],
+            booked_places=parsed["booked_places"],
         )
+
+        # Ручное booked_places — независимое поле, не связанное со списком
+        # реальных броней (bookings). Если админ поставил значение меньше
+        # фактического числа занятых по бронированиям мест — это подозрительно
+        # (может скрыть переполненность игры), но по требованию это не должно
+        # блокировать сохранение — только фиксируется в логах для отладки.
+        actual_taken = db.count_bookings_for_game(game_id)
+        if parsed["booked_places"] < actual_taken:
+            logger.warning(
+                "Игра №%s: вручную установлено занято мест (%s) меньше фактического "
+                "числа мест по активным бронированиям (%s)",
+                game_id, parsed["booked_places"], actual_taken,
+            )
+
         cache.invalidate_games_cache()
         description = f"Игра №{game_id} отредактирована: {_describe_game_diff(old_snapshot, dict(updated))}"
         log_admin_action("update", "game", game_id, description=description)
         flash("Игра обновлена")
         return redirect(url_for("games_list"))
 
+    actual_taken = db.count_bookings_for_game(game_id)
     return render_template(
         "game_form.html", game=game, values=_game_values_from_row(game),
-        clubs=clubs, levels=GAME_LEVELS,
+        clubs=clubs, levels=GAME_LEVELS, actual_taken=actual_taken,
     )
 
 

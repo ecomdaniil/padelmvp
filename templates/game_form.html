@@ -72,6 +72,25 @@
             </select>
         </div>
 
+        <div class="form-row">
+            <label for="booked_places">Занято мест (вручную)</label>
+            <input type="number" id="booked_places" name="booked_places"
+                   min="0" max="{{ values.total_slots or 100 }}" step="1"
+                   value="{{ values.booked_places }}">
+            {% if actual_taken is defined %}
+            <small class="field-hint">
+                По реальным бронированиям сейчас занято: {{ actual_taken }}
+                {% if game %}из {{ game.total_slots }}{% endif %}.
+                Это поле — независимая ручная корректировка (например, для игроков,
+                записанных не через бота); список бронирований она не меняет.
+            </small>
+            {% else %}
+            <small class="field-hint">
+                Ручная корректировка занятых мест — не влияет на список бронирований.
+            </small>
+            {% endif %}
+        </div>
+
         <div class="form-actions">
             <button class="btn" type="submit">Сохранить</button>
             <a class="btn btn-secondary" href="{{ url_for('games_list') }}">Отмена</a>
@@ -82,6 +101,7 @@
         .form-row { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
         .form-row label { font-weight: 600; font-size: 13px; color: var(--muted); }
         .form-row input, .form-row select { width: 100%; }
+        .field-hint { font-size: 12px; color: var(--muted); line-height: 1.4; }
         .form-actions { margin-top: 8px; display: flex; gap: 10px; flex-wrap: wrap; }
         @media (min-width: 560px) {
             form.card { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
@@ -102,6 +122,21 @@
                 const addr = opt ? opt.getAttribute('data-address') : '';
                 if (addr && !addressInput.value.trim()) {
                     addressInput.value = addr;
+                }
+            });
+        })();
+
+        // "Занято мест" не может превышать "Макс. игроков" — держим max
+        // атрибут в актуальном состоянии на клиенте (окончательная проверка
+        // всё равно на сервере, это только для удобства).
+        (function () {
+            const totalSlotsInput = document.getElementById('total_slots');
+            const bookedInput = document.getElementById('booked_places');
+            if (!totalSlotsInput || !bookedInput) return;
+            totalSlotsInput.addEventListener('input', function () {
+                const max = parseInt(totalSlotsInput.value, 10);
+                if (!isNaN(max)) {
+                    bookedInput.max = String(max);
                 }
             });
         })();

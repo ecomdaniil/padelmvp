@@ -342,6 +342,12 @@ def _migrate_games_table(cur):
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 90;"
     )
     cur.execute("ALTER TABLE games ADD COLUMN IF NOT EXISTS level TEXT;")
+    # Ручная корректировка занятых мест админом в CRM (например, офлайн-запись
+    # игрока без брони в системе) — независима от реального числа броней,
+    # которое всегда считается из bookings (см. get_games_paginated/taken).
+    cur.execute(
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS booked_places INTEGER NOT NULL DEFAULT 0;"
+    )
 
 
 def _migrate_admin_logs_table(cur):
@@ -692,17 +698,18 @@ def get_game_by_id(game_id: int):
 def create_game(
     game_date, game_time, location, price, total_slots,
     city=None, club_id=None, address=None, duration_minutes=90, level=None,
+    booked_places=0,
 ):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO games (
                game_date, game_time, location, price, total_slots,
-               city, club_id, address, duration_minutes, level
+               city, club_id, address, duration_minutes, level, booked_places
            )
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
         (game_date, game_time, location, price, total_slots,
-         city, club_id, address, duration_minutes, level),
+         city, club_id, address, duration_minutes, level, booked_places),
     )
     game = cur.fetchone()
     conn.commit()
@@ -714,7 +721,11 @@ def create_game(
 def update_game(
     game_id, game_date, game_time, location, price, total_slots,
     city=None, club_id=None, address=None, duration_minutes=90, level=None,
+    booked_places=None,
 ):
+    """booked_places=None означает "не менять" — используется на случай,
+    если update_game когда-нибудь вызовут без этого параметра (обратная
+    совместимость); из формы CRM всегда приходит явное число."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -722,11 +733,12 @@ def update_game(
            SET game_date = %s, game_time = %s, location = %s,
                price = %s, total_slots = %s,
                city = %s, club_id = %s, address = %s,
-               duration_minutes = %s, level = %s
+               duration_minutes = %s, level = %s,
+               booked_places = COALESCE(%s, booked_places)
            WHERE id = %s
            RETURNING *""",
         (game_date, game_time, location, price, total_slots,
-         city, club_id, address, duration_minutes, level, game_id),
+         city, club_id, address, duration_minutes, level, booked_places, game_id),
     )
     game = cur.fetchone()
     conn.commit()
