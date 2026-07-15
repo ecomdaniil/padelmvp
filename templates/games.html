@@ -7,14 +7,40 @@
     </div>
 
     <div class="card" style="margin-bottom:18px; padding:14px 16px;">
-        <form method="get" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-            <div style="min-width:200px;">
+        <form method="get" style="display:flex; gap:12px; align-items:end; flex-wrap:wrap;">
+            <div style="min-width:170px;">
+                <label class="filter-label">Уровень</label>
                 <select name="level" style="width:100%;">
                     <option value="" {% if not selected_level %}selected{% endif %}>Все уровни</option>
                     {% for lvl in levels %}
                     <option value="{{ lvl }}" {% if selected_level == lvl %}selected{% endif %}>{{ lvl }}</option>
                     {% endfor %}
                 </select>
+            </div>
+            <div style="min-width:170px;">
+                <label class="filter-label">Город</label>
+                <select name="city" style="width:100%;">
+                    <option value="" {% if not selected_city %}selected{% endif %}>Все города</option>
+                    {% for c in cities %}
+                    <option value="{{ c }}" {% if selected_city == c %}selected{% endif %}>{{ c }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div style="min-width:140px;">
+                <label class="filter-label">Дата с</label>
+                <input type="date" name="date_from" value="{{ date_from }}" style="width:100%;">
+            </div>
+            <div style="min-width:140px;">
+                <label class="filter-label">Дата по</label>
+                <input type="date" name="date_to" value="{{ date_to }}" style="width:100%;">
+            </div>
+            <div style="min-width:110px;">
+                <label class="filter-label">Время с</label>
+                <input type="time" name="time_from" value="{{ time_from }}" style="width:100%;">
+            </div>
+            <div style="min-width:110px;">
+                <label class="filter-label">Время по</label>
+                <input type="time" name="time_to" value="{{ time_to }}" style="width:100%;">
             </div>
             <button type="submit" class="btn">Фильтровать</button>
             <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
@@ -74,6 +100,14 @@
     {% include "_pagination.html" %}
 
     <style>
+        .filter-label {
+            display: block;
+            font-size: 11px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 4px;
+        }
         .game-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

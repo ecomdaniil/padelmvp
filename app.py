@@ -477,15 +477,50 @@ def _build_game_location(parsed, clubs_by_id):
     return ", ".join(parts)
 
 
+def _safe_date(value: str):
+    """Парсит "YYYY-MM-DD" из query-параметра; None, если пусто/некорректно —
+    некорректный фильтр молча игнорируется, а не роняет страницу с 500."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _safe_time(value: str):
+    """Аналог _safe_date для "HH:MM"."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except ValueError:
+        return None
+
+
 @app.route("/games")
 @login_required
 def games_list():
     page = request.args.get("page", 1, type=int)
     level = request.args.get("level", "")
-    result = db.get_games_paginated(page=page, per_page=DEFAULT_PAGE_SIZE, level=level)
+    city = request.args.get("city", "")
+    date_from_raw = request.args.get("date_from", "")
+    date_to_raw = request.args.get("date_to", "")
+    time_from_raw = request.args.get("time_from", "")
+    time_to_raw = request.args.get("time_to", "")
+
+    result = db.get_games_paginated(
+        page=page, per_page=DEFAULT_PAGE_SIZE, level=level, city=city,
+        date_from=_safe_date(date_from_raw), date_to=_safe_date(date_to_raw),
+        time_from=_safe_time(time_from_raw), time_to=_safe_time(time_to_raw),
+    )
+    cities = db.get_distinct_game_cities()
     return render_template(
         "games.html", games=result["items"], pagination=result,
         levels=GAME_LEVELS, selected_level=level,
+        cities=cities, selected_city=city,
+        date_from=date_from_raw, date_to=date_to_raw,
+        time_from=time_from_raw, time_to=time_to_raw,
     )
 
 
@@ -809,8 +844,13 @@ def club_edit(club_id):
 @login_required
 def logs_list():
     page = request.args.get("page", 1, type=int)
-    result = db.get_logs_paginated(page=page, per_page=DEFAULT_PAGE_SIZE)
-    return render_template("logs.html", logs=result["items"], pagination=result)
+    entity_type = request.args.get("entity_type", "")
+    result = db.get_logs_paginated(page=page, per_page=DEFAULT_PAGE_SIZE, entity_type=entity_type)
+    entity_types = db.get_distinct_log_entity_types()
+    return render_template(
+        "logs.html", logs=result["items"], pagination=result,
+        entity_types=entity_types, selected_entity_type=entity_type,
+    )
 
 
 # ---------------------------------------------------------------------------

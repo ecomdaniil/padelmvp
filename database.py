@@ -540,9 +540,14 @@ def get_all_games():
     return games
 
 
-def get_games_paginated(page: int = 1, per_page: int = 20, level: str = ""):
+def get_games_paginated(
+    page: int = 1, per_page: int = 20, level: str = "",
+    date_from=None, date_to=None, time_from=None, time_to=None, city: str = "",
+):
     """Список игр с пагинацией + количество занятых мест/собранных оплат
-    одним запросом (без N+1), с опциональным фильтром по уровню.
+    одним запросом (без N+1), с опциональными фильтрами по уровню, дате
+    (диапазон date_from..date_to), времени суток (диапазон time_from..time_to,
+    например «найти вечерние слоты 18:00-20:00 в любой день») и городу.
     Возвращает dict с items/total/total_pages."""
     page = max(1, page)
     offset = (page - 1) * per_page
@@ -552,6 +557,21 @@ def get_games_paginated(page: int = 1, per_page: int = 20, level: str = ""):
     if level:
         where_clause += " AND g.level = %s"
         params.append(level)
+    if date_from:
+        where_clause += " AND g.game_date >= %s"
+        params.append(date_from)
+    if date_to:
+        where_clause += " AND g.game_date <= %s"
+        params.append(date_to)
+    if time_from:
+        where_clause += " AND g.game_time >= %s"
+        params.append(time_from)
+    if time_to:
+        where_clause += " AND g.game_time <= %s"
+        params.append(time_to)
+    if city:
+        where_clause += " AND g.city = %s"
+        params.append(city)
 
     conn = get_connection()
     cur = conn.cursor()
@@ -642,6 +662,21 @@ def count_games() -> int:
     cur.close()
     conn.close()
     return total
+
+
+def get_distinct_game_cities():
+    """Список городов, встречающихся в играх — источник значений для
+    выпадающего фильтра «место» на /games (только реально существующие в БД
+    значения, а не статический список)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT city FROM games WHERE city IS NOT NULL AND city != '' ORDER BY city"
+    )
+    cities = [row["city"] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return cities
 
 
 def get_game_by_id(game_id: int):
@@ -1465,26 +1500,48 @@ def get_all_logs():
     return logs
 
 
-def get_logs_paginated(page: int = 1, per_page: int = 20):
-    """Журнал действий с пагинацией — для CRM."""
+def get_logs_paginated(page: int = 1, per_page: int = 20, entity_type: str = ""):
+    """Журнал действий с пагинацией — для CRM. entity_type — опциональный
+    фильтр по типу сущности (game/booking/payment/club/club_info)."""
     page = max(1, page)
     offset = (page - 1) * per_page
+
+    where_clause = "WHERE 1=1"
+    params: list = []
+    if entity_type:
+        where_clause += " AND entity_type = %s"
+        params.append(entity_type)
 
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT *, COUNT(*) OVER() AS total_count FROM admin_logs ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        (per_page, offset),
+        f"""SELECT *, COUNT(*) OVER() AS total_count FROM admin_logs
+            {where_clause} ORDER BY created_at DESC LIMIT %s OFFSET %s""",
+        params + [per_page, offset],
     )
     logs = cur.fetchall()
     result = _paginated_from_window(
-        cur, logs, page, per_page, "SELECT COUNT(*) AS cnt FROM admin_logs",
+        cur, logs, page, per_page, f"SELECT COUNT(*) AS cnt FROM admin_logs {where_clause}", params,
     )
     cur.close()
     conn.close()
 
     return result
+
+
+def get_distinct_log_entity_types():
+    """Список entity_type, реально встречающихся в журнале — источник
+    значений для выпадающего фильтра на /logs."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT entity_type FROM admin_logs WHERE entity_type IS NOT NULL ORDER BY entity_type"
+    )
+    types = [row["entity_type"] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return types
 
 
 def get_dashboard_summary() -> dict:

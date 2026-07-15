@@ -1,6 +1,20 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>Журнал действий</h1>
+    <div class="card" style="margin-bottom:18px; padding:14px 16px;">
+        <form method="get" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+            <div style="min-width:220px;">
+                <select name="entity_type" style="width:100%;">
+                    <option value="" {% if not selected_entity_type %}selected{% endif %}>Все сущности</option>
+                    {% for et in entity_types %}
+                    <option value="{{ et }}" {% if selected_entity_type == et %}selected{% endif %}>{{ et | entity_label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="submit" class="btn">Фильтровать</button>
+            <a href="{{ url_for('logs_list') }}" class="btn btn-secondary">Сбросить</a>
+        </form>
+    </div>
     <table>
         <tr>
             <th>Дата</th><th>Действие</th><th>Сущность</th><th>ID</th><th>Описание</th>
