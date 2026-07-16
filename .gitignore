@@ -1,4 +1,29 @@
-venv/
+# Secrets — never commit
 .env
+mv.env
+*.env
+!.env.example
+
+# Python
+venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local logs / exports
+*.log
+/tmp/
+*.xlsx
+.secrets_rotated.local

@@ -26,19 +26,12 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# game_date/game_time хранятся как "наивные" дата/время БЕЗ таймзоны — это
-# локальное время клуба (Europe/Moscow по умолчанию), как его вводит админ в
-# форме. Сессия БД при этом работает в UTC (см. TimeZone сервера/провайдера),
-# поэтому "SELECT ... WHERE game_date + game_time >= NOW()" сравнивает
-# наивное московское время как если бы это было UTC — то есть со сдвигом на
-# разницу UTC/Europe-Moscow (обычно 3 часа). Из-за этого игра могла считаться
-# "ещё не прошедшей"/"не идёт сейчас" на 3 часа дольше, чем по факту. Приводим
-# NOW() к тому же "наивному локальному" виду через AT TIME ZONE — тогда
-# сравнение с game_date+game_time корректно.
-import re as _re
-_APP_TZ_RAW = os.getenv("APP_TIMEZONE", "Europe/Moscow")
-APP_TIMEZONE = _APP_TZ_RAW if _re.fullmatch(r"[A-Za-z0-9_+\-/]+", _APP_TZ_RAW) else "Europe/Moscow"
+# game_date/game_time — наивные «настенные» часы клуба (Москва). Сессия
+# Postgres обычно в UTC, поэтому сырой NOW() нельзя сравнивать с ними —
+# будет сдвиг ~3 часа. Для «сейчас» относительно игр всегда Москва:
+APP_TIMEZONE = "Europe/Moscow"
 _LOCAL_NOW_EXPR = f"(NOW() AT TIME ZONE '{APP_TIMEZONE}')"
+_LOCAL_TODAY_EXPR = f"(({_LOCAL_NOW_EXPR})::date)"
 
 # Пул соединений. Раньше get_connection() делал psycopg2.connect(...) на
 # КАЖДЫЙ вызов, а почти каждая функция в этом файле открывает и закрывает
@@ -68,6 +61,12 @@ def _get_pool():
             _pool = psycopg2_pool.ThreadedConnectionPool(
                 DB_POOL_MIN_SIZE, DB_POOL_MAX_SIZE, DATABASE_URL,
                 cursor_factory=RealDictCursor,
+                # TCP keepalive — чтобы Neon/прокси не роняли «тихие»
+                # соединения из пула между запросами CRM.
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
             )
     return _pool
 
@@ -118,13 +117,26 @@ _keepalive_started = False
 _keepalive_lock = threading.Lock()
 
 
-def start_keepalive_thread(interval_seconds: int = 180) -> None:
+def _ping_db() -> None:
+    """Один лёгкий SELECT 1 — прогрев пула / анти-suspend Neon."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+    finally:
+        conn.close()
+
+
+def start_keepalive_thread(interval_seconds: int = 45) -> None:
     """Фоновый поток, держащий БД "тёплой" для CRM — тот же смысл, что и
     database_async.keepalive_loop() для бота: Neon приостанавливает
     вычислительный узел после простоя, и без периодических запросов первая
     открытая после паузы страница CRM ждала бы "холодный старт" (секунды).
-    Idempotent — повторный вызов (например, если WSGI-обёртка импортирует
-    модуль дважды) не запустит второй поток."""
+
+    Сразу при старте делает ping (не ждёт interval), затем каждые
+    interval_seconds (по умолчанию 45с — с запасом меньше типичного
+    suspend Neon ~5 мин). Idempotent."""
     global _keepalive_started
     with _keepalive_lock:
         if _keepalive_started:
@@ -133,17 +145,13 @@ def start_keepalive_thread(interval_seconds: int = 180) -> None:
 
     def _loop():
         while True:
-            time.sleep(interval_seconds)
             try:
-                conn = get_connection()
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                cur.close()
-                conn.close()
+                _ping_db()
             except Exception:
                 # Сеть/БД могли на секунду моргнуть — следующая попытка
                 # через interval_seconds всё исправит, поток не должен упасть.
                 pass
+            time.sleep(interval_seconds)
 
     threading.Thread(target=_loop, daemon=True, name="db-keepalive").start()
 
@@ -404,9 +412,16 @@ def _migrate_admin_logs_table(cur):
 def _migrate_bookings_table(cur):
     """slots_count — сколько мест занимает одна заявка (фича «Сколько мест?
     (1-4)» в боте). DEFAULT 1 — старые заявки, созданные до этой миграции,
-    корректно продолжают считаться как 1 занятое место."""
+    корректно продолжают считаться как 1 занятое место.
+
+    admin_notify_message_id — message_id уведомления «Новая запись на корт»
+    в чате админа (Telegram). Нужен, чтобы при отмене ДО оплаты бот мог
+    удалить это сообщение (см. _notify_admin_new_booking / cancel в bot.py)."""
     cur.execute(
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS slots_count INTEGER NOT NULL DEFAULT 1;"
+    )
+    cur.execute(
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS admin_notify_message_id BIGINT;"
     )
 
 
@@ -424,6 +439,17 @@ def _migrate_payments_table(cur):
     оплаты."""
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT;")
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS player_notified_at TIMESTAMP;")
+    # Разово подчищаем «висящие» оплаты по уже отменённым заявкам — они
+    # больше не должны отображаться в разделе «Оплаты» CRM.
+    cur.execute(
+        """
+        DELETE FROM payments p
+        USING bookings b
+        WHERE p.booking_id = b.id
+          AND b.status = 'отменена'
+          AND p.status = 'ожидает'
+        """
+    )
 
 
 def _create_indexes(cur):
@@ -548,9 +574,9 @@ def get_upcoming_games():
     """Игры, которые ещё не прошли, отсортированные по дате."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT * FROM games
-        WHERE (game_date + game_time) >= NOW()
+        WHERE (game_date + game_time) >= {_LOCAL_NOW_EXPR}
         ORDER BY game_date, game_time
     """)
     games = cur.fetchall()
@@ -848,11 +874,11 @@ def get_games_needing_reminder():
     """Игры, которые начнутся через 23-25 часов и по которым ещё не отправлено напоминание."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT * FROM games
         WHERE reminder_sent = FALSE
-          AND (game_date + game_time) BETWEEN NOW() + INTERVAL '23 hours'
-                                            AND NOW() + INTERVAL '25 hours'
+          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '23 hours'
+                                            AND {_LOCAL_NOW_EXPR} + INTERVAL '25 hours'
     """)
     games = cur.fetchall()
     cur.close()
@@ -1077,11 +1103,11 @@ def delete_old_bookings(days: int = 60) -> int:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         DELETE FROM bookings b
         USING games g
         WHERE b.game_id = g.id
-          AND g.game_date < (CURRENT_DATE - %s * INTERVAL '1 day')
+          AND g.game_date < ({_LOCAL_TODAY_EXPR} - %s * INTERVAL '1 day')
         """,
         (days,),
     )
@@ -1330,6 +1356,7 @@ def get_payments_filtered(search: str = "", status: str = ""):
         query += " AND p.status = %s"
         params.append(status)
 
+    query += " AND NOT (b.status = 'отменена' AND p.status = 'ожидает')"
     query += " ORDER BY p.created_at DESC"
 
     cur.execute(query, params)
@@ -1337,6 +1364,22 @@ def get_payments_filtered(search: str = "", status: str = ""):
     cur.close()
     conn.close()
     return payments
+
+
+def delete_pending_payments_for_booking(booking_id: int) -> int:
+    """Удаляет платежи со статусом «ожидает» по заявке — заявка отменена
+    до реальной оплаты, в разделе «Оплаты» такие строки не нужны."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM payments WHERE booking_id = %s AND status = 'ожидает'",
+        (booking_id,),
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return deleted
 
 
 def get_payments_paginated(search: str = "", status: str = "", page: int = 1, per_page: int = 20):
@@ -1354,6 +1397,10 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
     if status:
         where_clause += " AND p.status = %s"
         params.append(status)
+
+    # Заявки, отменённые до оплаты: платёж со статусом «ожидает» не показываем
+    # (при отмене бот/CRM его удаляют, фильтр — страховка для старых записей).
+    where_clause += " AND NOT (b.status = 'отменена' AND p.status = 'ожидает')"
 
     conn = get_connection()
     cur = conn.cursor()
@@ -1761,7 +1808,9 @@ def get_dashboard_summary() -> dict:
         SELECT
             (SELECT COUNT(*) FROM games) AS games,
             (SELECT COUNT(*) FROM bookings WHERE status != 'отменена') AS bookings,
-            (SELECT COUNT(*) FROM payments WHERE status = 'ожидает') AS pending_payments,
+            (SELECT COUNT(*) FROM payments p
+             JOIN bookings b ON b.id = p.booking_id
+             WHERE p.status = 'ожидает' AND b.status != 'отменена') AS pending_payments,
             (SELECT COUNT(*) FROM bookings WHERE status = 'посещена') AS visits,
             (SELECT COUNT(*) FROM clubs) AS clubs,
             (SELECT COUNT(*) FROM admin_logs) AS logs
@@ -1836,10 +1885,108 @@ def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_
     return dict(row)
 
 
+_badge_cache_lock = threading.Lock()
+_badge_cache = {}  # key -> (monotonic_ts, counts_dict)
+_BADGE_CACHE_TTL = 10.0
+
+_dashboard_cache_lock = threading.Lock()
+_dashboard_cache = None  # (monotonic_ts, summary_dict)
+_DASHBOARD_CACHE_TTL = 5.0
+
+
+def peek_badge_counts(last_booking_id: int, last_payment_notified_at, last_review_id: int):
+    """Только in-memory кэш бейджей — без обращения к БД.
+
+    Нужен шапке CRM: иначе каждый клик по меню платит ~1с round-trip к Neon
+    сверх запроса самой страницы. Промах → None, бейджи подтянет поллинг
+    /api/activity."""
+    key = (last_booking_id, last_payment_notified_at, last_review_id)
+    now = time.monotonic()
+    with _badge_cache_lock:
+        hit = _badge_cache.get(key)
+        if hit and (now - hit[0]) < _BADGE_CACHE_TTL:
+            return hit[1]
+    return None
+
+
+def count_new_since_cached(last_booking_id: int, last_payment_notified_at, last_review_id: int) -> dict:
+    """Тот же count_new_since, но с in-memory TTL: /api/activity и редкие
+    места, где бейджи всё же нужно посчитать сразу."""
+    key = (last_booking_id, last_payment_notified_at, last_review_id)
+    now = time.monotonic()
+    with _badge_cache_lock:
+        hit = _badge_cache.get(key)
+        if hit and (now - hit[0]) < _BADGE_CACHE_TTL:
+            return hit[1]
+    counts = count_new_since(last_booking_id, last_payment_notified_at, last_review_id)
+    with _badge_cache_lock:
+        _badge_cache[key] = (now, counts)
+    return counts
+
+
+def get_dashboard_summary_cached() -> dict:
+    """Кэш главной CRM на несколько секунд — повторные заходы/клики
+    «Главная» не ждут ещё один ~1с round-trip к Neon."""
+    global _dashboard_cache
+    now = time.monotonic()
+    with _dashboard_cache_lock:
+        if _dashboard_cache and (now - _dashboard_cache[0]) < _DASHBOARD_CACHE_TTL:
+            return _dashboard_cache[1]
+    summary = get_dashboard_summary()
+    with _dashboard_cache_lock:
+        _dashboard_cache = (time.monotonic(), summary)
+    return summary
+
+
+def get_activity_snapshot(last_booking_id: int, last_payment_notified_at, last_review_id: int) -> dict:
+    """Маркер свежести + new_* бейджи одним round-trip — для /api/activity.
+    Раньше было два подряд запроса (get_latest_activity_marker +
+    count_new_since), и на удалённом Neon это давало ~2с на каждый опрос."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            (SELECT COALESCE(MAX(id), 0) FROM bookings) AS max_booking_id,
+            (SELECT COALESCE(MAX(id), 0) FROM payments) AS max_payment_id,
+            (SELECT MAX(player_notified_at) FROM payments) AS last_payment_notified_at,
+            (SELECT COALESCE(MAX(id), 0) FROM reviews) AS max_review_id,
+            (SELECT COUNT(*) FROM bookings) AS bookings_count,
+            (SELECT COUNT(*) FROM payments) AS payments_count,
+            (SELECT COUNT(*) FROM reviews) AS reviews_count,
+            (SELECT COUNT(*) FROM bookings WHERE id > %s) AS new_bookings,
+            (SELECT COUNT(*) FROM payments
+                WHERE player_notified_at IS NOT NULL
+                  AND player_notified_at > COALESCE(%s::timestamp, 'epoch'::timestamp)) AS new_payments,
+            (SELECT COUNT(*) FROM reviews WHERE id > %s) AS new_reviews
+        """,
+        (last_booking_id, last_payment_notified_at, last_review_id),
+    )
+    row = dict(cur.fetchone())
+    cur.close()
+    conn.close()
+    # Обновляем кэш бейджей — следующий рендер шапки не пойдёт в БД снова.
+    key = (last_booking_id, last_payment_notified_at, last_review_id)
+    counts = {
+        "new_bookings": row["new_bookings"],
+        "new_payments": row["new_payments"],
+        "new_reviews": row["new_reviews"],
+    }
+    with _badge_cache_lock:
+        _badge_cache[key] = (time.monotonic(), counts)
+    return row
+
+
 def count_pending_payments() -> int:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS cnt FROM payments WHERE status = 'ожидает'")
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt FROM payments p
+        JOIN bookings b ON b.id = p.booking_id
+        WHERE p.status = 'ожидает' AND b.status != 'отменена'
+        """
+    )
     total = cur.fetchone()["cnt"]
     cur.close()
     conn.close()

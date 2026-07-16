@@ -113,10 +113,12 @@ _backend = _RedisCache(_redis_client) if _redis_client else _InMemoryCache()
 # этого кэша, поэтому бот мог показывать устаревший список до истечения TTL
 # или перезапуска процесса.
 GAMES_CACHE_KEY = "games:upcoming_with_slots"
-GAMES_CACHE_TTL = 15  # секунд — короткое окно на случай, если инвалидация
-                      # ниже не сработает (например, разные процессы без Redis)
+GAMES_CACHE_TTL = 30  # секунд — инвалидация при записи/правках всё равно
+                      # сбрасывает ключ; TTL — запас, если процессы без Redis
 LEVELS_CACHE_KEY = "levels:list"
 LEVELS_CACHE_TTL = 3600
+USER_CACHE_PREFIX = "user:tg:"
+USER_CACHE_TTL = 120  # секунд — профиль почти не меняется между кликами меню
 
 
 def get(key: str) -> Any:

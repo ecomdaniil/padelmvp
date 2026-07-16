@@ -16,13 +16,15 @@ CRM (веб-панель администратора) на Flask.
 Затем открой в браузере: http://127.0.0.1:5000
 """
 
+import hashlib
+import html
 import io
 import json
 import logging
 import os
 import secrets
 import urllib.request
-from datetime import date, datetime, time as time_type
+from datetime import date, datetime, time as time_type, timedelta
 from decimal import Decimal
 from functools import wraps
 
@@ -37,6 +39,7 @@ from flask_wtf import CSRFProtect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openpyxl import Workbook
+from werkzeug.security import check_password_hash
 
 import cache
 import database as db
@@ -72,6 +75,13 @@ app.secret_key = FLASK_SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
+    hours=int(os.getenv("SESSION_LIFETIME_HOURS", "12"))
+)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+# Debug только по явному флагу — иначе в HTML может утечь текст исключения.
+app.config["DEBUG"] = os.getenv("FLASK_DEBUG", "0").lower() in {"1", "true", "yes"}
+app.debug = app.config["DEBUG"]
 
 # Кэширование статики в браузере (сек). 1 год для /static, т.к. имена файлов
 # можно версионировать при изменениях; по умолчанию — сутки.
@@ -90,6 +100,8 @@ csrf = CSRFProtect(app)
 
 # Rate limiting: не более 10 запросов в секунду с одного IP. Отдельно более
 # строгий лимит применяется к /login, чтобы затруднить брутфорс пароля.
+# В production задайте REDIS_URL — иначе лимиты in-memory и сбрасываются
+# при рестарте / не шарятся между воркерами.
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,
@@ -98,15 +110,69 @@ limiter = Limiter(
 )
 
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-if not ADMIN_LOGIN or not ADMIN_PASSWORD:
+# Предпочтительно ADMIN_PASSWORD_HASH (werkzeug/scrypt/pbkdf2). ADMIN_PASSWORD
+# оставлен только для обратной совместимости локальных .env — в проде хеш.
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH") or ""
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or ""
+if not ADMIN_LOGIN or (not ADMIN_PASSWORD_HASH and not ADMIN_PASSWORD):
     raise RuntimeError(
-        "Не найдены ADMIN_LOGIN/ADMIN_PASSWORD в .env. "
-        "Задайте логин и надёжный пароль перед запуском CRM."
+        "Не найдены ADMIN_LOGIN и пароль в .env. "
+        "Задайте ADMIN_PASSWORD_HASH "
+        "(python -c \"from werkzeug.security import generate_password_hash; "
+        "print(generate_password_hash('ваш_пароль'))\") "
+        "или временно ADMIN_PASSWORD для локальной разработки."
+    )
+if ADMIN_PASSWORD and not ADMIN_PASSWORD_HASH:
+    logger.warning(
+        "ADMIN_PASSWORD задан в открытом виде. Перейдите на ADMIN_PASSWORD_HASH "
+        "и удалите ADMIN_PASSWORD из .env."
     )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+# Секрет для X-Telegram-Bot-Api-Secret-Token. Если не задан явно — стабильный
+# дериват от FLASK_SECRET_KEY (чтобы set_webhook и проверка совпадали без
+# обязательной новой переменной). В проде лучше задать WEBHOOK_SECRET_TOKEN
+# отдельно и ротировать при утечке.
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN") or hashlib.sha256(
+    f"tg-webhook:{FLASK_SECRET_KEY}".encode("utf-8")
+).hexdigest()
+
+BOOKING_STATUSES = frozenset({"новая", "подтверждена", "отменена", "посещена"})
+
+
+def _verify_admin_password(password_value: str) -> bool:
+    """Проверка пароля админа: сначала хеш, иначе (legacy) plaintext."""
+    if not password_value:
+        return False
+    if ADMIN_PASSWORD_HASH:
+        try:
+            return check_password_hash(ADMIN_PASSWORD_HASH, password_value)
+        except (ValueError, TypeError):
+            logger.error("ADMIN_PASSWORD_HASH имеет неверный формат")
+            return False
+    return bool(ADMIN_PASSWORD) and secrets.compare_digest(password_value, ADMIN_PASSWORD)
+
+
+@app.after_request
+def set_security_headers(response):
+    """Базовые security-заголовки для всех ответов CRM."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    # Inline CSS/JS в шаблонах CRM — разрешаем 'unsafe-inline'; внешние
+    # скрипты/стили не подключаем.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'",
+    )
+    return response
 
 
 def send_telegram_message(chat_id, text: str) -> bool:
@@ -141,11 +207,9 @@ def send_telegram_message(chat_id, text: str) -> bool:
 
 DEFAULT_PAGE_SIZE = int(os.getenv("CRM_PAGE_SIZE", "20"))
 
-# БД хранит created_at как naive-время в UTC (сессия Postgres настроена на
-# GMT, см. миграции) — при показе в CRM (журнал, отзывы, карточка игры)
-# переводим в локальную зону админа, иначе время визуально "отстаёт" на
-# несколько часов от реального. По умолчанию — московское время.
-APP_TIMEZONE = pytz.timezone(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
+# БД хранит created_at как naive-время в UTC (сессия Postgres — UTC).
+# В CRM и планировщиках везде показываем/считаем московское время клуба.
+APP_TIMEZONE = pytz.timezone("Europe/Moscow")
 
 # Сколько дней хранить старые брони/записи журнала перед автоочисткой —
 # см. _run_cleanup_job() и start_cleanup_scheduler() ближе к концу файла.
@@ -179,8 +243,7 @@ _RU_MONTHS = [
 
 def _dashboard_greeting() -> dict:
     """Приветствие и дата для шапки главной страницы CRM — время дня и
-    дата берутся в локальной таймзоне администратора (APP_TIMEZONE), а не
-    в UTC сервера, иначе "Добрый вечер" мог бы показываться утром."""
+    дата по Москве (Europe/Moscow), а не UTC сервера/БД."""
     now = datetime.now(APP_TIMEZONE)
     hour = now.hour
     if 5 <= hour < 12:
@@ -394,19 +457,21 @@ def _mark_all_sections_seen() -> None:
 
 @app.context_processor
 def inject_nav_badges():
-    """Считает бейджи "+N" на КАЖДЫЙ рендер страницы CRM (лёгкий индексный
-    запрос, не тормозит). Не логированному пользователю (страница логина)
-    ничего не считаем."""
+    """Бейджи "+N" в шапке. На рендере страницы НЕ ходим в БД — только
+    in-memory кэш (его наполняет /api/activity). Иначе каждый клик по меню
+    = лишний ~1с round-trip к Neon сверх запроса самой страницы."""
     if not session.get("logged_in"):
         return {}
     try:
-        counts = db.count_new_since(
+        counts = db.peek_badge_counts(
             session.get("seen_booking_id", 0),
             session.get("seen_payment_notified_at"),
             session.get("seen_review_id", 0),
         )
     except Exception as e:
-        logger.error("Не удалось посчитать бейджи меню: %s", e)
+        logger.error("Не удалось прочитать бейджи меню: %s", e)
+        counts = None
+    if not counts:
         return {"nav_badges": {"bookings": 0, "payments": 0, "reviews": 0}}
     return {"nav_badges": {
         "bookings": counts["new_bookings"],
@@ -418,24 +483,29 @@ def inject_nav_badges():
 @app.route("/login", methods=["GET", "POST"])
 @limiter.limit(os.getenv("LOGIN_RATE_LIMIT", "5 per minute"))
 def login():
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
     if request.method == "POST":
         login_value = request.form.get("login", "")
         password_value = request.form.get("password", "")
 
-        # Сравниваем с данными из .env. Никаких паролей в коде!
-        # secrets.compare_digest — защита от timing-атак на сравнение строк.
+        # Логин — compare_digest (timing-safe). Пароль — хеш (или legacy plaintext).
         valid_login = bool(ADMIN_LOGIN) and secrets.compare_digest(login_value, ADMIN_LOGIN)
-        valid_password = bool(ADMIN_PASSWORD) and secrets.compare_digest(password_value, ADMIN_PASSWORD)
+        valid_password = _verify_admin_password(password_value)
 
         if valid_login and valid_password:
+            # session.clear() сбрасывает старый session id → защита от fixation.
             session.clear()
+            session.permanent = True
             session["logged_in"] = True
             # Отмечаем всё, что накопилось ДО этого входа, как уже "увиденное" —
             # иначе сразу после входа бейджи "+N" показали бы весь объём старых
             # заявок/оплат/отзывов, а не только новые.
             _mark_all_sections_seen()
+            logger.info("Успешный вход в CRM с IP %s", get_remote_address())
             return redirect(url_for("games_list"))
         else:
+            logger.warning("Неудачная попытка входа в CRM с IP %s", get_remote_address())
             flash("Неверный логин или пароль")
 
     return render_template("login.html")
@@ -445,6 +515,16 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+@app.errorhandler(429)
+def ratelimit_handler(err):
+    """Превышен rate limit — единый ответ без деталей лимитера наружу."""
+    logger.warning("Rate limit 429: %s %s from %s", request.method, request.path, get_remote_address())
+    if request.path.startswith("/api/"):
+        return {"error": "too_many_requests"}, 429
+    flash("Слишком много запросов. Подождите немного и попробуйте снова.")
+    return render_template("error.html", message="Слишком много запросов. Попробуйте позже."), 429
 
 
 @app.errorhandler(Exception)
@@ -459,8 +539,9 @@ def handle_unexpected_error(err):
     if isinstance(err, HTTPException):
         return err
     logger.exception("Необработанная ошибка при обработке %s %s", request.method, request.path)
+    # В production никогда не отдаём текст исключения клиенту.
     try:
-        return render_template("error.html", message=str(err) if app.debug else None), 500
+        return render_template("error.html", message=None), 500
     except Exception:
         return "Произошла ошибка на сервере. Попробуйте обновить страницу.", 500
 
@@ -468,10 +549,8 @@ def handle_unexpected_error(err):
 @app.route("/")
 @login_required
 def index():
-    # Один запрос с 6 подзапросами вместо 6 отдельных round-trip'ов к БД
-    # (см. db.get_dashboard_summary) — на управляемом Postgres каждый лишний
-    # round-trip добавлял заметную задержку к открытию главной страницы.
-    summary = db.get_dashboard_summary()
+    # Один запрос + короткий in-memory кэш (см. get_dashboard_summary_cached).
+    summary = db.get_dashboard_summary_cached()
     return render_template("dashboard.html", summary=summary, **_dashboard_greeting())
 
 
@@ -495,14 +574,18 @@ def api_activity():
     соответствующий раздел (см. seen_*_id в сессии) — этим живут бейджи
     "+N" в шапке меню на ЛЮБОЙ странице CRM, без перезагрузки (см.
     startNavBadgesPoll в base.html)."""
-    marker = db.get_latest_activity_marker()
-    new_counts = db.count_new_since(
+    # Один запрос вместо двух (marker + count_new_since) — иначе поллинг
+    # каждые ~8с платил двумя round-trip'ами к удалённому Postgres.
+    snapshot = db.get_activity_snapshot(
         session.get("seen_booking_id", 0),
         session.get("seen_payment_notified_at"),
         session.get("seen_review_id", 0),
     )
-    marker.update(new_counts)
-    return marker, 200
+    # datetime из Postgres нельзя отдать в jsonify as-is на всех версиях Flask.
+    notified = snapshot.get("last_payment_notified_at")
+    if isinstance(notified, datetime):
+        snapshot["last_payment_notified_at"] = notified.isoformat()
+    return snapshot, 200
 
 
 def _json_value(value):
@@ -893,7 +976,10 @@ def bookings_list():
 @app.route("/bookings/<int:booking_id>/status", methods=["POST"])
 @login_required
 def booking_update_status(booking_id):
-    new_status = request.form["status"]
+    new_status = (request.form.get("status") or "").strip()
+    if new_status not in BOOKING_STATUSES:
+        flash("Недопустимый статус заявки")
+        return redirect(url_for("bookings_list"))
     # Один запрос вместо двух (get_booking_by_id + update_booking_status) —
     # old_status получаем прямо из UPDATE, см. update_booking_status_and_get.
     updated = db.update_booking_status_and_get(booking_id, new_status)
@@ -920,6 +1006,8 @@ def booking_update_status(booking_id):
     cache.invalidate_games_cache()
     user_name = updated.get("user_name") or "—"
     if new_status == "отменена":
+        # Отмена до оплаты — убираем «висящий» платёж из раздела Оплаты.
+        db.delete_pending_payments_for_booking(booking_id)
         description = f"Бронирование №{booking_id} отменено (игрок: {user_name})"
     else:
         description = (
@@ -967,7 +1055,7 @@ def payment_confirm(payment_id):
         return redirect(url_for("payments_list"))
     if context["status"] != "ожидает":
         # Платёж уже подтверждён или по нему оформлен возврат (например,
-        # игрок отменил бронь более чем за 24ч до игры) — повторное
+        # игрок отменил бронь более чем за 12ч до игры) — повторное
         # подтверждение не имеет смысла и могло бы затереть статус «возврат».
         flash(f"Платёж уже в статусе «{context['status']}» — подтверждение не требуется")
         return redirect(url_for("payments_list"))
@@ -984,12 +1072,13 @@ def payment_confirm(payment_id):
 
     if context and context.get("telegram_id"):
         game_dt = f"{context['game_date'].strftime('%d.%m.%Y')} в {str(context['game_time'])[:5]}"
+        loc = html.escape(str(context.get("location") or ""), quote=False)
         text = (
             "✅ <b>Оплата подтверждена!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"💰 Сумма: {float(context['amount']):.0f} ₽\n"
-            f"📅 {game_dt}\n"
-            f"📍 {context['location']}\n\n"
+            f"📅 {html.escape(game_dt, quote=False)}\n"
+            f"📍 {loc}\n\n"
             "Ждём тебя на корте! 🎾"
         )
         send_telegram_message(context["telegram_id"], text)
@@ -1002,7 +1091,7 @@ def payment_confirm(payment_id):
 @login_required
 def payment_confirm_refund(payment_id):
     """Финальное подтверждение возврата: бронь была отменена игроком более
-    чем за 24ч до игры (см. process_cancel в bot.py), платёж автоматически
+    чем за 12ч до игры (см. process_cancel_yes в bot.py), платёж автоматически
     получил статус 'возврат' — но реальный перевод денег администратор
     делает вручную вне системы, и эта кнопка фиксирует, что перевод сделан."""
     context = db.get_payment_notification_context(payment_id)
@@ -1210,7 +1299,7 @@ def report_excel():
     wb.save(buffer)
     buffer.seek(0)
 
-    filename = f"padel_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    filename = f"padel_report_{datetime.now(APP_TIMEZONE).strftime('%Y%m%d_%H%M')}.xlsx"
     return send_file(
         buffer,
         as_attachment=True,
@@ -1225,26 +1314,29 @@ def report_excel():
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 @csrf.exempt  # Telegram отправляет JSON без CSRF-токена — это не браузерная форма
-@limiter.exempt  # у Telegram свой троттлинг обновлений, наш общий лимит здесь не нужен
+@limiter.limit(os.getenv("WEBHOOK_RATE_LIMIT", "30 per second"))
 def webhook():
     """Принимает обновления от Telegram через webhook.
+
+    Обязательная проверка X-Telegram-Bot-Api-Secret-Token (см.
+    WEBHOOK_SECRET_TOKEN / set_webhook(secret_token=...)) — без неё любой,
+    кто знает URL, мог бы подделать обновления бота.
 
     Обработка передаётся в event loop бот-потока через
     run_coroutine_threadsafe, а не через asyncio.run() — иначе каждый запрос
     создавал бы новый event loop, в котором нельзя использовать asyncpg-пул,
     созданный в другом loop.
 
-    ВАЖНО: раньше здесь стоял future.result(timeout=10) — запрос ждал ДО 10
-    секунд обработки в другом потоке, прежде чем ответить. При
-    `gunicorn --workers 1` (см. deploy.md/docker-compose.yml) это означает,
-    что ЕДИНСТВЕННЫЙ обработчик запросов был занят все эти секунды и не мог
-    ответить ни на один запрос к CRM — при активном использовании бота
-    (несколько параллельных бронирований, оплата с генерацией QR и т.п.)
-    админ-панель выглядела зависшей/упавшей, а при превышении таймаута
-    gunicorn ("--timeout", по умолчанию 30с) воркер вообще убивался и
-    перезапускался. Telegram не ждёт результата обработки — ему достаточно
-    ответа 200 OK, поэтому теперь мы отвечаем СРАЗУ, а обработку отправляем
-    в фон (ошибки не теряются — их ловит done-callback ниже)."""
+    Telegram не ждёт результата обработки — ему достаточно ответа 200 OK,
+    поэтому отвечаем сразу, а обработку отправляем в фон."""
+    header_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not WEBHOOK_SECRET_TOKEN or not secrets.compare_digest(header_token, WEBHOOK_SECRET_TOKEN):
+        logger.warning(
+            "Отклонён webhook без/с неверным secret token (IP %s)",
+            get_remote_address(),
+        )
+        return {"status": "forbidden"}, 403
+
     if bot_instance and dp_instance and bot_loop:
         try:
             update = Update.model_validate(request.json)
@@ -1313,7 +1405,10 @@ def run_bot():
         scheduler.start()
 
         if WEBHOOK_URL:
-            await bot_instance.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+            await bot_instance.set_webhook(
+                url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+                secret_token=WEBHOOK_SECRET_TOKEN,
+            )
         else:
             await dp_instance.start_polling(bot_instance)
 
@@ -1421,4 +1516,8 @@ start_background_services()
 _cleanup_scheduler = start_cleanup_scheduler()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Локально по умолчанию только localhost; на PaaS (Render и т.п.) задайте
+    # HOST=0.0.0.0. Debug — только через FLASK_DEBUG=1.
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host=host, port=port, debug=app.debug)

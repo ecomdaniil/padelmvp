@@ -19,7 +19,6 @@ database_async.py
 
 import asyncio
 import os
-import re as _re
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -30,14 +29,9 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Та же логика, что и в database.py: game_date/game_time — наивные, это
-# локальное время клуба (Europe/Moscow), а сессия БД работает в UTC. Приводим
-# NOW() к "наивному локальному" виду через AT TIME ZONE, иначе сравнение с
-# game_date+game_time сдвинуто на разницу UTC/Europe-Moscow (обычно 3 часа) —
-# игра могла считаться "ещё не начавшейся" на несколько часов дольше, чем
-# по факту.
-_APP_TZ_RAW = os.getenv("APP_TIMEZONE", "Europe/Moscow")
-APP_TIMEZONE = _APP_TZ_RAW if _re.fullmatch(r"[A-Za-z0-9_+\-/]+", _APP_TZ_RAW) else "Europe/Moscow"
+# Клуб работает по московскому времени (см. database.py). Сессия БД — UTC;
+# для сравнений с game_date+game_time всегда берём московский «сейчас».
+APP_TIMEZONE = "Europe/Moscow"
 _LOCAL_NOW_EXPR = f"(NOW() AT TIME ZONE '{APP_TIMEZONE}')"
 
 _pool: Optional[asyncpg.Pool] = None
@@ -86,21 +80,17 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-async def keepalive_loop(interval_seconds: int = 180) -> None:
+async def keepalive_loop(interval_seconds: int = 45) -> None:
     """Не даёт БД "заснуть" между сообщениями пользователей.
 
     Neon (как и большинство serverless Postgres) отключает вычислительный
-    узел после нескольких минут без активных запросов, чтобы не тратить
-    ресурсы впустую. Это и есть причина задержки ~5 секунд на /start или
-    первое сообщение после долгого перерыва — Neon поднимает узел заново
-    ("холодный старт"), и первый же запрос к БД ждёт этого пробуждения.
-    Приложение здесь ничего "не тормозит" — простой SELECT 1 каждые
-    interval_seconds не даёт простою наступить, и все запросы (включая
-    самый первый после паузы) остаются быстрыми.
+    узел после нескольких минут без активных запросов — отсюда задержка
+    ~5–8 с на /start или первое сообщение после паузы. SELECT 1 сразу при
+    старте и далее каждые interval_seconds (45с по умолчанию) не даёт
+    простою наступить.
 
     Запускается как фоновая задача сразу после старта пула (см. bot.py:main
-    и app.py:run_bot). interval_seconds=180 (3 минуты) — с запасом меньше
-    типичного тайм-аута автоотключения (обычно 5 минут)."""
+    и app.py:run_bot)."""
     pool = await get_pool()
     while True:
         try:
@@ -189,9 +179,9 @@ async def get_upcoming_games() -> list:
     """Игры, которые ещё не прошли, отсортированные по дате (без счётчика мест)."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
+        f"""
         SELECT * FROM games
-        WHERE (game_date + game_time) >= NOW()
+        WHERE (game_date + game_time) >= {_LOCAL_NOW_EXPR}
         ORDER BY game_date, game_time
         """
     )
@@ -269,11 +259,11 @@ async def get_games_needing_reminder_24h() -> list:
     проверке планировщиком) и оно ещё не было отправлено."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
+        f"""
         SELECT * FROM games
         WHERE reminder_sent = FALSE
-          AND (game_date + game_time) BETWEEN NOW() + INTERVAL '23 hours'
-                                            AND NOW() + INTERVAL '25 hours'
+          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '23 hours'
+                                            AND {_LOCAL_NOW_EXPR} + INTERVAL '25 hours'
         """
     )
     return _to_dict_list(rows)
@@ -285,11 +275,11 @@ async def get_games_needing_reminder_2h() -> list:
     (см. main() в bot.py/app.py — интервал 15 минут)."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
+        f"""
         SELECT * FROM games
         WHERE reminder_2h_sent = FALSE
-          AND (game_date + game_time) BETWEEN NOW() + INTERVAL '1 hour 45 minutes'
-                                            AND NOW() + INTERVAL '2 hours 15 minutes'
+          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '1 hour 45 minutes'
+                                            AND {_LOCAL_NOW_EXPR} + INTERVAL '2 hours 15 minutes'
         """
     )
     return _to_dict_list(rows)
@@ -344,6 +334,17 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                 return {"status": "not_found", "booking": None, "game": None}
             game_dict = _to_dict(game)
 
+            # Нельзя записаться на уже начавшуюся/прошедшую игру (по Москве).
+            still_upcoming = await conn.fetchval(
+                f"""
+                SELECT (game_date + game_time) >= {_LOCAL_NOW_EXPR}
+                FROM games WHERE id = $1
+                """,
+                game_id,
+            )
+            if not still_upcoming:
+                return {"status": "not_found", "booking": None, "game": game_dict}
+
             existing = await conn.fetchrow(
                 """SELECT * FROM bookings
                    WHERE user_id = $1 AND game_id = $2 AND status != 'отменена'""",
@@ -393,17 +394,75 @@ async def get_booking_by_id(booking_id: int) -> Optional[dict]:
     return _to_dict(row)
 
 
+async def get_booking_cancel_info(booking_id: int, user_id: int) -> dict:
+    """Данные для экрана подтверждения отмены в боте — без самой отмены.
+
+    Возвращает:
+        {"status": "not_found"|"forbidden"|"ok", ...}
+        при ok:
+          refund_window — до игры больше 12 часов (локальное APP_TIMEZONE)
+          payment_pending_confirm — игрок уже нажал «Я оплатил», но админ
+            ещё не подтвердил (status='ожидает' и player_notified_at заполнен):
+            в этом окне отмена запрещена
+          had_confirmed_payment — есть платёж со статусом «подтверждена»
+          game — dict игры
+    """
+    pool = await get_pool()
+    booking = await pool.fetchrow("SELECT * FROM bookings WHERE id = $1", booking_id)
+    if booking is None:
+        return {"status": "not_found"}
+    if booking["user_id"] != user_id:
+        return {"status": "forbidden"}
+    if booking["status"] == "отменена":
+        return {"status": "not_found"}
+
+    game = await pool.fetchrow(
+        f"""
+        SELECT *,
+               ((game_date + game_time) - {_LOCAL_NOW_EXPR}) > INTERVAL '12 hours' AS refund_window
+        FROM games
+        WHERE id = $1
+        """,
+        booking["game_id"],
+    )
+    payment = await pool.fetchrow(
+        """
+        SELECT * FROM payments
+        WHERE booking_id = $1
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        booking_id,
+    )
+    payment_dict = _to_dict(payment)
+    pending_confirm = bool(
+        payment_dict
+        and payment_dict.get("status") == "ожидает"
+        and payment_dict.get("player_notified_at") is not None
+    )
+    had_confirmed = bool(payment_dict and payment_dict.get("status") == "подтверждена")
+    return {
+        "status": "ok",
+        "refund_window": bool(game and game["refund_window"]),
+        "payment_pending_confirm": pending_confirm,
+        "had_confirmed_payment": had_confirmed,
+        "game": _to_dict(game),
+        "payment": payment_dict,
+        "booking": _to_dict(booking),
+    }
+
+
 async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
     """Отменяет заявку только если она принадлежит указанному пользователю.
     Защита от IDOR: раньше отмена работала по одному booking_id без проверки
     владельца, что позволяло отменить чужую запись, зная/подобрав id.
 
     Дополнительно решает, положен ли возврат оплаты: если до начала игры
-    оставалось больше 24 часов И по брони есть подтверждённый платёж, этот
+    оставалось больше 12 часов И по брони есть подтверждённый платёж, этот
     платёж помечается статусом 'возврат' (новая запись не создаётся —
     история и так видна по created_at/updated-статусу одной записи).
-    ">24 часа" считается в SQL через (game_date + game_time) - NOW(), тем же
-    способом, что и окна напоминаний (см. get_games_needing_reminder_24h) —
+    ">12 часов" считается в SQL через (game_date + game_time) -
+    LOCAL_NOW (APP_TIMEZONE), тем же способом, что и статус игр —
     чтобы не разойтись с остальной логикой из-за разных представлений о
     часовом поясе между Python-процессом бота и БД.
 
@@ -413,17 +472,18 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
     Возвращает dict:
         {"status": "not_found"} — брони не существует
         {"status": "forbidden"} — бронь принадлежит другому пользователю
+        {"status": "payment_pending_confirm"} — игрок нажал «Я оплатил»,
+            админ ещё не подтвердил: отмена запрещена
         {"status": "ok",
-         "refund_eligible": bool,   # возврат реально оформлен (>24ч И была подтверждённая оплата)
-         "refund_window": bool,     # >24ч до игры, НЕЗАВИСИМО от того, была ли оплата
-         "had_payment": bool,       # у брони есть хоть какой-то платёж (любого статуса)
+         "refund_eligible": bool,   # возврат реально оформлен (>12ч И была подтверждённая оплата)
+         "refund_window": bool,     # >12ч до игры, НЕЗАВИСИМО от того, была ли оплата
+         "had_payment": bool,       # у брони есть подтверждённый платёж
          "game": dict | None, "payment": dict | None}
         payment — обновлённая (со статусом 'возврат') запись, если возврат
         оформлен, иначе None. refund_window/had_payment нужны боту, чтобы
         показать игроку корректное сообщение и при отмене игры МЕНЕЕ чем за
-        24 часа («оплата не возвращается, так как до игры меньше суток») —
-        это сообщение имеет смысл показывать только если оплата вообще была
-        (had_payment), а не любому, кто просто отменил пустую бронь.
+        12 часов («оплата не возвращается») — это сообщение имеет смысл
+        показывать только если оплата была подтверждена (had_payment).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -437,25 +497,45 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                 return {"status": "forbidden"}
 
             game = await conn.fetchrow(
-                """
-                SELECT *, (game_date + game_time) - NOW() > INTERVAL '24 hours' AS refund_window
+                f"""
+                SELECT *,
+                       ((game_date + game_time) - {_LOCAL_NOW_EXPR}) > INTERVAL '12 hours' AS refund_window
                 FROM games WHERE id = $1
                 """,
                 booking["game_id"],
             )
             refund_window = bool(game and game["refund_window"])
 
-            confirmed_payment = await conn.fetchrow(
+            latest_payment = await conn.fetchrow(
                 """SELECT * FROM payments
-                   WHERE booking_id = $1 AND status = 'подтверждена'
+                   WHERE booking_id = $1
                    ORDER BY id DESC LIMIT 1 FOR UPDATE""",
                 booking_id,
             )
-            had_payment = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM payments WHERE booking_id = $1)", booking_id
+            # Игрок уже нажал «Я оплатил», админ ещё не подтвердил — отмена
+            # запрещена, пока статус не станет «подтверждена» (или не сменится
+            # иначе в CRM). Иначе можно было бы отменить бронь «между» оплатой
+            # и проверкой администратора.
+            if (
+                latest_payment is not None
+                and latest_payment["status"] == "ожидает"
+                and latest_payment["player_notified_at"] is not None
+            ):
+                return {"status": "payment_pending_confirm"}
+
+            confirmed_payment = (
+                latest_payment
+                if latest_payment is not None and latest_payment["status"] == "подтверждена"
+                else None
             )
+            # «Была оплата» для текстов бота — только подтверждённая. Платёж
+            # «ожидает» при отмене до оплаты удаляем (см. ниже) и в CRM он
+            # больше не должен светиться в разделе «Оплаты».
+            had_payment = confirmed_payment is not None
 
             refund_eligible = refund_window and confirmed_payment is not None
+            admin_notify_message_id = booking["admin_notify_message_id"]
+            payment_deleted = False
 
             await conn.execute(
                 "UPDATE bookings SET status = 'отменена' WHERE id = $1", booking_id
@@ -467,15 +547,39 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                     "UPDATE payments SET status = 'возврат' WHERE id = $1 RETURNING *",
                     confirmed_payment["id"],
                 )
+            else:
+                # Отмена до оплаты (или без подтверждённого платежа) — удаляем
+                # «ожидающие» платежи, чтобы они исчезли из CRM «Оплаты».
+                deleted = await conn.execute(
+                    "DELETE FROM payments WHERE booking_id = $1 AND status = 'ожидает'",
+                    booking_id,
+                )
+                # asyncpg execute возвращает строку вида "DELETE N"
+                try:
+                    payment_deleted = int(str(deleted).split()[-1]) > 0
+                except (ValueError, IndexError):
+                    payment_deleted = True
 
             return {
                 "status": "ok",
                 "refund_eligible": refund_eligible,
                 "refund_window": refund_window,
                 "had_payment": bool(had_payment),
+                "payment_deleted": payment_deleted,
+                "admin_notify_message_id": admin_notify_message_id,
                 "game": _to_dict(game),
                 "payment": _to_dict(payment_result) if payment_result else None,
             }
+
+
+async def set_booking_admin_notify_message(booking_id: int, message_id: int) -> None:
+    """Сохраняет message_id уведомления админу о новой записи — чтобы при
+    отмене до оплаты можно было удалить это сообщение в Telegram."""
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE bookings SET admin_notify_message_id = $1 WHERE id = $2",
+        message_id, booking_id,
+    )
 
 
 async def log_action(
@@ -538,6 +642,33 @@ async def set_payment_method(payment_id: int, method: str) -> None:
     await pool.execute("UPDATE payments SET method = $1 WHERE id = $2", method, payment_id)
 
 
+async def get_payment_for_user(payment_id: int, user_id: int) -> Optional[dict]:
+    """Платёж только если он принадлежит заявке этого user_id — защита от
+    IDOR по угаданному payment_id в callback_data бота."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT p.*, b.user_id AS booking_user_id, b.id AS booking_id_ref, b.status AS booking_status
+        FROM payments p
+        JOIN bookings b ON b.id = p.booking_id
+        WHERE p.id = $1 AND b.user_id = $2
+        """,
+        payment_id,
+        user_id,
+    )
+    return _to_dict(row)
+
+
+async def set_payment_method_owned(payment_id: int, user_id: int, method: str) -> Optional[dict]:
+    """Меняет способ оплаты только для платежа владельца. None — нет доступа."""
+    payment = await get_payment_for_user(payment_id, user_id)
+    if not payment:
+        return None
+    await set_payment_method(payment_id, method)
+    payment["method"] = method
+    return payment
+
+
 async def mark_payment_notified(payment_id: int) -> None:
     """Игрок нажал «✅ Я оплатил» (см. process_paid_notify в bot.py) —
     отмечаем момент отдельным полем player_notified_at. Именно это поле, а
@@ -550,6 +681,15 @@ async def mark_payment_notified(payment_id: int) -> None:
     )
 
 
+async def mark_payment_notified_owned(payment_id: int, user_id: int) -> Optional[dict]:
+    """«Я оплатил» только для своего платежа."""
+    payment = await get_payment_for_user(payment_id, user_id)
+    if not payment:
+        return None
+    await mark_payment_notified(payment_id)
+    return payment
+
+
 async def confirm_payment(payment_id: int) -> None:
     """Используется автоматическим подтверждением оплаты картой через
     реальный Telegram Payments provider (см. process_successful_payment в
@@ -557,6 +697,25 @@ async def confirm_payment(payment_id: int) -> None:
     администратор вручную в CRM (db.confirm_payment в database.py)."""
     pool = await get_pool()
     await pool.execute("UPDATE payments SET status = 'подтверждена' WHERE id = $1", payment_id)
+
+
+async def confirm_payment_owned(payment_id: int, user_id: int, amount_kopecks: int) -> dict:
+    """Автоподтверждение Telegram Payments: владелец + сумма + статус «ожидает».
+
+    Возвращает {"status": "ok"|"forbidden"|"mismatch"|"already"|"not_found"}."""
+    payment = await get_payment_for_user(payment_id, user_id)
+    if not payment:
+        return {"status": "not_found"}
+    if payment.get("status") == "подтверждена":
+        return {"status": "already", "payment": payment}
+    expected = int(round(float(payment["amount"]) * 100))
+    if expected != int(amount_kopecks):
+        return {"status": "mismatch", "payment": payment}
+    if payment.get("status") != "ожидает":
+        return {"status": "forbidden", "payment": payment}
+    await confirm_payment(payment_id)
+    payment["status"] = "подтверждена"
+    return {"status": "ok", "payment": payment}
 
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,14 @@
         }
         html, body { min-height: 100%; }
         html { color-scheme: light; }
+        /* Мгновенный отклик на клик по меню: страница ещё грузится с Neon,
+           но UI сразу показывает, что переход начался. */
+        body.nav-pending { cursor: progress; }
+        body.nav-pending .container {
+            opacity: 0.55;
+            transition: opacity 0.12s ease;
+            pointer-events: none;
+        }
         body::before {
             content: "";
             position: fixed;
@@ -577,8 +585,19 @@
                     })
                     .catch(function () { /* сеть недоступна — просто пропускаем цикл */ });
             }
+            // Сразу после загрузки — шапка больше не ждёт БД при рендере,
+            // бейджи подтягиваем отдельным лёгким запросом.
+            poll();
             setInterval(poll, 8000);
         })();
+
+        // Клик по пункту меню — мгновенная визуальная реакция до прихода HTML.
+        document.querySelectorAll('.nav-links a[href]').forEach(function (link) {
+            link.addEventListener('click', function (e) {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || link.target === '_blank') return;
+                document.body.classList.add('nav-pending');
+            });
+        });
     </script>
     {% block extra_scripts %}{% endblock %}
 </body>

@@ -5,7 +5,7 @@ Telegram-бот для игроков в падел.
 
 Что умеет:
 - /start — расширенная анкета (имя, возраст, город, опыт, инвентарь, правила, телефон)
-- /menu — главное меню, /help — написать администратору
+- /menu — главное меню, /myprofile — мой профиль, /help — написать администратору
 - показывает список ближайших игр, спрашивает количество мест (1-4) и
   позволяет записаться с автоматическим расчётом цены
 - после записи предлагает оплату (карта / СБП QR — интерфейс рабочий,
@@ -20,11 +20,14 @@ Telegram-бот для игроков в падел.
 """
 
 import asyncio
+import hashlib
+import html
 import logging
 import os
 import re
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from dotenv import load_dotenv
@@ -70,6 +73,12 @@ load_dotenv()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+_FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY") or ""
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN") or (
+    hashlib.sha256(f"tg-webhook:{_FLASK_SECRET_KEY}".encode("utf-8")).hexdigest()
+    if _FLASK_SECRET_KEY
+    else ""
+)
 
 # По умолчанию логируем только ошибки — это отдельно настраиваемо через .env,
 # если для отладки понадобится более подробный вывод (INFO/DEBUG).
@@ -88,6 +97,9 @@ GAMES_CACHE_KEY = cache.GAMES_CACHE_KEY
 GAMES_CACHE_TTL = cache.GAMES_CACHE_TTL
 LEVELS_CACHE_KEY = cache.LEVELS_CACHE_KEY
 LEVELS_CACHE_TTL = cache.LEVELS_CACHE_TTL
+USER_CACHE_PREFIX = cache.USER_CACHE_PREFIX
+USER_CACHE_TTL = cache.USER_CACHE_TTL
+_USER_NONE = "__none__"  # sentinel в кэше: пользователя нет (не путать с miss)
 
 RATE_LIMIT_PER_SECOND = int(os.getenv("BOT_RATE_LIMIT_PER_SECOND", "10"))
 
@@ -97,6 +109,7 @@ RATE_LIMIT_PER_SECOND = int(os.getenv("BOT_RATE_LIMIT_PER_SECOND", "10"))
 BOT_COMMANDS = [
     BotCommand(command="start", description="Начать / открыть анкету"),
     BotCommand(command="menu", description="Главное меню"),
+    BotCommand(command="myprofile", description="Мой профиль"),
     BotCommand(command="help", description="Написать администратору"),
 ]
 
@@ -256,19 +269,33 @@ def _format_profile(user: dict) -> str:
     return (
         f"👤 <b>Ваш профиль</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Имя: {user['name']}\n"
-        f"Возраст: {user.get('age') or '—'}\n"
-        f"Город: {user.get('city') or '—'}\n"
-        f"Опыт: {user['level']}\n"
+        f"Имя: {_html(user['name'])}\n"
+        f"Возраст: {_html(user.get('age') or '—')}\n"
+        f"Город: {_html(user.get('city') or '—')}\n"
+        f"Опыт: {_html(user['level'])}\n"
         f"Свой инвентарь: {inventory}\n"
         f"Нужны правила: {rules}\n"
-        f"Телефон: {user['phone']}\n"
+        f"Телефон: {_html(user['phone'])}\n"
     )
 
 
 def _safe_text(message: Message) -> str:
     """Возвращает текст сообщения без исключения для пустых/не-текстовых обновлений."""
     return (message.text or "").strip()
+
+
+def _html(value) -> str:
+    """Экранирует пользовательский/БД-текст перед parse_mode=HTML в Telegram."""
+    if value is None:
+        return ""
+    return html.escape(str(value), quote=False)
+
+
+def _is_admin_user(user_id: Optional[int]) -> bool:
+    """Только личный ADMIN_CHAT_ID может отвечать игрокам от имени клуба."""
+    if not ADMIN_CHAT_ID or user_id is None:
+        return False
+    return str(user_id) == str(ADMIN_CHAT_ID)
 
 
 def _profile_keyboard() -> InlineKeyboardMarkup:
@@ -343,6 +370,7 @@ async def _save_profile(message: Message, state: FSMContext):
         )
         title = "Спасибо, анкета заполнена! ✅"
 
+    _invalidate_user_cache(message.from_user.id)
     await state.clear()
 
     inventory_text = "Да ✅" if data.get("has_inventory") else "Нет"
@@ -386,6 +414,25 @@ async def cmd_start(message: Message, state: FSMContext):
         return
 
     await _start_questionnaire(message, state, is_edit=False)
+
+
+@router.message(Command("myprofile"))
+async def cmd_myprofile(message: Message):
+    """Команда из мини-меню Telegram («/») — показать анкету игрока."""
+    user = await _require_registered(message.from_user.id)
+    if not user:
+        await message.answer(
+            "❌ Сначала заполни анкету.\n"
+            "Отправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    await message.answer(
+        _format_profile(user),
+        reply_markup=_profile_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "edit_profile")
@@ -624,8 +671,8 @@ def _game_card(game: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
 
     text = (
         f"📅 <b>{game['game_date'].strftime('%d.%m.%Y')}</b> в {str(game['game_time'])[:5]}\n"
-        f"📍 {game['location']}\n"
-        f"💰 {game['price']} ₽\n"
+        f"📍 {_html(game['location'])}\n"
+        f"💰 {_html(game['price'])} ₽\n"
         f"👥 Свободно мест: <b>{free_slots}</b> из {game['total_slots']}"
     )
 
@@ -776,7 +823,7 @@ async def _show_my_bookings(message: Message):
             f"📌 Статус: {status_emoji} {b['status']}"
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel:{b['id']}")]
+            [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_ask:{b['id']}")]
         ])
         return text, keyboard
 
@@ -962,10 +1009,10 @@ async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
         admin_text = (
             "💬 <b>Сообщение от игрока (/help)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 {user['name']}\n"
-            f"📞 {user['phone']}\n"
+            f"👤 {_html(user['name'])}\n"
+            f"📞 {_html(user['phone'])}\n"
             f"🆔 Telegram ID: {message.from_user.id}\n\n"
-            f"📝 {user_message}"
+            f"📝 {_html(user_message)}"
         )
         # Кнопка «Ответить» — нажатие запускает FSM-диалог AdminReply прямо
         # в чате администратора (см. admin_reply_start/admin_reply_send):
@@ -1000,10 +1047,10 @@ async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("reply_to:"))
 async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
-    """Админ нажал «↩️ Ответить» под сообщением игрока — просим текст
-    ответа. Кнопка существует только в сообщениях, отправленных в
-    ADMIN_CHAT_ID, поэтому нажать её может только тот, у кого есть доступ к
-    этому чату (Telegram не позволяет «нажать» инлайн-кнопку в чужом чате)."""
+    """Админ нажал «↩️ Ответить» — только ADMIN_CHAT_ID (личный telegram id)."""
+    if not _is_admin_user(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
     target_telegram_id = int(callback.data.split(":", 1)[1])
     await state.update_data(reply_target_telegram_id=target_telegram_id)
     await state.set_state(AdminReply.waiting_for_reply)
@@ -1017,6 +1064,11 @@ async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(StateFilter(AdminReply.waiting_for_reply))
 async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
+    if not _is_admin_user(message.from_user.id):
+        await state.clear()
+        await message.answer("❌ Недостаточно прав.")
+        return
+
     data = await state.get_data()
     target_telegram_id = data.get("reply_target_telegram_id")
     await state.clear()
@@ -1029,7 +1081,7 @@ async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
     try:
         await bot.send_message(
             target_telegram_id,
-            f"💬 <b>Ответ администратора:</b>\n\n{reply_text}",
+            f"💬 <b>Ответ администратора:</b>\n\n{_html(reply_text)}",
             parse_mode="HTML",
         )
         await message.answer("✅ Ответ отправлен игроку.")
@@ -1044,15 +1096,29 @@ async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
 # Список игр и запись
 # ---------------------------------------------------------------------------
 
+def _invalidate_user_cache(telegram_id: int) -> None:
+    cache.delete(f"{USER_CACHE_PREFIX}{telegram_id}")
+
+
 async def _require_registered(telegram_id: int):
-    """Возвращает пользователя из БД или None, если анкета не заполнена."""
-    return await db.get_user_by_telegram_id(telegram_id)
+    """Возвращает пользователя или None. Кэш на USER_CACHE_TTL — иначе
+    каждый клик по меню ReplyKeyboard ждёт ~1с round-trip к Neon только
+    ради проверки анкеты."""
+    key = f"{USER_CACHE_PREFIX}{telegram_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return None if cached == _USER_NONE else cached
+    user = await db.get_user_by_telegram_id(telegram_id)
+    cache.set(key, _USER_NONE if user is None else user, USER_CACHE_TTL)
+    return user
 
 
 async def _notify_admin_new_booking(
     bot: Bot, user: dict, game: dict, booking_id: int, slots_count: int, total_price: float,
 ):
-    """Отправляет админу уведомление о новой записи игрока на корт."""
+    """Отправляет админу уведомление о новой записи игрока на корт и
+    сохраняет message_id в bookings.admin_notify_message_id — при отмене
+    до оплаты это сообщение удаляется (см. _delete_admin_booking_notify)."""
     if not ADMIN_CHAT_ID:
         logger.warning("ADMIN_CHAT_ID не задан — уведомление о записи пропущено")
         return
@@ -1063,27 +1129,46 @@ async def _notify_admin_new_booking(
     notification_text = (
         "🔔 <b>Новая запись на корт!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 Имя: {user['name']}\n"
-        f"📞 Телефон: {user['phone']}\n"
-        f"📅 Дата и время: {game_datetime}\n"
-        f"📍 Корт / площадка: {game['location']}\n"
+        f"👤 Имя: {_html(user['name'])}\n"
+        f"📞 Телефон: {_html(user['phone'])}\n"
+        f"📅 Дата и время: {_html(game_datetime)}\n"
+        f"📍 Корт / площадка: {_html(game['location'])}\n"
         f"👥 Мест: {slots_count}\n"
         f"💰 К оплате: {total_price:.0f} ₽\n"
         f"🆔 ID заявки: {booking_id}"
     )
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=notification_text,
             parse_mode="HTML",
         )
+        try:
+            await db.set_booking_admin_notify_message(booking_id, sent.message_id)
+        except Exception as e:
+            logger.error(
+                "Не удалось сохранить message_id уведомления для брони #%s: %s",
+                booking_id, e,
+            )
         logger.debug(
-            "Уведомление о записи #%s отправлено админу (игрок: %s)",
+            "Уведомление о записи #%s отправлено админу (игрок: %s, msg=%s)",
             booking_id,
             user["name"],
+            sent.message_id,
         )
     except Exception as e:
         logger.error("Не удалось отправить уведомление админу о записи #%s: %s", booking_id, e)
+
+
+async def _delete_admin_booking_notify(bot: Bot, message_id: Optional[int]) -> None:
+    """Удаляет у админа сообщение о записи, если бронь отменена до оплаты."""
+    if not ADMIN_CHAT_ID or not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=message_id)
+    except Exception as e:
+        # Сообщение могли уже удалить вручную / слишком старое — не критично.
+        logger.debug("Не удалось удалить уведомление админу msg=%s: %s", message_id, e)
 
 
 @router.message(Command("games"))
@@ -1096,23 +1181,19 @@ def _slots_choice_keyboard(game_id: int, max_slots: int) -> InlineKeyboardMarkup
         InlineKeyboardButton(text=str(n), callback_data=f"book_slots:{game_id}:{n}")
         for n in range(1, max_slots + 1)
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        buttons,
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="book_back")],
+    ])
 
 
-@router.callback_query(F.data.startswith("book:"))
-async def process_booking_ask_slots(callback: CallbackQuery):
-    """Первый шаг записи: показываем игру и спрашиваем, на сколько мест
-    бронировать (1-4), прежде чем создавать заявку."""
-    user = await _require_registered(callback.from_user.id)
-    if not user:
-        await callback.answer("Сначала заполни анкету: отправь /start", show_alert=True)
-        return
-
-    game_id = int(callback.data.split(":")[1])
+async def _prompt_slots_for_game(message: Message, game_id: int) -> bool:
+    """Показывает вопрос «Сколько мест?» для игры. True — сообщение отправлено,
+    False — игра недоступна / мест нет (ошибка уже отправлена вызывающему
+    через return False — вызывающий сам решает, как ответить callback)."""
     game = await db.get_game_by_id(game_id)
     if not game:
-        await callback.answer("Эта игра больше не доступна.", show_alert=True)
-        return
+        return False
 
     taken = await db.count_bookings_for_game(game_id)
     # Учитываем и ручной booked_places из CRM — это ДОПОЛНИТЕЛЬНЫЕ места,
@@ -1121,12 +1202,10 @@ async def process_booking_ask_slots(callback: CallbackQuery):
     effective_taken = taken + (game.get("booked_places") or 0)
     free_slots = max(0, game["total_slots"] - effective_taken)
     if free_slots <= 0:
-        await callback.answer("К сожалению, места уже закончились.", show_alert=True)
-        return
+        return False
 
     max_choice = min(MAX_SLOTS_PER_BOOKING, free_slots)
-    await callback.answer()
-    await callback.message.answer(
+    await message.answer(
         "👥 <b>Сколько мест забронировать?</b>\n"
         f"Свободно: {free_slots} из {game['total_slots']}\n"
         f"Цена за место: {game['price']} ₽\n\n"
@@ -1134,15 +1213,52 @@ async def process_booking_ask_slots(callback: CallbackQuery):
         reply_markup=_slots_choice_keyboard(game_id, max_choice),
         parse_mode="HTML",
     )
+    return True
+
+
+@router.callback_query(F.data.regexp(r"^book:\d+$"))
+async def process_booking_ask_slots(callback: CallbackQuery):
+    """Первый шаг записи: показываем игру и спрашиваем, на сколько мест
+    бронировать (1-4), прежде чем создавать заявку.
+
+    Фильтр именно ^book:\\d+$, а не startswith('book:') — иначе сюда же
+    попадали бы book_slots:... и book_back."""
+    # Снимаем «часики» Telegram сразу — проверка анкеты/мест может занять
+    # round-trip к Neon; ошибки покажем обычным сообщением.
+    await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    game_id = int(callback.data.split(":")[1])
+    ok = await _prompt_slots_for_game(callback.message, game_id)
+    if not ok:
+        await callback.message.answer("Эта игра больше не доступна или мест нет.")
+
+
+@router.callback_query(F.data == "book_back")
+async def process_book_back(callback: CallbackQuery):
+    """Назад с выбора количества мест — снова спрашиваем формат игры."""
+    await callback.answer()
+    await _ask_game_format(callback.message, telegram_id=callback.from_user.id)
 
 
 @router.callback_query(F.data.startswith("book_slots:"))
 async def process_booking_confirm(callback: CallbackQuery):
     """Второй шаг записи: пользователь выбрал количество мест — создаём
     заявку, считаем итоговую цену и предлагаем способ оплаты."""
+    # Мгновенный toast вместо крутящихся часиков на время create_booking_safe.
+    await callback.answer("Записываю…")
     user = await _require_registered(callback.from_user.id)
     if not user:
-        await callback.answer("Сначала заполни анкету: отправь /start", show_alert=True)
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
 
     _, game_id_str, slots_str = callback.data.split(":")
@@ -1158,13 +1274,15 @@ async def process_booking_confirm(callback: CallbackQuery):
     result = await db.create_booking_safe(user_id=user["id"], game_id=game_id, slots_count=slots_count)
 
     if result["status"] == "not_found":
-        await callback.answer("Эта игра больше не доступна.", show_alert=True)
+        await callback.message.answer("Эта игра больше не доступна.")
         return
     if result["status"] == "full":
-        await callback.answer("К сожалению, свободных мест уже меньше, чем ты выбрал.", show_alert=True)
+        await callback.message.answer(
+            "К сожалению, свободных мест уже меньше, чем ты выбрал."
+        )
         return
     if result["status"] == "duplicate":
-        await callback.answer("Ты уже записан на эту игру.", show_alert=True)
+        await callback.message.answer("Ты уже записан на эту игру.")
         return
 
     booking = result["booking"]
@@ -1187,8 +1305,6 @@ async def process_booking_confirm(callback: CallbackQuery):
     asyncio.create_task(
         _notify_admin_new_booking(callback.bot, user, game, booking_id, slots_count, total_price)
     )
-
-    await callback.answer("Заявка отправлена! ✅")
     await callback.message.answer(
         f"✅ Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
         f"в {str(game['game_time'])[:5]}!\n\n"
@@ -1223,25 +1339,97 @@ def _payment_method_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплатить картой", callback_data=f"pay_card:{payment_id}")],
         [InlineKeyboardButton(text="📱 Оплатить по СБП (QR)", callback_data=f"pay_sbp:{payment_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pay_back:{payment_id}")],
     ])
 
 
 def _paid_notify_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_notify:{payment_id}")]
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_notify:{payment_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pay_back:{payment_id}")],
     ])
+
+
+@router.callback_query(F.data.startswith("pay_back:"))
+async def process_pay_back(callback: CallbackQuery):
+    """Назад с экрана оплаты → отменяем ещё не подтверждённую заявку и
+    возвращаем к выбору количества мест по той же игре."""
+    await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.get_payment_by_id(payment_id)
+    if not payment:
+        await callback.message.answer("Платёж не найден.")
+        return
+
+    booking = await db.get_booking_by_id(payment["booking_id"])
+    if not booking or booking["user_id"] != user["id"]:
+        await callback.message.answer("Это не твоя запись.")
+        return
+
+    if payment.get("status") == "подтверждена":
+        await callback.message.answer(
+            "Оплата уже подтверждена — отменить через «Назад» нельзя. "
+            "Используй «Мои записи».",
+        )
+        return
+    if payment.get("player_notified_at") is not None and payment.get("status") == "ожидает":
+        await callback.message.answer(
+            "Ты уже сообщил об оплате. Дождись подтверждения администратора "
+            "или напиши ему через «Связаться с администратором».",
+        )
+        return
+
+    result = await db.cancel_booking_owned(booking["id"], user["id"])
+    if result["status"] == "payment_pending_confirm":
+        await callback.message.answer(
+            "Ты уже сообщил об оплате. Дождись подтверждения администратора.",
+        )
+        return
+    if result["status"] != "ok":
+        await callback.message.answer("Не удалось вернуться назад.")
+        return
+
+    _invalidate_games_cache()
+    # Отмена до оплаты — убираем уведомление админу о этой записи.
+    await _delete_admin_booking_notify(callback.bot, result.get("admin_notify_message_id"))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "Хорошо, вернулись к выбору количества мест.",
+    )
+    ok = await _prompt_slots_for_game(callback.message, booking["game_id"])
+    if not ok:
+        await callback.message.answer(
+            "Эта игра больше недоступна. Выбери другую в разделе «🎾 Игры».",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 @router.callback_query(F.data.startswith("pay_card:"))
 async def process_pay_card(callback: CallbackQuery):
-    payment_id = int(callback.data.split(":")[1])
-    payment = await db.get_payment_by_id(payment_id)
-    if not payment:
-        await callback.answer("Платёж не найден.", show_alert=True)
-        return
-
-    await db.set_payment_method(payment_id, "card")
     await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.set_payment_method_owned(payment_id, user["id"], "card")
+    if not payment:
+        await callback.message.answer("Платёж не найден или это не твоя запись.")
+        return
 
     if payment_provider.is_card_provider_configured():
         # Настоящий Telegram Payments API — сработает, если в .env указан
@@ -1273,14 +1461,19 @@ async def process_pay_card(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pay_sbp:"))
 async def process_pay_sbp(callback: CallbackQuery):
-    payment_id = int(callback.data.split(":")[1])
-    payment = await db.get_payment_by_id(payment_id)
-    if not payment:
-        await callback.answer("Платёж не найден.", show_alert=True)
-        return
-
-    await db.set_payment_method(payment_id, "sbp")
     await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.set_payment_method_owned(payment_id, user["id"], "sbp")
+    if not payment:
+        await callback.message.answer("Платёж не найден или это не твоя запись.")
+        return
 
     # СБП не входит в стандартный Telegram Payments API — реального
     # приёма нет, показываем интерфейс (QR с тестовыми данными) и просим
@@ -1312,18 +1505,23 @@ async def process_paid_notify(callback: CallbackQuery):
     окончательное подтверждение всё равно делает администратор в CRM,
     чтобы нельзя было просто нажать кнопку и получить статус «оплачено»
     без реальной проверки оплаты."""
-    payment_id = int(callback.data.split(":")[1])
-    payment = await db.get_payment_by_id(payment_id)
-    if not payment:
-        await callback.answer("Платёж не найден.", show_alert=True)
+    await callback.answer("Спасибо! Администратор проверит оплату.")
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
-
+    payment_id = int(callback.data.split(":")[1])
     # Именно с этого момента платёж считается "новым" для бейджа "+N" рядом
     # с "Оплаты" в CRM — до этого клика он уже существовал (создаётся сразу
     # при записи на игру), но игрок ещё не заявлял об оплате.
-    await db.mark_payment_notified(payment_id)
+    payment = await db.mark_payment_notified_owned(payment_id, user["id"])
+    if not payment:
+        await callback.message.answer("Платёж не найден или это не твоя запись.")
+        return
 
-    await callback.answer("Спасибо! Администратор проверит оплату.", show_alert=True)
     await callback.message.answer(
         "⏳ Мы получили твоё уведомление об оплате.\n"
         "Администратор подтвердит её в ближайшее время."
@@ -1331,24 +1529,19 @@ async def process_paid_notify(callback: CallbackQuery):
 
     if ADMIN_CHAT_ID:
         try:
-            # Имя берём из профиля в БД (то, что игрок указал при регистрации
-            # в боте, — надёжнее, чем Telegram-имя, которое человек может
-            # менять как угодно); username — только из Telegram, в профиле
-            # его не храним, и брать его больше не откуда.
-            db_user = await db.get_user_by_telegram_id(callback.from_user.id)
-            display_name = (db_user["name"] if db_user else None) or callback.from_user.full_name or "Игрок"
+            display_name = user.get("name") or callback.from_user.full_name or "Игрок"
             username = callback.from_user.username
-            username_part = f" (@{username})" if username else ""
+            username_part = f" (@{_html(username)})" if username else ""
 
             await callback.bot.send_message(
                 ADMIN_CHAT_ID,
                 "💰 <b>Игрок сообщил об оплате</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Пользователь {display_name}{username_part} сообщил об оплате "
+                f"Пользователь {_html(display_name)}{username_part} сообщил об оплате "
                 f"брони №{payment['booking_id']}\n\n"
                 f"🆔 Платёж #{payment_id}\n"
-                f"💳 Способ: {payment.get('method') or '—'}\n"
-                f"💰 Сумма: {payment['amount']} ₽\n\n"
+                f"💳 Способ: {_html(payment.get('method') or '—')}\n"
+                f"💰 Сумма: {_html(payment['amount'])} ₽\n\n"
                 "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
                 parse_mode="HTML",
             )
@@ -1358,10 +1551,30 @@ async def process_paid_notify(callback: CallbackQuery):
 
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Telegram требует ответить в течение 10 секунд, иначе платёж
-    отклоняется — здесь можно было бы ещё раз проверить наличие мест, но
-    места уже были зарезервированы на шаге создания заявки, поэтому просто
-    подтверждаем."""
+    """Telegram требует ответить в течение 10 секунд. Проверяем владельца
+    платежа и сумму до согласия на списание."""
+    payload = pre_checkout_query.invoice_payload or ""
+    try:
+        payment_id = int(payload.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await pre_checkout_query.answer(ok=False, error_message="Некорректный платёж.")
+        return
+
+    user = await _require_registered(pre_checkout_query.from_user.id)
+    if not user:
+        await pre_checkout_query.answer(ok=False, error_message="Сначала заполни анкету.")
+        return
+
+    payment = await db.get_payment_for_user(payment_id, user["id"])
+    if not payment or payment.get("status") != "ожидает":
+        await pre_checkout_query.answer(ok=False, error_message="Платёж недоступен.")
+        return
+
+    expected = int(round(float(payment["amount"]) * 100))
+    if int(pre_checkout_query.total_amount) != expected:
+        await pre_checkout_query.answer(ok=False, error_message="Сумма не совпадает.")
+        return
+
     await pre_checkout_query.answer(ok=True)
 
 
@@ -1369,8 +1582,7 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 async def process_successful_payment(message: Message):
     """Срабатывает только при настоящей интеграции Telegram Payments
     (PAYMENT_PROVIDER_TOKEN задан) — Telegram сам подтверждает, что деньги
-    списаны, поэтому здесь можно сразу помечать оплату подтверждённой без
-    участия администратора."""
+    списаны; дополнительно сверяем владельца и сумму."""
     payload = message.successful_payment.invoice_payload
     try:
         payment_id = int(payload.split(":", 1)[1])
@@ -1378,7 +1590,27 @@ async def process_successful_payment(message: Message):
         logger.error("Некорректный payload успешного платежа: %s", payload)
         return
 
-    await db.confirm_payment(payment_id)
+    user = await _require_registered(message.from_user.id)
+    if not user:
+        logger.error("successful_payment без зарегистрированного пользователя")
+        return
+
+    result = await db.confirm_payment_owned(
+        payment_id,
+        user["id"],
+        int(message.successful_payment.total_amount),
+    )
+    if result["status"] not in {"ok", "already"}:
+        logger.error(
+            "Отклонено автоподтверждение оплаты #%s: %s (user=%s)",
+            payment_id, result["status"], user["id"],
+        )
+        await message.answer(
+            "❌ Не удалось подтвердить оплату автоматически. "
+            "Напиши администратору через «Связаться с администратором»."
+        )
+        return
+
     await message.answer("✅ Оплата картой прошла успешно! Спасибо 🎾")
 
     if ADMIN_CHAT_ID:
@@ -1401,7 +1633,7 @@ async def cmd_my_bookings(message: Message):
 
 
 async def _notify_refund(callback: CallbackQuery, user: dict, booking_id: int, game: Optional[dict], payment: dict) -> None:
-    """Уведомляет игрока и админа о возврате оплаты (>24ч до игры, была
+    """Уведомляет игрока и админа о возврате оплаты (>12ч до игры, была
     подтверждённая оплата) и пишет об этом в общий журнал admin_logs —
     вызывается после успешной отмены брони, поэтому ошибки здесь не должны
     влиять на уже случившуюся отмену, только логируются."""
@@ -1427,7 +1659,7 @@ async def _notify_refund(callback: CallbackQuery, user: dict, booking_id: int, g
                 "❌ <b>Отмена записи с возвратом оплаты</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Пользователь {user['name']}{username_part} отменил запись "
-                f"на корт (бронь №{booking_id}) более чем за 24 часа до начала\n\n"
+                f"на корт (бронь №{booking_id}) более чем за 12 часов до начала\n\n"
                 f"📅 {game_dt}\n"
                 f"📍 {location}\n"
                 f"💰 К возврату: {amount:.0f} ₽\n\n"
@@ -1440,7 +1672,7 @@ async def _notify_refund(callback: CallbackQuery, user: dict, booking_id: int, g
     description = (
         f"Возврат оплаты {amount:.0f} ₽ по брони №{booking_id}: пользователь "
         f"{user['name']}{username_part} отменил запись на игру {game_dt} "
-        "более чем за 24 часа до начала"
+        "более чем за 12 часов до начала"
     )
     try:
         await db.log_action(
@@ -1455,43 +1687,161 @@ async def _notify_refund(callback: CallbackQuery, user: dict, booking_id: int, g
         logger.error("Не удалось записать возврат оплаты #%s в журнал: %s", payment["id"], e)
 
 
-@router.callback_query(F.data.startswith("cancel:"))
-async def process_cancel(callback: CallbackQuery):
+def _cancel_confirm_keyboard(booking_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Да, отменить", callback_data=f"cancel_yes:{booking_id}")],
+        [InlineKeyboardButton(text="Нет, оставить", callback_data=f"cancel_no:{booking_id}")],
+    ])
+
+
+@router.callback_query(F.data.regexp(r"^cancel_ask:\d+$"))
+@router.callback_query(F.data.regexp(r"^cancel:\d+$"))
+async def process_cancel_ask(callback: CallbackQuery):
+    """Первый шаг отмены: спрашиваем подтверждение. Если до игры <12ч —
+    доброжелательно предупреждаем, что возврата не будет. Если игрок уже
+    нажал «Я оплатил», а админ ещё не подтвердил — отмену блокируем.
+
+    cancel:<id> оставлен для кнопок «Не смогу» в напоминаниях; cancel_ask —
+    из «Мои записи». Фильтры с regexp, чтобы не перехватывать cancel_yes/no."""
+    await callback.answer()
     user = await _require_registered(callback.from_user.id)
     if not user:
-        await callback.answer("Сначала заполни анкету: отправь /start", show_alert=True)
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    booking_id = int(callback.data.split(":")[1])
+    info = await db.get_booking_cancel_info(booking_id, user["id"])
+
+    if info["status"] == "not_found":
+        await callback.message.answer("Запись не найдена.")
+        return
+    if info["status"] == "forbidden":
+        await callback.message.answer("Это не твоя запись.")
+        return
+
+    if info.get("payment_pending_confirm"):
+        await callback.message.answer(
+            "Ты уже сообщил об оплате. Отменить запись можно только после того, "
+            "как администратор подтвердит оплату в CRM.",
+        )
+        return
+
+    game = info.get("game") or {}
+    game_dt = (
+        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+        if game.get("game_date") else "—"
+    )
+
+    if info.get("refund_window"):
+        warning = ""
+        if info.get("had_confirmed_payment"):
+            warning = (
+                "\n\nПри отмене более чем за 12 часов до игры оплата будет "
+                "возвращена после оформления администратором."
+            )
+        text = (
+            f"Точно отменить запись на <b>{game_dt}</b>?\n"
+            f"📍 {game.get('location') or '—'}"
+            f"{warning}"
+        )
+    else:
+        # < 12 часов — всегда предупреждаем доброжелательно, даже если оплаты
+        # ещё не было: игрок должен понимать правило заранее.
+        text = (
+            f"Точно отменить запись на <b>{game_dt}</b>?\n"
+            f"📍 {game.get('location') or '—'}\n\n"
+            "⚠️ До начала игры осталось меньше 12 часов. Если отменишь сейчас, "
+            "вернуть оплату, к сожалению, не получится — по правилам клуба "
+            "возврат возможен только при отмене заранее. Мы будем рады видеть "
+            "тебя на другом корте в другой день!"
+        )
+
+    await callback.message.answer(
+        text,
+        reply_markup=_cancel_confirm_keyboard(booking_id),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("cancel_no:"))
+async def process_cancel_no(callback: CallbackQuery):
+    await callback.answer("Запись сохранена.")
+    try:
+        await callback.message.edit_text(
+            (callback.message.text or "") + "\n\n✅ Запись сохранена.",
+            reply_markup=None,
+        )
+    except Exception:
+        await callback.message.answer("Хорошо, запись остаётся активной.")
+
+
+@router.callback_query(F.data.startswith("cancel_yes:"))
+async def process_cancel_yes(callback: CallbackQuery):
+    await callback.answer("Отменяю…")
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
 
     booking_id = int(callback.data.split(":")[1])
 
     # Отмена проверяет владельца записи внутри транзакции — раньше можно было
     # отменить чужую запись, зная её booking_id (IDOR). Дополнительно решает,
-    # положен ли возврат оплаты (>24ч до игры + была подтверждённая оплата).
+    # положен ли возврат оплаты (>12ч до игры + была подтверждённая оплата)
+    # и блокирует отмену, пока админ не подтвердил оплату после «Я оплатил».
     result = await db.cancel_booking_owned(booking_id, user["id"])
 
     if result["status"] == "not_found":
-        await callback.answer("Запись не найдена.", show_alert=True)
+        await callback.message.answer("Запись не найдена.")
         return
     if result["status"] == "forbidden":
-        await callback.answer("Это не твоя запись.", show_alert=True)
+        await callback.message.answer("Это не твоя запись.")
+        return
+    if result["status"] == "payment_pending_confirm":
+        await callback.message.answer(
+            "Ты уже сообщил об оплате. Отменить запись можно только после того, "
+            "как администратор подтвердит оплату.",
+        )
         return
 
     _invalidate_games_cache()
-    await callback.answer("Запись отменена.")
-    await callback.message.edit_text(callback.message.text + "\n\n❌ ОТМЕНЕНО")
+    # Если отмена до оплаты — платёж удалён из CRM, уведомление админу тоже.
+    if result.get("payment_deleted") or (
+        not result.get("had_payment") and result.get("admin_notify_message_id")
+    ):
+        await _delete_admin_booking_notify(callback.bot, result.get("admin_notify_message_id"))
+
+    try:
+        await callback.message.edit_text(
+            (callback.message.text or "") + "\n\n❌ ОТМЕНЕНО",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
 
     if result.get("refund_eligible") and result.get("payment"):
         await _notify_refund(callback, user, booking_id, result.get("game"), result["payment"])
     elif not result.get("refund_window") and result.get("had_payment"):
-        # Игра начинается меньше чем через 24 часа — по правилам возврат не
+        # Игра начинается меньше чем через 12 часов — по правилам возврат не
         # положен, но игрок был оплатившим (had_payment), поэтому явно
         # объясняем, почему денег не будет, а не молчим об этом.
         await callback.message.answer(
             "Ваша запись отменена. К сожалению, вернуть оплату не получится — до начала "
-            "игры остаётся меньше 24 часов, а по правилам сервиса возврат возможен только "
+            "игры остаётся меньше 12 часов, а по правилам сервиса возврат возможен только "
             "при отмене заранее.\n\n"
             "Ничего страшного — в разделе «🎾 Игры» можно выбрать другую игру, будем рады "
             "видеть тебя снова! 🎾"
+        )
+    else:
+        await callback.message.answer(
+            "Запись отменена. Если передумаешь — загляни в «🎾 Игры».",
+            reply_markup=main_menu_keyboard(),
         )
 
 
@@ -1529,7 +1879,7 @@ async def fallback_message(message: Message, state: FSMContext):
 
     if message.text.startswith('/'):
         await message.answer(
-            "ℹ️ Я понимаю команды /start, /menu, /games, /my_bookings, /help и /cancel.\n"
+            "ℹ️ Я понимаю команды /start, /menu, /myprofile, /games, /my_bookings, /help и /cancel.\n"
             "Для навигации используй кнопки меню ниже.",
             reply_markup=main_menu_keyboard(),
         )
@@ -1548,11 +1898,29 @@ async def fallback_message(message: Message, state: FSMContext):
 # Напоминания за 24 часа и за 2 часа до игры
 # ---------------------------------------------------------------------------
 
-async def _send_reminder_batch(bot: Bot, games: list, label: str, mark_sent) -> None:
+def _refund_deadline_str(game: dict) -> str:
+    """Момент, после которого отмена уже без возврата (за 12 часов до старта)."""
+    game_time = game["game_time"]
+    if hasattr(game_time, "strftime"):
+        start = datetime.combine(game["game_date"], game_time)
+    else:
+        # asyncpg иногда отдаёт time как datetime / str
+        start = datetime.combine(game["game_date"], datetime.strptime(str(game_time)[:8], "%H:%M:%S").time())
+    deadline = start - timedelta(hours=12)
+    return deadline.strftime("%d.%m.%Y в %H:%M")
+
+
+async def _send_reminder_batch(
+    bot: Bot, games: list, label: str, mark_sent, *, include_refund_notice: bool = False,
+) -> None:
     """Рассылает напоминание с кнопкой «Не смогу» участникам списка игр и
     помечает игру как обработанную. Кнопка использует существующий callback
-    cancel:<booking_id> (см. process_cancel) — отдельный обработчик не
-    нужен, отмена брони работает одинаково откуда угодно."""
+    cancel:<booking_id> (см. process_cancel_ask) — сначала подтверждение,
+    затем та же логика отмены, что и в «Мои записи».
+
+    include_refund_notice — для напоминания за 24 часа: предупреждаем, что
+    отмена менее чем за 12 часов до игры уже без возврата, и указываем
+    крайнее время (старт минус 12 часов)."""
     for game in games:
         participants = await db.get_participants_for_game(game["id"])
         game_dt = f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
@@ -1561,9 +1929,16 @@ async def _send_reminder_batch(bot: Bot, games: list, label: str, mark_sent) -> 
             f"📅 {game_dt}\n"
             f"📍 {game['location']}\n\n"
             "Если не сможешь прийти — нажми «Не смогу», место освободится "
-            "для других игроков.\n\n"
-            "До встречи на корте! 🎾"
+            "для других игроков."
         )
+        if include_refund_notice:
+            deadline = _refund_deadline_str(game)
+            text += (
+                "\n\n⚠️ Важно: при отмене менее чем за 12 часов до начала игры "
+                f"возврат средств невозможен. Крайний срок для отмены с возвратом — "
+                f"<b>{deadline}</b>."
+            )
+        text += "\n\nДо встречи на корте! 🎾"
 
         def _reminder_keyboard(booking_id: int) -> InlineKeyboardMarkup:
             # Клавиатура своя для каждого участника — у каждого свой
@@ -1594,7 +1969,10 @@ async def send_reminders(bot: Bot):
     """Запускается планировщиком (см. main()/app.py:run_bot) каждые 15
     минут: проверяет, кому пора напомнить за 24 и за 2 часа до игры."""
     games_24h = await db.get_games_needing_reminder_24h()
-    await _send_reminder_batch(bot, games_24h, "Через 24 часа", db.mark_reminder_24h_sent)
+    await _send_reminder_batch(
+        bot, games_24h, "Через 24 часа", db.mark_reminder_24h_sent,
+        include_refund_notice=True,
+    )
 
     games_2h = await db.get_games_needing_reminder_2h()
     await _send_reminder_batch(bot, games_2h, "Через 2 часа", db.mark_reminder_2h_sent)
@@ -1642,15 +2020,24 @@ async def main():
     # как было для 24ч-напоминания) — чтобы надёжно попадать в более узкое
     # окно 2-часового напоминания (1ч45м-2ч15м).
     loop = asyncio.get_running_loop()
-    scheduler = BackgroundScheduler()
+    # Часовой пояс планировщика — Москва (как и вся логика игр/возвратов).
+    scheduler = BackgroundScheduler(timezone="Europe/Moscow")
     scheduler.add_job(_make_reminder_job(bot, loop), "interval", minutes=15)
     scheduler.start()
 
     try:
         # Если задан WEBHOOK_URL - используем вебхуки, иначе long polling
         if WEBHOOK_URL:
+            if not WEBHOOK_SECRET_TOKEN:
+                raise RuntimeError(
+                    "WEBHOOK_URL задан, но нет WEBHOOK_SECRET_TOKEN / FLASK_SECRET_KEY "
+                    "для secret_token вебхука."
+                )
             logger.info(f"Запуск бота с вебхуком: {WEBHOOK_URL}{WEBHOOK_PATH}")
-            await bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+            await bot.set_webhook(
+                url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+                secret_token=WEBHOOK_SECRET_TOKEN,
+            )
             logger.info("Бот запущен с вебхуком...")
         else:
             logger.info("Запуск бота с long polling...")
