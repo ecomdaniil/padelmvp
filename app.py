@@ -200,6 +200,7 @@ ACTION_LABELS = {
     "mark_visited": "Отметка посещения",
     "cleanup": "Автоочистка данных",
     "refund": "Возврат оплаты",
+    "confirm_refund": "Оформление возврата",
 }
 ENTITY_LABELS = {
     "game": "Игра",
@@ -596,11 +597,18 @@ def games_list():
     date_to_raw = request.args.get("date_to", "")
     time_from_raw = request.args.get("time_from", "")
     time_to_raw = request.args.get("time_to", "")
+    sort_order = request.args.get("sort", "asc")
+    if sort_order not in ("asc", "desc"):
+        sort_order = "asc"
+    fullness = request.args.get("fullness", "")
+    if fullness not in ("full", "available"):
+        fullness = ""
 
     result = db.get_games_paginated(
         page=page, per_page=DEFAULT_PAGE_SIZE, level=level, city=city,
         date_from=_safe_date(date_from_raw), date_to=_safe_date(date_to_raw),
         time_from=_safe_time(time_from_raw), time_to=_safe_time(time_to_raw),
+        sort_order=sort_order, fullness=fullness,
     )
     cities = db.get_distinct_game_cities()
     return render_template(
@@ -609,6 +617,7 @@ def games_list():
         cities=cities, selected_city=city,
         date_from=date_from_raw, date_to=date_to_raw,
         time_from=time_from_raw, time_to=time_to_raw,
+        sort_order=sort_order, fullness=fullness,
     )
 
 
@@ -869,6 +878,38 @@ def payment_confirm(payment_id):
         send_telegram_message(context["telegram_id"], text)
 
     flash("Оплата подтверждена")
+    return redirect(url_for("payments_list"))
+
+
+@app.route("/payments/<int:payment_id>/confirm_refund", methods=["POST"])
+@login_required
+def payment_confirm_refund(payment_id):
+    """Финальное подтверждение возврата: бронь была отменена игроком более
+    чем за 24ч до игры (см. process_cancel в bot.py), платёж автоматически
+    получил статус 'возврат' — но реальный перевод денег администратор
+    делает вручную вне системы, и эта кнопка фиксирует, что перевод сделан."""
+    context = db.get_payment_notification_context(payment_id)
+    if not context:
+        flash("Платёж не найден")
+        return redirect(url_for("payments_list"))
+    if context["status"] != "возврат":
+        flash(f"Платёж в статусе «{context['status']}» — оформление возврата не требуется")
+        return redirect(url_for("payments_list"))
+
+    updated = db.confirm_refund(payment_id)
+    if not updated:
+        flash("Не удалось оформить возврат — статус платежа уже изменился")
+        return redirect(url_for("payments_list"))
+
+    description = (
+        f"Возврат оплаты для брони №{context['booking_id']} оформлен администратором "
+        f"(игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
+    )
+    log_admin_action(
+        "confirm_refund", "payment", payment_id, description=description,
+        old="возврат", new="возврат оформлен",
+    )
+    flash("Возврат оформлен")
     return redirect(url_for("payments_list"))
 
 

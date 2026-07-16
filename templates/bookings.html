@@ -30,7 +30,10 @@
         <tr>
             <td>{{ b.user_name }}</td>
             <td>{{ b.user_phone }}</td>
-            <td>{{ b.game_date.strftime('%d.%m.%Y') }} {{ b.game_time.strftime('%H:%M') }} — {{ b.location }}</td>
+            <td>
+                <span class="game-number-tag">№{{ b.game_id }}</span>
+                {{ b.game_date.strftime('%d.%m.%Y') }} {{ b.game_time.strftime('%H:%M') }} — {{ b.location }}
+            </td>
             <td>{{ b.slots_count or 1 }}</td>
             <td>
                 {% if b.status == 'новая' %}

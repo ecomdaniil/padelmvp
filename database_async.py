@@ -385,10 +385,17 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
     Возвращает dict:
         {"status": "not_found"} — брони не существует
         {"status": "forbidden"} — бронь принадлежит другому пользователю
-        {"status": "ok", "refund_eligible": bool,
+        {"status": "ok",
+         "refund_eligible": bool,   # возврат реально оформлен (>24ч И была подтверждённая оплата)
+         "refund_window": bool,     # >24ч до игры, НЕЗАВИСИМО от того, была ли оплата
+         "had_payment": bool,       # у брони есть хоть какой-то платёж (любого статуса)
          "game": dict | None, "payment": dict | None}
         payment — обновлённая (со статусом 'возврат') запись, если возврат
-        оформлен, иначе None.
+        оформлен, иначе None. refund_window/had_payment нужны боту, чтобы
+        показать игроку корректное сообщение и при отмене игры МЕНЕЕ чем за
+        24 часа («оплата не возвращается, так как до игры меньше суток») —
+        это сообщение имеет смысл показывать только если оплата вообще была
+        (had_payment), а не любому, кто просто отменил пустую бронь.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -408,35 +415,38 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                 """,
                 booking["game_id"],
             )
-            refund_eligible = bool(game and game["refund_window"])
+            refund_window = bool(game and game["refund_window"])
 
-            payment = None
-            if refund_eligible:
-                payment = await conn.fetchrow(
-                    """SELECT * FROM payments
-                       WHERE booking_id = $1 AND status = 'подтверждена'
-                       ORDER BY id DESC LIMIT 1 FOR UPDATE""",
-                    booking_id,
-                )
-                # Нечего возвращать, если оплата ещё не была подтверждена
-                # (или брони вообще не оплачивалась) — обычная отмена.
-                refund_eligible = payment is not None
+            confirmed_payment = await conn.fetchrow(
+                """SELECT * FROM payments
+                   WHERE booking_id = $1 AND status = 'подтверждена'
+                   ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                booking_id,
+            )
+            had_payment = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM payments WHERE booking_id = $1)", booking_id
+            )
+
+            refund_eligible = refund_window and confirmed_payment is not None
 
             await conn.execute(
                 "UPDATE bookings SET status = 'отменена' WHERE id = $1", booking_id
             )
 
+            payment_result = None
             if refund_eligible:
-                payment = await conn.fetchrow(
+                payment_result = await conn.fetchrow(
                     "UPDATE payments SET status = 'возврат' WHERE id = $1 RETURNING *",
-                    payment["id"],
+                    confirmed_payment["id"],
                 )
 
             return {
                 "status": "ok",
                 "refund_eligible": refund_eligible,
+                "refund_window": refund_window,
+                "had_payment": bool(had_payment),
                 "game": _to_dict(game),
-                "payment": _to_dict(payment) if payment else None,
+                "payment": _to_dict(payment_result) if payment_result else None,
             }
 
 

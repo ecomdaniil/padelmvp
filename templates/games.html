@@ -42,6 +42,21 @@
                 <label class="filter-label">Время по</label>
                 <input type="time" name="time_to" value="{{ time_to }}" style="width:100%;">
             </div>
+            <div style="min-width:170px;">
+                <label class="filter-label">Заполненность</label>
+                <select name="fullness" style="width:100%;">
+                    <option value="" {% if not fullness %}selected{% endif %}>Все игры</option>
+                    <option value="available" {% if fullness == 'available' %}selected{% endif %}>Есть свободные места</option>
+                    <option value="full" {% if fullness == 'full' %}selected{% endif %}>Только заполненные</option>
+                </select>
+            </div>
+            <div style="min-width:170px;">
+                <label class="filter-label">Сортировка по дате</label>
+                <select name="sort" style="width:100%;">
+                    <option value="asc" {% if sort_order != 'desc' %}selected{% endif %}>Сначала ближайшие</option>
+                    <option value="desc" {% if sort_order == 'desc' %}selected{% endif %}>Сначала дальние</option>
+                </select>
+            </div>
             <button type="submit" class="btn">Фильтровать</button>
             <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
         </form>

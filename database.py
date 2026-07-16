@@ -549,12 +549,17 @@ def get_all_games():
 def get_games_paginated(
     page: int = 1, per_page: int = 20, level: str = "",
     date_from=None, date_to=None, time_from=None, time_to=None, city: str = "",
+    sort_order: str = "asc", fullness: str = "",
 ):
     """Список игр с пагинацией + количество занятых мест/собранных оплат
     одним запросом (без N+1), с опциональными фильтрами по уровню, дате
     (диапазон date_from..date_to), времени суток (диапазон time_from..time_to,
-    например «найти вечерние слоты 18:00-20:00 в любой день») и городу.
-    Возвращает dict с items/total/total_pages."""
+    например «найти вечерние слоты 18:00-20:00 в любой день»), городу и
+    заполненности (fullness: "full" — только полностью занятые по реальным
+    бронированиям, "available" — только со свободными местами, "" — все).
+
+    sort_order — "asc" (по умолчанию: ближайшие даты сверху) или "desc"
+    (сначала самые дальние/прошедшие). Возвращает dict с items/total/total_pages."""
     page = max(1, page)
     offset = (page - 1) * per_page
 
@@ -578,6 +583,19 @@ def get_games_paginated(
     if city:
         where_clause += " AND g.city = %s"
         params.append(city)
+
+    # Заполненность считается по РЕАЛЬНЫМ бронированиям (та же логика, что
+    # прячет заполненные игры в боте, см. get_upcoming_games_with_slots в
+    # database_async.py) — не по ручному booked_places, который может не
+    # совпадать с фактическими заявками.
+    order_dir = "DESC" if sort_order == "desc" else "ASC"
+
+    if fullness == "full":
+        fullness_clause = " AND COALESCE(bk.taken, 0) >= g.total_slots"
+    elif fullness == "available":
+        fullness_clause = " AND COALESCE(bk.taken, 0) < g.total_slots"
+    else:
+        fullness_clause = ""
 
     conn = get_connection()
     cur = conn.cursor()
@@ -610,8 +628,8 @@ def get_games_paginated(
             WHERE p.status = 'подтверждена'
             GROUP BY b.game_id
         ) pm ON pm.game_id = g.id
-        {where_clause}
-        ORDER BY g.game_date DESC, g.game_time DESC
+        {where_clause}{fullness_clause}
+        ORDER BY g.game_date {order_dir}, g.game_time {order_dir}
         LIMIT %s OFFSET %s
         """,
         params + [per_page, offset],
@@ -619,7 +637,18 @@ def get_games_paginated(
     games = cur.fetchall()
     result = _paginated_from_window(
         cur, games, page, per_page,
-        f"SELECT COUNT(*) AS cnt FROM games g {where_clause}", params,
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM games g
+        LEFT JOIN (
+            SELECT game_id, SUM(slots_count) AS taken
+            FROM bookings
+            WHERE status != 'отменена'
+            GROUP BY game_id
+        ) bk ON bk.game_id = g.id
+        {where_clause}{fullness_clause}
+        """,
+        params,
     )
     cur.close()
     conn.close()
@@ -1287,7 +1316,7 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
 
     cur.execute(
         f"""
-        SELECT p.*, u.name AS user_name, g.game_date, g.game_time, g.location,
+        SELECT p.*, u.name AS user_name, b.game_id, g.game_date, g.game_time, g.location,
                COUNT(*) OVER() AS total_count
         FROM payments p
         JOIN bookings b ON b.id = p.booking_id
@@ -1325,6 +1354,26 @@ def confirm_payment(payment_id: int):
     conn.commit()
     cur.close()
     conn.close()
+
+
+def confirm_refund(payment_id: int):
+    """Финальный шаг возврата: админ вручную подтверждает, что деньги
+    реально отправлены игроку (перевод/наличные и т.п. — сам процесс
+    возврата вне системы, здесь только фиксация факта). Условие
+    `status = 'возврат'` в WHERE — защита от повторного/гонки нажатия:
+    если платёж уже не в статусе 'возврат' (например, админ уже кликнул
+    в соседней вкладке), UPDATE не найдёт строку и вернёт None."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE payments SET status = 'возврат оформлен' WHERE id = %s AND status = 'возврат' RETURNING *",
+        (payment_id,),
+    )
+    updated = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return updated
 
 
 def get_payment_notification_context(payment_id: int):

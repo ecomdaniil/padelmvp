@@ -16,6 +16,7 @@
                     <option value="ожидает" {% if request.args.get('status') == 'ожидает' %}selected{% endif %}>ожидает</option>
                     <option value="подтверждена" {% if request.args.get('status') == 'подтверждена' %}selected{% endif %}>подтверждена</option>
                     <option value="возврат" {% if request.args.get('status') == 'возврат' %}selected{% endif %}>возврат</option>
+                    <option value="возврат оформлен" {% if request.args.get('status') == 'возврат оформлен' %}selected{% endif %}>возврат оформлен</option>
                 </select>
             </div>
             <button type="submit" class="btn">Фильтровать</button>
@@ -29,7 +30,10 @@
         {% for p in payments %}
         <tr>
             <td>{{ p.user_name }}</td>
-            <td>{{ p.game_date.strftime('%d.%m.%Y') }} {{ p.game_time.strftime('%H:%M') }} — {{ p.location }}</td>
+            <td>
+                <span class="game-number-tag">№{{ p.game_id }}</span>
+                {{ p.game_date.strftime('%d.%m.%Y') }} {{ p.game_time.strftime('%H:%M') }} — {{ p.location }}
+            </td>
             <td>{{ p.amount }} ₽</td>
             <td>
                 {% if p.method == 'card' %}
@@ -45,6 +49,8 @@
                     <span class="badge badge-confirmed">подтверждена</span>
                 {% elif p.status == 'возврат' %}
                     <span class="badge badge-cancelled">возврат</span>
+                {% elif p.status == 'возврат оформлен' %}
+                    <span class="badge" style="background:#eef2f7; color:#475569;">возврат оформлен</span>
                 {% else %}
                     <span class="badge badge-new">ожидает</span>
                 {% endif %}
@@ -56,6 +62,12 @@
                     <button class="btn" type="submit">✓ Подтвердить</button>
                 </form>
                 {% elif p.status == 'возврат' %}
+                <form method="post" action="{{ url_for('payment_confirm_refund', payment_id=p.id) }}"
+                      onsubmit="return confirm('Подтвердить, что возврат {{ p.amount }} ₽ игроку {{ p.user_name }} выполнен?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="btn btn-danger" type="submit">✓ Подтвердить</button>
+                </form>
+                {% elif p.status == 'возврат оформлен' %}
                 <span style="color: #991b1b; font-size: 13px;">Возврат оформлен</span>
                 {% else %}
                 <span style="color: #6b7280; font-size: 13px;">Оплачено</span>
