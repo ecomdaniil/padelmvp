@@ -65,6 +65,18 @@
             margin: 26px 0 12px;
         }
 
+        .stats-grid .stat-card .value {
+            color: #1362e1;
+        }
+        @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+            .stats-grid .stat-card .value {
+                background: linear-gradient(135deg, #0b3d87 0%, #1362e1 42%, #4f8cff 100%);
+                -webkit-background-clip: text;
+                background-clip: text;
+                color: transparent;
+            }
+        }
+
         .quick-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
@@ -85,9 +97,18 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 22px;
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-2) 100%);
-            box-shadow: 0 8px 18px rgba(37,99,235,0.28);
+            background: var(--nav);
+            box-shadow: 0 8px 18px rgba(7,24,47,0.22);
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+        .quick-icon svg {
+            width: 22px;
+            height: 22px;
+            stroke: #fff;
+            fill: none;
+            stroke-width: 1.7;
+            stroke-linecap: round;
+            stroke-linejoin: round;
         }
         .quick-body { flex: 1; min-width: 0; }
         .quick-title {
@@ -163,7 +184,9 @@
     <div class="section-title">Разделы CRM</div>
     <div class="quick-grid">
         <a href="{{ url_for('games_list') }}" class="card quick-card">
-            <div class="quick-icon">🎾</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3c-2.5 2.2-4 5.4-4 9s1.5 6.8 4 9c2.5-2.2 4-5.4 4-9s-1.5-6.8-4-9z"/><path d="M3.5 9.5h17M3.5 14.5h17"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">Игры</div>
                 <div class="quick-desc">Создание, редактирование и статус игр по датам и уровням</div>
@@ -171,7 +194,9 @@
             <div class="quick-arrow">→</div>
         </a>
         <a href="{{ url_for('bookings_list') }}" class="card quick-card">
-            <div class="quick-icon">📋</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M9 3.5h6v2.5H9z"/><path d="M9 11h6M9 15h4"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">
                     Заявки
@@ -182,7 +207,9 @@
             <div class="quick-arrow">→</div>
         </a>
         <a href="{{ url_for('payments_list') }}" class="card quick-card">
-            <div class="quick-icon">💳</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><rect x="2.5" y="5.5" width="19" height="13" rx="2.5"/><path d="M2.5 10h19M7 15h3"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">
                     Оплаты
@@ -193,7 +220,9 @@
             <div class="quick-arrow">→</div>
         </a>
         <a href="{{ url_for('visits_list') }}" class="card quick-card">
-            <div class="quick-icon">✅</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16.5 9"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">Посещения</div>
                 <div class="quick-desc">Отметка фактического прихода игроков на корт</div>
@@ -201,7 +230,9 @@
             <div class="quick-arrow">→</div>
         </a>
         <a href="{{ url_for('reviews_list') }}" class="card quick-card">
-            <div class="quick-icon">⭐</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.3 5.9.9-4.25 4.1 1 5.8L12 16.8 6.75 19.6l1-5.8L3.5 9.7l5.9-.9z"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">
                     Отзывы
@@ -212,7 +243,9 @@
             <div class="quick-arrow">→</div>
         </a>
         <a href="{{ url_for('clubs_list') }}" class="card quick-card">
-            <div class="quick-icon">🏟️</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 20V8l8-4 8 4v12"/><path d="M9 20v-6h6v6M9 10h.01M15 10h.01M12 10h.01"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">Клубы</div>
                 <div class="quick-desc">Карточки клубов, адреса и контакты</div>
@@ -220,7 +253,9 @@
             <div class="quick-arrow">→</div>
         </a>
         <a href="{{ url_for('logs_list') }}" class="card quick-card">
-            <div class="quick-icon">🗒️</div>
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M7 3.5h8.5L19.5 7v13.5H7z"/><path d="M15.5 3.5V7h3.5M10 11h6M10 15h4"/></svg>
+            </div>
             <div class="quick-body">
                 <div class="quick-title">Журнал действий</div>
                 <div class="quick-desc">История всех изменений, сделанных администраторами</div>

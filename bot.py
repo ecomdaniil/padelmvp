@@ -256,13 +256,13 @@ def _format_profile(user: dict) -> str:
     return (
         f"👤 <b>Ваш профиль</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📛 Имя: {user['name']}\n"
-        f"🎂 Возраст: {user.get('age') or '—'}\n"
-        f"🏙 Город: {user.get('city') or '—'}\n"
-        f"🎾 Опыт: {user['level']}\n"
-        f"🎒 Свой инвентарь: {inventory}\n"
-        f"📖 Нужны правила: {rules}\n"
-        f"📞 Телефон: {user['phone']}\n"
+        f"Имя: {user['name']}\n"
+        f"Возраст: {user.get('age') or '—'}\n"
+        f"Город: {user.get('city') or '—'}\n"
+        f"Опыт: {user['level']}\n"
+        f"Свой инвентарь: {inventory}\n"
+        f"Нужны правила: {rules}\n"
+        f"Телефон: {user['phone']}\n"
     )
 
 
@@ -283,8 +283,7 @@ async def show_main_menu(message: Message, user: dict):
     await message.answer(
         f"🏠 <b>Главное меню</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👋 Привет, <b>{user['name']}</b>!\n\n"
-        "📌 Выберите раздел ниже для быстрого доступа:\n"
+        "Выберите раздел ниже для быстрого доступа:\n"
         "• 🎾 Игры — посмотреть и записаться\n"
         "• 📋 Мои записи — посмотреть статус заявок\n"
         "• 📊 Моя статистика — оценить активность\n"
@@ -352,13 +351,13 @@ async def _save_profile(message: Message, state: FSMContext):
     await message.answer(
         f"{title}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📛 Имя: {data['name']}\n"
-        f"🎂 Возраст: {data.get('age')}\n"
-        f"🏙 Город: {data.get('city')}\n"
-        f"🎾 Опыт: {data['level']}\n"
-        f"🎒 Инвентарь: {inventory_text}\n"
-        f"📖 Правила объяснены: {rules_text}\n"
-        f"📞 Телефон: {data['phone']}\n\n"
+        f"Имя: {data['name']}\n"
+        f"Возраст: {data.get('age')}\n"
+        f"Город: {data.get('city')}\n"
+        f"Опыт: {data['level']}\n"
+        f"Инвентарь: {inventory_text}\n"
+        f"Правила объяснены: {rules_text}\n"
+        f"Телефон: {data['phone']}\n\n"
         "✅ Теперь ты можешь открыть раздел «🎾 Игры» и записаться на ближайший корт.",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -398,7 +397,31 @@ async def edit_profile(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "show_games")
 async def show_games_from_profile(callback: CallbackQuery):
     await callback.answer()
-    await cmd_games(callback.message)
+    # callback.message.from_user — это бот (сообщение от бота), а не игрок.
+    # Профиль проверяем по callback.from_user.id.
+    await _ask_game_format(callback.message, telegram_id=callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("games_format:"))
+async def process_games_format(callback: CallbackQuery):
+    """Игрок выбрал Сингл (2) или Классику (4) — показываем только игры
+    с соответствующим total_slots, ближайшие сверху."""
+    try:
+        total_slots = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный выбор формата.", show_alert=True)
+        return
+    if total_slots not in (2, 4):
+        await callback.answer("Некорректный выбор формата.", show_alert=True)
+        return
+
+    await callback.answer()
+    # См. show_games_from_profile: id игрока берём из callback, не из message.
+    await _show_games(
+        callback.message,
+        total_slots=total_slots,
+        telegram_id=callback.from_user.id,
+    )
 
 
 @router.message(StateFilter(RegistrationForm.waiting_for_name))
@@ -631,10 +654,20 @@ async def _send_answer(message: Message, text: str, keyboard: Optional[InlineKey
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-async def _show_games(message: Message):
-    """Показывает список ближайших игр."""
-    t_start = time.monotonic()
-    user = await _require_registered(message.from_user.id)
+def _game_format_keyboard() -> InlineKeyboardMarkup:
+    """Выбор формата игры перед показом списка: Сингл (2) / Классика (4)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сингл (2 игрока)", callback_data="games_format:2")],
+        [InlineKeyboardButton(text="Классика (4 игрока)", callback_data="games_format:4")],
+    ])
+
+
+async def _ask_game_format(message: Message, telegram_id: Optional[int] = None) -> None:
+    """Первый шаг раздела «Игры»: спрашиваем формат, а не сразу шлём список.
+
+    telegram_id — id игрока в Telegram. Нужен явно при вызове из callback:
+    у callback.message.from_user стоит бот, а не человек, нажавший кнопку."""
+    user = await _require_registered(telegram_id or message.from_user.id)
     if not user:
         await message.answer(
             "❌ Сначала заполни анкету.\n"
@@ -643,34 +676,68 @@ async def _show_games(message: Message):
         )
         return
 
-    games = await _get_upcoming_games_cached()
+    await message.answer(
+        "🎾 <b>Какую игру вы ищете?</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Выбери формат:",
+        reply_markup=_game_format_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+async def _show_games(
+    message: Message,
+    total_slots: int,
+    telegram_id: Optional[int] = None,
+):
+    """Показывает ближайшие игры выбранного формата (total_slots = 2 или 4),
+    отсортированные от ближайшей к дальнейшей. Список уже упорядочен в БД
+    (ORDER BY game_date, game_time); карточки отправляем по одной, чтобы
+    Telegram не перемешал порядок при конкурентной отправке.
+
+    telegram_id — см. _ask_game_format: при вызове из callback нельзя
+    брать message.from_user.id (там id бота)."""
+    t_start = time.monotonic()
+    user = await _require_registered(telegram_id or message.from_user.id)
+    if not user:
+        await message.answer(
+            "❌ Сначала заполни анкету.\n"
+            "Отправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    format_label = "Сингл (2 игрока)" if total_slots == 2 else "Классика (4 игрока)"
+    games = [
+        g for g in await _get_upcoming_games_cached()
+        if int(g.get("total_slots") or 0) == total_slots
+    ]
     if not games:
         await message.answer(
-            "😔 Пока нет доступных игр.\n\n"
+            f"😔 Пока нет доступных игр формата «{format_label}».\n\n"
             "Загляни позже — мы добавляем новые игры регулярно!",
             reply_markup=main_menu_keyboard(),
         )
         return
 
     await message.answer(
-        "🎾 <b>Ближайшие игры</b>\n"
+        f"🎾 <b>Ближайшие игры — {format_label}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Выбери игру и нажми «Записаться»:",
         parse_mode="HTML",
     )
 
-    # Раньше карточки игр отправлялись последовательно (await в цикле), то
-    # есть каждая дополнительная игра добавляла ещё один сетевой round-trip
-    # до Telegram (~100-400 мс) к общему времени ответа. Отправляем все
-    # карточки конкурентно — суммарное время ≈ время одного round-trip,
-    # а не N.
-    sends = [_send_answer(message, *_game_card(game)) for game in games]
-    results = await asyncio.gather(*sends, return_exceptions=True)
-    for game, result in zip(games, results):
-        if isinstance(result, Exception):
-            logger.error("Не удалось отправить карточку игры #%s: %s", game.get("id"), result)
+    for game in games:
+        text, keyboard = _game_card(game)
+        try:
+            await _send_answer(message, text, keyboard)
+        except Exception as e:
+            logger.error("Не удалось отправить карточку игры #%s: %s", game.get("id"), e)
 
-    logger.debug("_show_games: всего %.3f с, %d игр", time.monotonic() - t_start, len(games))
+    logger.debug(
+        "_show_games: всего %.3f с, %d игр (формат %s)",
+        time.monotonic() - t_start, len(games), total_slots,
+    )
 
 
 async def _show_my_bookings(message: Message):
@@ -760,7 +827,7 @@ async def menu_main(message: Message, state: FSMContext):
 
 @router.message(F.text == BTN_GAMES)
 async def menu_games(message: Message):
-    await _show_games(message)
+    await _ask_game_format(message)
 
 
 @router.message(F.text == BTN_MY_BOOKINGS)
@@ -1021,7 +1088,7 @@ async def _notify_admin_new_booking(
 
 @router.message(Command("games"))
 async def cmd_games(message: Message):
-    await _show_games(message)
+    await _ask_game_format(message)
 
 
 def _slots_choice_keyboard(game_id: int, max_slots: int) -> InlineKeyboardMarkup:
