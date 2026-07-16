@@ -27,3 +27,4 @@ __pycache__/
 /tmp/
 *.xlsx
 .secrets_rotated.local
+.env
