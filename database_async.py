@@ -365,12 +365,30 @@ async def get_booking_by_id(booking_id: int) -> Optional[dict]:
     return _to_dict(row)
 
 
-async def cancel_booking_owned(booking_id: int, user_id: int) -> str:
+async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
     """Отменяет заявку только если она принадлежит указанному пользователю.
     Защита от IDOR: раньше отмена работала по одному booking_id без проверки
     владельца, что позволяло отменить чужую запись, зная/подобрав id.
 
-    Возвращает "ok", "not_found" или "forbidden".
+    Дополнительно решает, положен ли возврат оплаты: если до начала игры
+    оставалось больше 24 часов И по брони есть подтверждённый платёж, этот
+    платёж помечается статусом 'возврат' (новая запись не создаётся —
+    история и так видна по created_at/updated-статусу одной записи).
+    ">24 часа" считается в SQL через (game_date + game_time) - NOW(), тем же
+    способом, что и окна напоминаний (см. get_games_needing_reminder_24h) —
+    чтобы не разойтись с остальной логикой из-за разных представлений о
+    часовом поясе между Python-процессом бота и БД.
+
+    Всё выполняется в одной транзакции с FOR UPDATE (бронь и платёж), чтобы
+    избежать гонки с параллельным подтверждением оплаты в CRM.
+
+    Возвращает dict:
+        {"status": "not_found"} — брони не существует
+        {"status": "forbidden"} — бронь принадлежит другому пользователю
+        {"status": "ok", "refund_eligible": bool,
+         "game": dict | None, "payment": dict | None}
+        payment — обновлённая (со статусом 'возврат') запись, если возврат
+        оформлен, иначе None.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -379,13 +397,68 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> str:
                 "SELECT * FROM bookings WHERE id = $1 FOR UPDATE", booking_id
             )
             if booking is None:
-                return "not_found"
+                return {"status": "not_found"}
             if booking["user_id"] != user_id:
-                return "forbidden"
+                return {"status": "forbidden"}
+
+            game = await conn.fetchrow(
+                """
+                SELECT *, (game_date + game_time) - NOW() > INTERVAL '24 hours' AS refund_window
+                FROM games WHERE id = $1
+                """,
+                booking["game_id"],
+            )
+            refund_eligible = bool(game and game["refund_window"])
+
+            payment = None
+            if refund_eligible:
+                payment = await conn.fetchrow(
+                    """SELECT * FROM payments
+                       WHERE booking_id = $1 AND status = 'подтверждена'
+                       ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                    booking_id,
+                )
+                # Нечего возвращать, если оплата ещё не была подтверждена
+                # (или брони вообще не оплачивалась) — обычная отмена.
+                refund_eligible = payment is not None
+
             await conn.execute(
                 "UPDATE bookings SET status = 'отменена' WHERE id = $1", booking_id
             )
-            return "ok"
+
+            if refund_eligible:
+                payment = await conn.fetchrow(
+                    "UPDATE payments SET status = 'возврат' WHERE id = $1 RETURNING *",
+                    payment["id"],
+                )
+
+            return {
+                "status": "ok",
+                "refund_eligible": refund_eligible,
+                "game": _to_dict(game),
+                "payment": _to_dict(payment) if payment else None,
+            }
+
+
+async def log_action(
+    action: str,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[int] = None,
+    description: Optional[str] = None,
+    old_value: Optional[str] = None,
+    new_value: Optional[str] = None,
+    details: Optional[str] = None,
+) -> None:
+    """Асинхронный аналог database.log_action (используется CRM) — нужен,
+    чтобы бот тоже мог писать в общий журнал admin_logs (например, при
+    отмене брони пользователем с возвратом оплаты), не блокируя event loop
+    синхронным psycopg2-вызовом."""
+    pool = await get_pool()
+    await pool.execute(
+        """INSERT INTO admin_logs (action, entity_type, entity_id, description, old_value, new_value, details)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+        action, entity_type, entity_id, description, old_value, new_value, details,
+    )
 
 
 async def get_participants_for_game(game_id: int) -> list:

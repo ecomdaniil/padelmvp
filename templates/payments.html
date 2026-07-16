@@ -15,6 +15,7 @@
                     <option value="">Все статусы</option>
                     <option value="ожидает" {% if request.args.get('status') == 'ожидает' %}selected{% endif %}>ожидает</option>
                     <option value="подтверждена" {% if request.args.get('status') == 'подтверждена' %}selected{% endif %}>подтверждена</option>
+                    <option value="возврат" {% if request.args.get('status') == 'возврат' %}selected{% endif %}>возврат</option>
                 </select>
             </div>
             <button type="submit" class="btn">Фильтровать</button>
@@ -42,16 +43,20 @@
             <td>
                 {% if p.status == 'подтверждена' %}
                     <span class="badge badge-confirmed">подтверждена</span>
+                {% elif p.status == 'возврат' %}
+                    <span class="badge badge-cancelled">возврат</span>
                 {% else %}
                     <span class="badge badge-new">ожидает</span>
                 {% endif %}
             </td>
             <td>
-                {% if p.status != 'подтверждена' %}
+                {% if p.status == 'ожидает' %}
                 <form method="post" action="{{ url_for('payment_confirm', payment_id=p.id) }}">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button class="btn" type="submit">✓ Подтвердить</button>
                 </form>
+                {% elif p.status == 'возврат' %}
+                <span style="color: #991b1b; font-size: 13px;">Возврат оформлен</span>
                 {% else %}
                 <span style="color: #6b7280; font-size: 13px;">Оплачено</span>
                 {% endif %}

@@ -199,6 +199,7 @@ ACTION_LABELS = {
     "confirm": "Подтверждение оплаты",
     "mark_visited": "Отметка посещения",
     "cleanup": "Автоочистка данных",
+    "refund": "Возврат оплаты",
 }
 ENTITY_LABELS = {
     "game": "Игра",
@@ -835,6 +836,16 @@ def payment_confirm(payment_id):
     # что-то пойдёт не так с отправкой сообщения, это не должно повлиять
     # на сам факт подтверждения оплаты в базе.
     context = db.get_payment_notification_context(payment_id)
+    if not context:
+        flash("Платёж не найден")
+        return redirect(url_for("payments_list"))
+    if context["status"] != "ожидает":
+        # Платёж уже подтверждён или по нему оформлен возврат (например,
+        # игрок отменил бронь более чем за 24ч до игры) — повторное
+        # подтверждение не имеет смысла и могло бы затереть статус «возврат».
+        flash(f"Платёж уже в статусе «{context['status']}» — подтверждение не требуется")
+        return redirect(url_for("payments_list"))
+
     db.confirm_payment(payment_id)
     if context:
         description = (

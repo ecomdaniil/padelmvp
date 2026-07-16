@@ -1324,6 +1324,59 @@ async def cmd_my_bookings(message: Message):
     await _show_my_bookings(message)
 
 
+async def _notify_refund(callback: CallbackQuery, user: dict, booking_id: int, game: Optional[dict], payment: dict) -> None:
+    """Уведомляет игрока и админа о возврате оплаты (>24ч до игры, была
+    подтверждённая оплата) и пишет об этом в общий журнал admin_logs —
+    вызывается после успешной отмены брони, поэтому ошибки здесь не должны
+    влиять на уже случившуюся отмену, только логируются."""
+    await callback.message.answer(
+        "Ваша запись отменена. Оплата будет возвращена на ваш счёт в ближайшее время."
+    )
+
+    game_dt = (
+        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+        if game else "—"
+    )
+    location = game["location"] if game else "—"
+    amount = float(payment["amount"])
+    username = callback.from_user.username
+    username_part = f" (@{username})" if username else ""
+
+    if ADMIN_CHAT_ID:
+        try:
+            await callback.bot.send_message(
+                ADMIN_CHAT_ID,
+                "❌ <b>Отмена записи с возвратом оплаты</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Пользователь {user['name']}{username_part} отменил запись "
+                f"на корт (бронь №{booking_id}) более чем за 24 часа до начала\n\n"
+                f"📅 {game_dt}\n"
+                f"📍 {location}\n"
+                f"💰 К возврату: {amount:.0f} ₽\n\n"
+                "Статус оплаты изменён на «возврат» — оформите возврат средств игроку.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить админа об отмене брони №%s: %s", booking_id, e)
+
+    description = (
+        f"Возврат оплаты {amount:.0f} ₽ по брони №{booking_id}: пользователь "
+        f"{user['name']}{username_part} отменил запись на игру {game_dt} "
+        "более чем за 24 часа до начала"
+    )
+    try:
+        await db.log_action(
+            action="refund",
+            entity_type="payment",
+            entity_id=payment["id"],
+            description=description,
+            old_value="подтверждена",
+            new_value="возврат",
+        )
+    except Exception as e:
+        logger.error("Не удалось записать возврат оплаты #%s в журнал: %s", payment["id"], e)
+
+
 @router.callback_query(F.data.startswith("cancel:"))
 async def process_cancel(callback: CallbackQuery):
     user = await _require_registered(callback.from_user.id)
@@ -1334,19 +1387,23 @@ async def process_cancel(callback: CallbackQuery):
     booking_id = int(callback.data.split(":")[1])
 
     # Отмена проверяет владельца записи внутри транзакции — раньше можно было
-    # отменить чужую запись, зная её booking_id (IDOR).
+    # отменить чужую запись, зная её booking_id (IDOR). Дополнительно решает,
+    # положен ли возврат оплаты (>24ч до игры + была подтверждённая оплата).
     result = await db.cancel_booking_owned(booking_id, user["id"])
 
-    if result == "not_found":
+    if result["status"] == "not_found":
         await callback.answer("Запись не найдена.", show_alert=True)
         return
-    if result == "forbidden":
+    if result["status"] == "forbidden":
         await callback.answer("Это не твоя запись.", show_alert=True)
         return
 
     _invalidate_games_cache()
     await callback.answer("Запись отменена.")
     await callback.message.edit_text(callback.message.text + "\n\n❌ ОТМЕНЕНО")
+
+    if result.get("refund_eligible") and result.get("payment"):
+        await _notify_refund(callback, user, booking_id, result.get("game"), result["payment"])
 
 
 @router.message(Command("cancel"))
