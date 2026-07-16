@@ -52,6 +52,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 load_dotenv()
 
+# Render (и похожие PaaS) задают RENDER / RENDER_EXTERNAL_URL. На ноутбуке
+# бот засыпает вместе с крышкой — в облаке он должен работать сам: фоновый
+# поток + webhook на публичный HTTPS URL сервиса.
+_IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
+if _IS_RENDER:
+    os.environ.setdefault("RUN_BOT_IN_BACKGROUND", "1")
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "1")
+    if not (os.getenv("WEBHOOK_URL") or "").strip():
+        _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+        if _external:
+            os.environ["WEBHOOK_URL"] = _external
+
 # По умолчанию в логах остаются только ошибки — уровень можно поднять через
 # .env (LOG_LEVEL=INFO/DEBUG), например для отладки на staging.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()
