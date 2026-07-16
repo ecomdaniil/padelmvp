@@ -1,6 +1,138 @@
 {% extends "base.html" %}
 {% block content %}
-    <h1>📊 Главная панель CRM</h1>
+    <style>
+        .hero {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+            background: var(--nav);
+            border-radius: 24px;
+            padding: 28px 32px;
+            margin-bottom: 22px;
+            color: #fff;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 20px 44px rgba(7,24,47,0.28);
+        }
+        .hero::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 88% 12%, rgba(255,255,255,0.22), transparent 42%),
+                        radial-gradient(circle at 6% 92%, rgba(255,255,255,0.12), transparent 38%);
+            pointer-events: none;
+        }
+        .hero-text { position: relative; z-index: 1; }
+        .hero-date {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: rgba(255,255,255,0.72);
+            margin-bottom: 6px;
+        }
+        .hero-greeting {
+            font-size: 26px;
+            font-weight: 800;
+            margin: 0 0 6px;
+            color: #fff;
+        }
+        .hero-sub {
+            font-size: 14px;
+            color: rgba(255,255,255,0.82);
+            margin: 0;
+        }
+        .hero-actions { position: relative; z-index: 1; display: flex; gap: 10px; flex-wrap: wrap; }
+        .hero-actions .btn {
+            background: rgba(255,255,255,0.16);
+            border: 1px solid rgba(255,255,255,0.32);
+            box-shadow: none;
+            backdrop-filter: blur(6px);
+        }
+        .hero-actions .btn:hover { background: rgba(255,255,255,0.26); }
+        @media (max-width: 640px) {
+            .hero { padding: 22px; }
+            .hero-greeting { font-size: 21px; }
+        }
+
+        .section-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin: 26px 0 12px;
+        }
+
+        .quick-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 16px;
+        }
+        .quick-card {
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            text-decoration: none;
+            color: inherit;
+        }
+        .quick-icon {
+            flex-shrink: 0;
+            width: 46px;
+            height: 46px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-2) 100%);
+            box-shadow: 0 8px 18px rgba(37,99,235,0.28);
+        }
+        .quick-body { flex: 1; min-width: 0; }
+        .quick-title {
+            font-weight: 700;
+            font-size: 15px;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .quick-desc {
+            font-size: 13px;
+            color: var(--muted);
+            margin-top: 3px;
+            line-height: 1.4;
+        }
+        .quick-arrow {
+            align-self: center;
+            color: var(--muted);
+            font-size: 18px;
+            transition: transform 0.15s ease;
+        }
+        .quick-card:hover .quick-arrow { transform: translateX(3px); color: var(--primary); }
+        .quick-badge {
+            background: #ef4444;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 1px 7px;
+            border-radius: 999px;
+        }
+    </style>
+
+    <div class="hero">
+        <div class="hero-text">
+            <div class="hero-date">{{ date_str }}</div>
+            <h1 class="hero-greeting">{{ greeting }}, Начальник!</h1>
+            <p class="hero-sub">Вот что происходит в клубе прямо сейчас.</p>
+        </div>
+        <div class="hero-actions">
+            <a href="{{ url_for('game_new') }}" class="btn">+ Новая игра</a>
+            <a href="{{ url_for('bookings_list') }}" class="btn">Заявки</a>
+        </div>
+    </div>
+
     <div class="stats-grid">
         <div class="stat-card">
             <div class="label">Ближайшие игры</div>
@@ -27,13 +159,73 @@
             <div class="value">{{ summary.logs }}</div>
         </div>
     </div>
-    <div class="card">
-        <h2 style="margin-top: 0; color: #1d4ed8;">🚀 Что доступно в CRM</h2>
-        <ul>
-            <li>Управление играми, заявками и оплатами</li>
-            <li>Отметка посещений и просмотр отзывов</li>
-            <li>Управление клубами и настройками карточки клуба</li>
-            <li>Экспорт отчёта по играм в Excel</li>
-        </ul>
+
+    <div class="section-title">Разделы CRM</div>
+    <div class="quick-grid">
+        <a href="{{ url_for('games_list') }}" class="card quick-card">
+            <div class="quick-icon">🎾</div>
+            <div class="quick-body">
+                <div class="quick-title">Игры</div>
+                <div class="quick-desc">Создание, редактирование и статус игр по датам и уровням</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
+        <a href="{{ url_for('bookings_list') }}" class="card quick-card">
+            <div class="quick-icon">📋</div>
+            <div class="quick-body">
+                <div class="quick-title">
+                    Заявки
+                    {% if nav_badges and nav_badges.bookings %}<span class="quick-badge">+{{ nav_badges.bookings }}</span>{% endif %}
+                </div>
+                <div class="quick-desc">Все брони игроков и их текущий статус</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
+        <a href="{{ url_for('payments_list') }}" class="card quick-card">
+            <div class="quick-icon">💳</div>
+            <div class="quick-body">
+                <div class="quick-title">
+                    Оплаты
+                    {% if nav_badges and nav_badges.payments %}<span class="quick-badge">+{{ nav_badges.payments }}</span>{% endif %}
+                </div>
+                <div class="quick-desc">Подтверждение оплат и оформление возвратов</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
+        <a href="{{ url_for('visits_list') }}" class="card quick-card">
+            <div class="quick-icon">✅</div>
+            <div class="quick-body">
+                <div class="quick-title">Посещения</div>
+                <div class="quick-desc">Отметка фактического прихода игроков на корт</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
+        <a href="{{ url_for('reviews_list') }}" class="card quick-card">
+            <div class="quick-icon">⭐</div>
+            <div class="quick-body">
+                <div class="quick-title">
+                    Отзывы
+                    {% if nav_badges and nav_badges.reviews %}<span class="quick-badge">+{{ nav_badges.reviews }}</span>{% endif %}
+                </div>
+                <div class="quick-desc">Отзывы игроков после игр</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
+        <a href="{{ url_for('clubs_list') }}" class="card quick-card">
+            <div class="quick-icon">🏟️</div>
+            <div class="quick-body">
+                <div class="quick-title">Клубы</div>
+                <div class="quick-desc">Карточки клубов, адреса и контакты</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
+        <a href="{{ url_for('logs_list') }}" class="card quick-card">
+            <div class="quick-icon">🗒️</div>
+            <div class="quick-body">
+                <div class="quick-title">Журнал действий</div>
+                <div class="quick-desc">История всех изменений, сделанных администраторами</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
     </div>
 {% endblock %}

@@ -169,6 +169,31 @@ def local_dt_filter(value, fmt="%d.%m.%Y %H:%M"):
     local = _to_local_dt(value)
     return local.strftime(fmt) if local else "—"
 
+
+_RU_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+_RU_MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def _dashboard_greeting() -> dict:
+    """Приветствие и дата для шапки главной страницы CRM — время дня и
+    дата берутся в локальной таймзоне администратора (APP_TIMEZONE), а не
+    в UTC сервера, иначе "Добрый вечер" мог бы показываться утром."""
+    now = datetime.now(APP_TIMEZONE)
+    hour = now.hour
+    if 5 <= hour < 12:
+        greeting = "Доброе утро"
+    elif 12 <= hour < 18:
+        greeting = "Добрый день"
+    elif 18 <= hour < 23:
+        greeting = "Добрый вечер"
+    else:
+        greeting = "Доброй ночи"
+    date_str = f"{now.day} {_RU_MONTHS[now.month - 1]}, {_RU_WEEKDAYS[now.weekday()]}"
+    return {"greeting": greeting, "date_str": date_str}
+
 # Тот же набор уровней, что и в боте (см. bot.py: VALID_LEVELS) — продублирован
 # здесь, чтобы не тянуть в CRM тяжёлые импорты aiogram/бота только за одной
 # константой. Если список уровней поменяется — обновите его в обоих местах.
@@ -447,7 +472,7 @@ def index():
     # (см. db.get_dashboard_summary) — на управляемом Postgres каждый лишний
     # round-trip добавлял заметную задержку к открытию главной страницы.
     summary = db.get_dashboard_summary()
-    return render_template("dashboard.html", summary=summary)
+    return render_template("dashboard.html", summary=summary, **_dashboard_greeting())
 
 
 @app.route("/health")
