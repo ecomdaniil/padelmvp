@@ -73,20 +73,26 @@
         </div>
 
         <div class="form-row">
-            <label for="booked_places">Занято мест (вручную)</label>
+            <label for="booked_places">Занято вручную, доп. мест</label>
             <input type="number" id="booked_places" name="booked_places"
-                   min="0" max="{{ values.total_slots or 100 }}" step="1"
-                   value="{{ values.booked_places }}">
+                   min="0"
+                   max="{{ (values.total_slots|int - actual_taken) if (values.total_slots and actual_taken is defined) else (values.total_slots or 100) }}"
+                   step="1"
+                   value="{{ values.booked_places }}"
+                   data-actual-taken="{{ actual_taken if actual_taken is defined else 0 }}">
             {% if actual_taken is defined %}
             <small class="field-hint">
-                По реальным бронированиям сейчас занято: {{ actual_taken }}
+                Через бота уже забронировано: {{ actual_taken }}
                 {% if game %}из {{ game.total_slots }}{% endif %}.
-                Это поле — независимая ручная корректировка (например, для игроков,
-                записанных не через бота); список бронирований она не меняет.
+                Это поле — ДОПОЛНИТЕЛЬНЫЕ места, занятые мимо бота (например, по телефону
+                или на месте), они складываются с реальными бронированиями. Например, при
+                1 брони через бота и total_slots=2 — поставьте здесь 1, чтобы игра считалась
+                полностью занятой (1 + 1 = 2). Список бронирований бота это поле не меняет.
             </small>
             {% else %}
             <small class="field-hint">
-                Ручная корректировка занятых мест — не влияет на список бронирований.
+                Дополнительные места, занятые мимо бота (например, по телефону) —
+                складываются с реальными бронированиями бота, а не заменяют их.
             </small>
             {% endif %}
         </div>
@@ -126,17 +132,20 @@
             });
         })();
 
-        // "Занято мест" не может превышать "Макс. игроков" — держим max
-        // атрибут в актуальном состоянии на клиенте (окончательная проверка
-        // всё равно на сервере, это только для удобства).
+        // "Занято вручную" — это ДОПОЛНИТЕЛЬНЫЕ места сверх уже забронированных
+        // через бота, поэтому лимит для него = "Макс. игроков" - "уже занято
+        // через бота", а не просто "Макс. игроков". Держим max атрибут в
+        // актуальном состоянии на клиенте (окончательная проверка всё равно
+        // на сервере, это только для удобства).
         (function () {
             const totalSlotsInput = document.getElementById('total_slots');
             const bookedInput = document.getElementById('booked_places');
             if (!totalSlotsInput || !bookedInput) return;
+            const actualTaken = parseInt(bookedInput.getAttribute('data-actual-taken'), 10) || 0;
             totalSlotsInput.addEventListener('input', function () {
                 const max = parseInt(totalSlotsInput.value, 10);
                 if (!isNaN(max)) {
-                    bookedInput.max = String(max);
+                    bookedInput.max = String(Math.max(0, max - actualTaken));
                 }
             });
         })();

@@ -324,6 +324,72 @@ def login_required(view_func):
     return wrapped
 
 
+# ---------------------------------------------------------------------------
+# Бейджи "+N" в шапке меню (Заявки/Оплаты/Отзывы)
+# ---------------------------------------------------------------------------
+# Идея: в сессии админа храним id последней увиденной заявки/отзыва
+# (seen_booking_id/seen_review_id) — бейдж = сколько строк имеют id больше
+# сохранённого. Для оплат — не id, а seen_payment_notified_at (timestamp),
+# так как "новизна" оплаты для бейджа определяется моментом, когда игрок
+# нажал "✅ Я оплатил" (может произойти позже создания более новых платежей),
+# а не порядком id. Как только админ открывает раздел, seen_* подтягивается
+# до текущего максимума, и бейдж пропадает.
+
+_UNSET = object()
+
+
+def _mark_section_seen(booking_id=None, payment_notified_at=_UNSET, review_id=None) -> None:
+    if booking_id is not None:
+        session["seen_booking_id"] = booking_id
+    if payment_notified_at is not _UNSET:
+        # Храним как ISO-строку — datetime не кладётся в сессию как есть.
+        # None допустим (значит: ни одного платежа игрок ещё не подтверждал).
+        session["seen_payment_notified_at"] = (
+            payment_notified_at.isoformat() if payment_notified_at else None
+        )
+    if review_id is not None:
+        session["seen_review_id"] = review_id
+
+
+def _mark_all_sections_seen() -> None:
+    try:
+        marker = db.get_latest_activity_marker()
+    except Exception as e:
+        logger.error("Не удалось инициализировать бейджи после входа: %s", e)
+        return
+    _mark_section_seen(
+        booking_id=marker["max_booking_id"],
+        # seen_payment_notified_at хранит момент, когда игрок в последний раз
+        # (до этого визита) нажимал "✅ Я оплатил", а не id последнего
+        # созданного платежа — см. count_new_since в database.py.
+        payment_notified_at=marker["last_payment_notified_at"],
+        review_id=marker["max_review_id"],
+    )
+
+
+@app.context_processor
+def inject_nav_badges():
+    """Считает бейджи "+N" на КАЖДЫЙ рендер страницы CRM (лёгкий индексный
+    запрос, не тормозит). Не логированному пользователю (страница логина)
+    ничего не считаем."""
+    if not session.get("logged_in"):
+        return {}
+    try:
+        counts = db.count_new_since(
+            session.get("seen_booking_id", 0),
+            session.get("seen_payment_notified_at"),
+            session.get("seen_review_id", 0),
+        )
+    except Exception as e:
+        logger.error("Не удалось посчитать бейджи меню: %s", e)
+        return {"nav_badges": {"bookings": 0, "payments": 0, "reviews": 0}}
+    return {"nav_badges": {
+        "bookings": counts["new_bookings"],
+        "payments": counts["new_payments"],
+        "reviews": counts["new_reviews"],
+    }}
+
+
 @app.route("/login", methods=["GET", "POST"])
 @limiter.limit(os.getenv("LOGIN_RATE_LIMIT", "5 per minute"))
 def login():
@@ -339,6 +405,10 @@ def login():
         if valid_login and valid_password:
             session.clear()
             session["logged_in"] = True
+            # Отмечаем всё, что накопилось ДО этого входа, как уже "увиденное" —
+            # иначе сразу после входа бейджи "+N" показали бы весь объём старых
+            # заявок/оплат/отзывов, а не только новые.
+            _mark_all_sections_seen()
             return redirect(url_for("games_list"))
         else:
             flash("Неверный логин или пароль")
@@ -393,8 +463,21 @@ def api_activity():
     страницы, и если что-то новое появилось (например, бронирование и
     оплата из бота), показывает баннер «Обновить». Одна простая агрегатная
     выборка (см. db.get_latest_activity_marker), не создаёт заметной
-    нагрузки даже при частом опросе."""
-    return db.get_latest_activity_marker(), 200
+    нагрузки даже при частом опросе.
+
+    Дополнительно отдаёт new_bookings/new_payments/new_reviews — сколько
+    появилось нового с момента, когда админ последний раз открывал
+    соответствующий раздел (см. seen_*_id в сессии) — этим живут бейджи
+    "+N" в шапке меню на ЛЮБОЙ странице CRM, без перезагрузки (см.
+    startNavBadgesPoll в base.html)."""
+    marker = db.get_latest_activity_marker()
+    new_counts = db.count_new_since(
+        session.get("seen_booking_id", 0),
+        session.get("seen_payment_notified_at"),
+        session.get("seen_review_id", 0),
+    )
+    marker.update(new_counts)
+    return marker, 200
 
 
 def _json_value(value):
@@ -479,10 +562,15 @@ def _game_values_from_row(game):
     }
 
 
-def _validate_game_values(values, clubs_by_id):
+def _validate_game_values(values, clubs_by_id, actual_taken: int = 0):
     """Валидирует все поля формы игры. Возвращает (errors, parsed) — при
     непустом errors значения в parsed могут быть неполными/некорректными,
-    использовать их для сохранения в БД нельзя."""
+    использовать их для сохранения в БД нельзя.
+
+    actual_taken — сколько мест уже занято реальными бронированиями (0 для
+    новой игры). booked_places — это ДОПОЛНИТЕЛЬНЫЕ места, занятые мимо бота
+    (например, по телефону), поэтому лимит для него — не total_slots, а
+    total_slots - actual_taken (то, что реально остаётся)."""
     errors = []
     parsed = {}
 
@@ -535,9 +623,15 @@ def _validate_game_values(values, clubs_by_id):
     try:
         booked_places = int(values.get("booked_places") or 0)
         if booked_places < 0:
-            errors.append("Занято мест не может быть отрицательным.")
-        elif "total_slots" in parsed and booked_places > parsed["total_slots"]:
-            errors.append("Занято мест не может превышать максимальное количество игроков.")
+            errors.append("Занято мест (вручную) не может быть отрицательным.")
+        elif "total_slots" in parsed:
+            remaining = parsed["total_slots"] - actual_taken
+            if booked_places > remaining:
+                errors.append(
+                    f"Занято мест (вручную) не может превышать оставшиеся свободные места "
+                    f"({remaining} из {parsed['total_slots']}, с учётом {actual_taken} уже "
+                    f"забронированных через бота)."
+                )
         parsed["booked_places"] = booked_places
     except ValueError:
         errors.append("Укажите корректное число занятых мест (целое число).")
@@ -603,12 +697,13 @@ def games_list():
     fullness = request.args.get("fullness", "")
     if fullness not in ("full", "available"):
         fullness = ""
+    show_past = request.args.get("show_past") == "1"
 
     result = db.get_games_paginated(
         page=page, per_page=DEFAULT_PAGE_SIZE, level=level, city=city,
         date_from=_safe_date(date_from_raw), date_to=_safe_date(date_to_raw),
         time_from=_safe_time(time_from_raw), time_to=_safe_time(time_to_raw),
-        sort_order=sort_order, fullness=fullness,
+        sort_order=sort_order, fullness=fullness, show_past=show_past,
     )
     cities = db.get_distinct_game_cities()
     return render_template(
@@ -617,7 +712,7 @@ def games_list():
         cities=cities, selected_city=city,
         date_from=date_from_raw, date_to=date_to_raw,
         time_from=time_from_raw, time_to=time_to_raw,
-        sort_order=sort_order, fullness=fullness,
+        sort_order=sort_order, fullness=fullness, show_past=show_past,
     )
 
 
@@ -684,13 +779,17 @@ def game_edit(game_id):
 
     if request.method == "POST":
         values = _game_values_from_form(request.form)
-        errors, parsed = _validate_game_values(values, clubs_by_id)
+        # actual_taken нужен ДО валидации: booked_places — это ДОПОЛНИТЕЛЬНЫЕ
+        # места сверх реальных бронирований, поэтому лимит для него зависит
+        # от того, сколько мест уже занято через бота.
+        actual_taken = db.count_bookings_for_game(game_id)
+        errors, parsed = _validate_game_values(values, clubs_by_id, actual_taken=actual_taken)
         if errors:
             for e in errors:
                 flash(e)
             return render_template(
                 "game_form.html", game=game, values=values, clubs=clubs, levels=GAME_LEVELS,
-                actual_taken=db.count_bookings_for_game(game_id),
+                actual_taken=actual_taken,
             )
 
         location = _build_game_location(parsed, clubs_by_id)
@@ -709,19 +808,6 @@ def game_edit(game_id):
             level=parsed["level"],
             booked_places=parsed["booked_places"],
         )
-
-        # Ручное booked_places — независимое поле, не связанное со списком
-        # реальных броней (bookings). Если админ поставил значение меньше
-        # фактического числа занятых по бронированиям мест — это подозрительно
-        # (может скрыть переполненность игры), но по требованию это не должно
-        # блокировать сохранение — только фиксируется в логах для отладки.
-        actual_taken = db.count_bookings_for_game(game_id)
-        if parsed["booked_places"] < actual_taken:
-            logger.warning(
-                "Игра №%s: вручную установлено занято мест (%s) меньше фактического "
-                "числа мест по активным бронированиям (%s)",
-                game_id, parsed["booked_places"], actual_taken,
-            )
 
         cache.invalidate_games_cache()
         description = f"Игра №{game_id} отредактирована: {_describe_game_diff(old_snapshot, dict(updated))}"
@@ -772,6 +858,8 @@ def bookings_list():
         search=search, status=status_filter, page=page, per_page=DEFAULT_PAGE_SIZE
     )
     activity = db.get_latest_activity_marker()
+    # Открыли раздел — бейдж "+N" у "Заявки" в шапке пропадает.
+    _mark_section_seen(booking_id=activity["max_booking_id"])
     return render_template(
         "bookings.html", bookings=result["items"], pagination=result, activity=activity
     )
@@ -833,6 +921,10 @@ def payments_list():
         search=search, status=status_filter, page=page, per_page=DEFAULT_PAGE_SIZE
     )
     activity = db.get_latest_activity_marker()
+    # Открыли раздел — бейдж "+N" у "Оплаты" в шапке пропадает. Отмечаем
+    # именно last_payment_notified_at (а не max_payment_id) — см.
+    # count_new_since в database.py.
+    _mark_section_seen(payment_notified_at=activity["last_payment_notified_at"])
     return render_template(
         "payments.html", payments=result["items"], pagination=result, activity=activity
     )
@@ -1050,7 +1142,10 @@ def about_club_update():
 @login_required
 def reviews_list():
     reviews = db.get_all_reviews()
-    return render_template("reviews.html", reviews=reviews)
+    # Открыли раздел — бейдж "+N" у "Отзывы" в шапке пропадает.
+    activity = db.get_latest_activity_marker()
+    _mark_section_seen(review_id=activity["max_review_id"])
+    return render_template("reviews.html", reviews=reviews, activity=activity)
 
 
 # ---------------------------------------------------------------------------

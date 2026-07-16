@@ -57,6 +57,13 @@
                     <option value="desc" {% if sort_order == 'desc' %}selected{% endif %}>Сначала дальние</option>
                 </select>
             </div>
+            <div style="display:flex; align-items:center; gap:6px; padding-bottom:8px;">
+                <input type="checkbox" id="show_past" name="show_past" value="1" style="width:auto;"
+                       {% if show_past %}checked{% endif %}>
+                <label for="show_past" class="filter-label" style="margin-bottom:0; text-transform:none; font-size:13px;">
+                    Показывать прошедшие игры
+                </label>
+            </div>
             <button type="submit" class="btn">Фильтровать</button>
             <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
         </form>
@@ -64,7 +71,9 @@
 
     <div class="game-grid">
         {% for g in games %}
-        <div class="card game-card">
+        {% set effective_taken = (g.taken or 0) + (g.booked_places or 0) %}
+        {% set is_full = effective_taken >= g.total_slots %}
+        <div class="card game-card{{ ' game-card-full' if is_full else '' }}">
             <div class="game-card-head">
                 <button type="button" class="game-icon-btn" data-game-id="{{ g.id }}"
                         title="Подробнее об игре №{{ g.id }}">🎾</button>
@@ -72,6 +81,12 @@
                     <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
                     <div class="game-card-number">№{{ g.id }}</div>
                 </div>
+                {% if g.is_live %}
+                <span class="badge badge-live" title="Игра уже началась и ещё не закончилась">🟢 Идёт сейчас</span>
+                {% endif %}
+                {% if is_full %}
+                <span class="badge badge-full" title="Все места заняты — бот не показывает эту игру пользователям">🚫 Мест нет</span>
+                {% endif %}
                 {% if g.level %}
                 <span class="badge badge-new">{{ g.level }}</span>
                 {% else %}
@@ -91,15 +106,19 @@
                     <div class="stat-box-value">{{ g.price }} ₽</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-box-label">Забронировано мест</div>
+                    <div class="stat-box-label">Забронировано (бот)</div>
                     <div class="stat-box-value">{{ g.taken }} / {{ g.total_slots }}</div>
-                    <div class="slots-bar">
-                        <div class="slots-bar-fill" style="width: {{ (g.taken / g.total_slots * 100) if g.total_slots else 0 }}%;"></div>
-                    </div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-box-label">Занято мест (вручную)</div>
-                    <div class="stat-box-value">{{ g.booked_places or 0 }} / {{ g.total_slots }}</div>
+                    <div class="stat-box-label">Занято вручную (доп.)</div>
+                    <div class="stat-box-value">+{{ g.booked_places or 0 }}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-box-label">Итого занято</div>
+                    <div class="stat-box-value">{{ effective_taken }} / {{ g.total_slots }}</div>
+                    <div class="slots-bar">
+                        <div class="slots-bar-fill" style="width: {{ (effective_taken / g.total_slots * 100) if g.total_slots else 0 }}%;"></div>
+                    </div>
                 </div>
                 <div class="stat-box">
                     <div class="stat-box-label">Собрано оплат</div>
@@ -145,6 +164,26 @@
             gap: 16px;
         }
         .game-card { display: flex; flex-direction: column; gap: 10px; }
+        .game-card-full {
+            border-color: rgba(220,38,38,0.35);
+            background: linear-gradient(135deg, rgba(254,242,242,0.85) 0%, rgba(255,255,255,0.9) 100%);
+        }
+        .badge-full {
+            background: #fee2e2;
+            color: #991b1b;
+            white-space: nowrap;
+        }
+        .badge-live {
+            background: #dcfce7;
+            color: #166534;
+            white-space: nowrap;
+            animation: liveBlink 2s ease-in-out infinite;
+        }
+        @keyframes liveBlink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .game-card-full .slots-bar-fill { background: #dc2626; }
         .game-card-head {
             display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
         }
@@ -166,7 +205,7 @@
         .game-card-location { font-size: 14px; color: var(--text); }
         .muted-line { font-size: 12px; color: var(--muted); margin-top: 2px; }
         .game-card-stats {
-            display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px;
         }
         .stat-box {
             background: rgba(37,99,235,0.06);
@@ -229,6 +268,17 @@
             const closeBtn = document.getElementById('game-details-close');
             if (!modal || !content || !closeBtn) return;
 
+            // .container (в base.html) анимируется через CSS animation с
+            // transform в keyframes — из-за fill-mode "both" итоговый
+            // computed transform остаётся не "none" даже после завершения
+            // анимации, а это по спеке CSS Transforms делает .container
+            // containing block для потомков с position:fixed. В итоге
+            // модалка центрировалась не по экрану, а по всей высоте
+            // страницы, и «плыла» вместе со скроллом. Переносим модалку
+            // прямым потомком <body> — там transform нет, и fixed снова
+            // считается от вьюпорта.
+            document.body.appendChild(modal);
+
             function esc(value) {
                 const div = document.createElement('div');
                 div.textContent = (value === null || value === undefined || value === '') ? '—' : String(value);
@@ -243,8 +293,14 @@
             function renderDetails(data) {
                 const g = data.game;
                 const participants = data.participants || [];
+                const effectiveTaken = (Number(g.taken) || 0) + (Number(g.booked_places) || 0);
+                const isFull = g.total_slots ? effectiveTaken >= g.total_slots : false;
 
-                let html = '<h2 style="margin-top:0;">Игра №' + esc(g.id) + '</h2>';
+                let html = '<h2 style="margin-top:0;">Игра №' + esc(g.id) +
+                    (g.is_live ? ' <span class="badge badge-live" style="font-size:12px; vertical-align:middle;">🟢 Идёт сейчас</span>' : '') +
+                    (isFull ?
+                    ' <span class="badge badge-full" style="font-size:12px; vertical-align:middle;">🚫 Мест нет</span>' : '') +
+                    '</h2>';
                 html += '<div class="details-grid">';
                 html += detailRow('Дата и время', g.game_date + ' в ' + g.game_time);
                 html += detailRow('Город', g.city);
@@ -254,8 +310,9 @@
                 html += detailRow('Уровень', g.level || 'любой уровень');
                 html += detailRow('Цена за место', g.price + ' ₽');
                 html += detailRow('Макс. игроков', g.total_slots);
-                html += detailRow('Занято по бронированиям', g.taken + ' из ' + g.total_slots);
-                html += detailRow('Занято мест (вручную)', (g.booked_places || 0) + ' из ' + g.total_slots);
+                html += detailRow('Забронировано (бот)', g.taken + ' из ' + g.total_slots);
+                html += detailRow('Занято вручную (доп.)', '+' + (g.booked_places || 0));
+                html += detailRow('Итого занято', effectiveTaken + ' из ' + g.total_slots);
                 html += detailRow('Собрано оплат', g.collected + ' ₽');
                 html += '</div>';
 

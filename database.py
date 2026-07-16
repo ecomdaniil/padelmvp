@@ -26,6 +26,20 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# game_date/game_time хранятся как "наивные" дата/время БЕЗ таймзоны — это
+# локальное время клуба (Europe/Moscow по умолчанию), как его вводит админ в
+# форме. Сессия БД при этом работает в UTC (см. TimeZone сервера/провайдера),
+# поэтому "SELECT ... WHERE game_date + game_time >= NOW()" сравнивает
+# наивное московское время как если бы это было UTC — то есть со сдвигом на
+# разницу UTC/Europe-Moscow (обычно 3 часа). Из-за этого игра могла считаться
+# "ещё не прошедшей"/"не идёт сейчас" на 3 часа дольше, чем по факту. Приводим
+# NOW() к тому же "наивному локальному" виду через AT TIME ZONE — тогда
+# сравнение с game_date+game_time корректно.
+import re as _re
+_APP_TZ_RAW = os.getenv("APP_TIMEZONE", "Europe/Moscow")
+APP_TIMEZONE = _APP_TZ_RAW if _re.fullmatch(r"[A-Za-z0-9_+\-/]+", _APP_TZ_RAW) else "Europe/Moscow"
+_LOCAL_NOW_EXPR = f"(NOW() AT TIME ZONE '{APP_TIMEZONE}')"
+
 # Пул соединений. Раньше get_connection() делал psycopg2.connect(...) на
 # КАЖДЫЙ вызов, а почти каждая функция в этом файле открывает и закрывает
 # своё собственное соединение — то есть один клик в CRM, дёргающий несколько
@@ -399,8 +413,17 @@ def _migrate_bookings_table(cur):
 def _migrate_payments_table(cur):
     """method — способ оплаты, выбранный игроком в боте (card/sbp), для
     отображения в CRM. NULL — способ ещё не выбран (например, заявку
-    оплатили наличными на месте без похода через бота)."""
+    оплатили наличными на месте без похода через бота).
+
+    player_notified_at — момент, когда игрок нажал «✅ Я оплатил» в боте
+    (см. process_paid_notify в bot.py). NULL — платёж создан (сразу при
+    записи на игру, статус «ожидает»), но игрок ещё не сообщал об оплате.
+    Бейдж «+N» рядом с «Оплаты» в шапке CRM (см. count_new_since) считает
+    ТОЛЬКО платежи с заполненным player_notified_at — иначе бейдж загорался
+    бы на каждую новую заявку, даже если игрок ещё даже не открывал экран
+    оплаты."""
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT;")
+    cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS player_notified_at TIMESTAMP;")
 
 
 def _create_indexes(cur):
@@ -546,10 +569,18 @@ def get_all_games():
     return games
 
 
+# Момент окончания игры = начало + длительность (по умолчанию 90 минут,
+# если не указана) — используется и чтобы убрать завершившиеся игры из
+# списка, и чтобы посчитать "идёт сейчас".
+_GAME_END_EXPR = (
+    "(g.game_date + g.game_time + (COALESCE(g.duration_minutes, 90) || ' minutes')::interval)"
+)
+
+
 def get_games_paginated(
     page: int = 1, per_page: int = 20, level: str = "",
     date_from=None, date_to=None, time_from=None, time_to=None, city: str = "",
-    sort_order: str = "asc", fullness: str = "",
+    sort_order: str = "asc", fullness: str = "", show_past: bool = False,
 ):
     """Список игр с пагинацией + количество занятых мест/собранных оплат
     одним запросом (без N+1), с опциональными фильтрами по уровню, дате
@@ -557,6 +588,12 @@ def get_games_paginated(
     например «найти вечерние слоты 18:00-20:00 в любой день»), городу и
     заполненности (fullness: "full" — только полностью занятые по реальным
     бронированиям, "available" — только со свободными местами, "" — все).
+
+    show_past — по умолчанию False: игры, которые уже закончились (дата +
+    время + длительность < текущего момента), сразу пропадают из списка
+    (админ всё равно может открыть их по прямой ссылке /games/<id>/edit —
+    список только скрывает их из основной вкладки). True — показывать и
+    прошедшие тоже.
 
     sort_order — "asc" (по умолчанию: ближайшие даты сверху) или "desc"
     (сначала самые дальние/прошедшие). Возвращает dict с items/total/total_pages."""
@@ -583,17 +620,22 @@ def get_games_paginated(
     if city:
         where_clause += " AND g.city = %s"
         params.append(city)
+    if not show_past:
+        where_clause += f" AND {_GAME_END_EXPR} >= {_LOCAL_NOW_EXPR}"
 
-    # Заполненность считается по РЕАЛЬНЫМ бронированиям (та же логика, что
-    # прячет заполненные игры в боте, см. get_upcoming_games_with_slots в
-    # database_async.py) — не по ручному booked_places, который может не
-    # совпадать с фактическими заявками.
+    # Занятость = СУММА реальных бронирований и ручного booked_places (та же
+    # логика, что прячет заполненные игры в боте — см.
+    # get_upcoming_games_with_slots в database_async.py). booked_places —
+    # это места, занятые мимо бота (например, по телефону), ДОПОЛНИТЕЛЬНО к
+    # реальным бронированиям, а не альтернативная величина. Если у игры 1
+    # реальная бронь и total_slots=2, а админ вручную поставил
+    # booked_places=1 — игра полностью занята (1+1=2), а не наполовину.
     order_dir = "DESC" if sort_order == "desc" else "ASC"
 
     if fullness == "full":
-        fullness_clause = " AND COALESCE(bk.taken, 0) >= g.total_slots"
+        fullness_clause = " AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) >= g.total_slots"
     elif fullness == "available":
-        fullness_clause = " AND COALESCE(bk.taken, 0) < g.total_slots"
+        fullness_clause = " AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) < g.total_slots"
     else:
         fullness_clause = ""
 
@@ -609,6 +651,7 @@ def get_games_paginated(
                c.name AS club_name,
                COALESCE(bk.taken, 0) AS taken,
                COALESCE(pm.collected, 0) AS collected,
+               ({_LOCAL_NOW_EXPR} >= (g.game_date + g.game_time) AND {_LOCAL_NOW_EXPR} < {_GAME_END_EXPR}) AS is_live,
                COUNT(*) OVER() AS total_count
         FROM games g
         LEFT JOIN clubs c ON c.id = g.club_id
@@ -1072,10 +1115,11 @@ def get_game_details(game_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT g.*, c.name AS club_name,
                COALESCE(bk.taken, 0) AS taken,
-               COALESCE(pm.collected, 0) AS collected
+               COALESCE(pm.collected, 0) AS collected,
+               ({_LOCAL_NOW_EXPR} >= (g.game_date + g.game_time) AND {_LOCAL_NOW_EXPR} < {_GAME_END_EXPR}) AS is_live
         FROM games g
         LEFT JOIN clubs c ON c.id = g.club_id
         LEFT JOIN (
@@ -1729,21 +1773,63 @@ def get_dashboard_summary() -> dict:
 
 
 def get_latest_activity_marker() -> dict:
-    """Лёгкий «маркер свежести» для заявок и оплат: max(id) + max(updated_at)
-    по bookings/payments. Используется CRM-страницами для поллинга —
-    сравниваем с тем, что было при рендере, и если что-то изменилось (новая
-    заявка/оплата из бота или правка другим админом), подсказываем
-    обновить страницу. Один простой запрос, не нагружает БД при частом
-    опросе (индексы по id есть по умолчанию — это PK)."""
+    """Лёгкий «маркер свежести» для заявок, оплат и отзывов: max(id) + общее
+    количество строк по bookings/payments/reviews. Используется CRM-страницами
+    для поллинга — сравниваем с тем, что было при рендере, и если что-то
+    изменилось (новая заявка/оплата/отзыв или правка другим админом),
+    подсказываем обновить страницу (bookings.html/payments.html), а также
+    используется для сброса счётчика-бейджа "+N" в шапке меню при заходе в
+    раздел (см. bookings_list/payments_list/reviews_list в app.py). Один
+    простой запрос, не нагружает БД при частом опросе (индексы по id есть по
+    умолчанию — это PK)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT
             (SELECT COALESCE(MAX(id), 0) FROM bookings) AS max_booking_id,
             (SELECT COALESCE(MAX(id), 0) FROM payments) AS max_payment_id,
+            (SELECT MAX(player_notified_at) FROM payments) AS last_payment_notified_at,
+            (SELECT COALESCE(MAX(id), 0) FROM reviews) AS max_review_id,
             (SELECT COUNT(*) FROM bookings) AS bookings_count,
-            (SELECT COUNT(*) FROM payments) AS payments_count
+            (SELECT COUNT(*) FROM payments) AS payments_count,
+            (SELECT COUNT(*) FROM reviews) AS reviews_count
     """)
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row)
+
+
+def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_id: int) -> dict:
+    """Сколько новых заявок/оплат/отзывов появилось после last_* — основа
+    бейджей-счётчиков "+N" рядом с «Заявки»/«Оплаты»/«Отзывы» в шапке CRM.
+    last_booking_id/last_review_id — это id, максимальные на момент, когда
+    админ последний раз ОТКРЫВАЛ соответствующий раздел (хранится в сессии,
+    см. app.py) — бейдж показывает то, что появилось НОВОГО с того момента,
+    и пропадает, как только раздел открыт снова.
+
+    last_payment_notified_at — НЕ id, а timestamp (строка ISO или None):
+    платёж создаётся автоматически сразу при записи на игру (статус
+    «ожидает»), задолго до того, как игрок реально попытается оплатить,
+    поэтому бейдж "+N" у «Оплаты» должен появляться только когда игрок
+    нажал «✅ Я оплатил» в боте (player_notified_at заполняется в
+    process_paid_notify, bot.py) — а этот момент никак не привязан к
+    порядку id платежей (можно нажать кнопку у платежа, созданного давно,
+    уже после того как появились более новые платежи), поэтому сравнение
+    по id здесь не подходит, нужен именно временной водораздел."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM bookings WHERE id > %s) AS new_bookings,
+            (SELECT COUNT(*) FROM payments
+                WHERE player_notified_at IS NOT NULL
+                  AND player_notified_at > COALESCE(%s::timestamp, 'epoch'::timestamp)) AS new_payments,
+            (SELECT COUNT(*) FROM reviews WHERE id > %s) AS new_reviews
+        """,
+        (last_booking_id, last_payment_notified_at, last_review_id),
+    )
     row = cur.fetchone()
     cur.close()
     conn.close()

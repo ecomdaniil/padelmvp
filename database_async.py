@@ -19,6 +19,7 @@ database_async.py
 
 import asyncio
 import os
+import re as _re
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -28,6 +29,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Та же логика, что и в database.py: game_date/game_time — наивные, это
+# локальное время клуба (Europe/Moscow), а сессия БД работает в UTC. Приводим
+# NOW() к "наивному локальному" виду через AT TIME ZONE, иначе сравнение с
+# game_date+game_time сдвинуто на разницу UTC/Europe-Moscow (обычно 3 часа) —
+# игра могла считаться "ещё не начавшейся" на несколько часов дольше, чем
+# по факту.
+_APP_TZ_RAW = os.getenv("APP_TIMEZONE", "Europe/Moscow")
+APP_TIMEZONE = _APP_TZ_RAW if _re.fullmatch(r"[A-Za-z0-9_+\-/]+", _APP_TZ_RAW) else "Europe/Moscow"
+_LOCAL_NOW_EXPR = f"(NOW() AT TIME ZONE '{APP_TIMEZONE}')"
 
 _pool: Optional[asyncpg.Pool] = None
 _pool_lock = asyncio.Lock()
@@ -199,16 +210,28 @@ async def get_upcoming_games_with_slots() -> list:
 
     ORDER BY g.game_date, g.game_time — сначала ближайшие игры.
 
-    COALESCE(bk.taken, 0) < g.total_slots — игры, где все места уже заняты,
-    полностью исключаются из результата (а не просто помечаются "мест нет"
-    в тексте). Как только кто-то отменит бронь, освободившееся место сразу
-    видно новым пользователям — кэш инвалидируется при любой брони/отмене
-    (см. _invalidate_games_cache в bot.py), так что устаревших данных
-    дольше TTL/факта изменения не бывает."""
+    (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) < g.total_slots
+    — игры, где все места уже заняты, полностью исключаются из результата
+    (а не просто помечаются "мест нет" в тексте). Занятость считается как
+    СУММА реальных бронирований и ручного booked_places, которое админ
+    может выставить в CRM для мест, занятых мимо бота (например, по
+    телефону/на месте) — это ДОПОЛНИТЕЛЬНЫЕ места сверх бронирований, а не
+    альтернативная/перекрывающая их величина. Боту должно быть безразлично,
+    кто занял места (бот или ручная правка) — при 1 месте через бота и 1
+    вручную на игру с total_slots=2 игра должна считаться полностью занятой.
+    LEAST(..., g.total_slots) — на случай, если сумма превысит total_slots
+    (например, из-за гонки бронирования и ручной правки), не показываем
+    отрицательное количество свободных мест. Как только кто-то отменит бронь
+    (или админ уменьшит booked_places), освободившееся место сразу видно
+    новым пользователям — кэш инвалидируется при любой брони/отмене (см.
+    _invalidate_games_cache в bot.py) и при сохранении игры в CRM, так что
+    устаревших данных дольше TTL/факта изменения не бывает."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
-        SELECT g.*, COALESCE(bk.taken, 0) AS taken
+        f"""
+        SELECT g.*, LEAST(
+            COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0), g.total_slots
+        ) AS taken
         FROM games g
         LEFT JOIN (
             SELECT game_id, SUM(slots_count) AS taken
@@ -216,8 +239,8 @@ async def get_upcoming_games_with_slots() -> list:
             WHERE status != 'отменена'
             GROUP BY game_id
         ) bk ON bk.game_id = g.id
-        WHERE (g.game_date + g.game_time) >= NOW()
-          AND COALESCE(bk.taken, 0) < g.total_slots
+        WHERE (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR}
+          AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) < g.total_slots
         ORDER BY g.game_date, g.game_time
         """
     )
@@ -333,7 +356,12 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                 "SELECT COALESCE(SUM(slots_count), 0) FROM bookings WHERE game_id = $1 AND status != 'отменена'",
                 game_id,
             )
-            if taken + slots_count > game["total_slots"]:
+            # Учитываем и ручной booked_places (админ мог занять места в CRM
+            # мимо бота, например по телефону) — это ДОПОЛНИТЕЛЬНЫЕ места
+            # сверх реальных бронирований, поэтому складываем, а не берём
+            # максимум, иначе бот пустил бы запись сверх реального лимита.
+            effective_taken = taken + (game_dict.get("booked_places") or 0)
+            if effective_taken + slots_count > game["total_slots"]:
                 return {"status": "full", "booking": None, "game": game_dict}
 
             booking = await conn.fetchrow(
@@ -508,6 +536,18 @@ async def get_payment_by_id(payment_id: int) -> Optional[dict]:
 async def set_payment_method(payment_id: int, method: str) -> None:
     pool = await get_pool()
     await pool.execute("UPDATE payments SET method = $1 WHERE id = $2", method, payment_id)
+
+
+async def mark_payment_notified(payment_id: int) -> None:
+    """Игрок нажал «✅ Я оплатил» (см. process_paid_notify в bot.py) —
+    отмечаем момент отдельным полем player_notified_at. Именно это поле, а
+    не сам факт создания платежа (он создаётся автоматически сразу при
+    записи на игру, ещё до реальной оплаты), включает бейдж «+N» рядом с
+    «Оплаты» в шапке CRM — см. count_new_since в database.py."""
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE payments SET player_notified_at = NOW() WHERE id = $1", payment_id
+    )
 
 
 async def confirm_payment(payment_id: int) -> None:

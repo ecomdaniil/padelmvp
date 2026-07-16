@@ -1048,7 +1048,11 @@ async def process_booking_ask_slots(callback: CallbackQuery):
         return
 
     taken = await db.count_bookings_for_game(game_id)
-    free_slots = game["total_slots"] - taken
+    # Учитываем и ручной booked_places из CRM — это ДОПОЛНИТЕЛЬНЫЕ места,
+    # занятые мимо бота (например, по телефону), поэтому складываем с
+    # реальными бронированиями, а не берём максимум.
+    effective_taken = taken + (game.get("booked_places") or 0)
+    free_slots = max(0, game["total_slots"] - effective_taken)
     if free_slots <= 0:
         await callback.answer("К сожалению, места уже закончились.", show_alert=True)
         return
@@ -1246,6 +1250,11 @@ async def process_paid_notify(callback: CallbackQuery):
     if not payment:
         await callback.answer("Платёж не найден.", show_alert=True)
         return
+
+    # Именно с этого момента платёж считается "новым" для бейджа "+N" рядом
+    # с "Оплаты" в CRM — до этого клика он уже существовал (создаётся сразу
+    # при записи на игру), но игрок ещё не заявлял об оплате.
+    await db.mark_payment_notified(payment_id)
 
     await callback.answer("Спасибо! Администратор проверит оплату.", show_alert=True)
     await callback.message.answer(

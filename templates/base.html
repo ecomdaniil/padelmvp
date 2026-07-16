@@ -199,6 +199,27 @@
             background: rgba(255,255,255,0.16);
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.22);
         }
+        .nav-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 18px;
+            height: 18px;
+            padding: 0 5px;
+            margin-left: 6px;
+            border-radius: 999px;
+            background: #ef4444;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 800;
+            line-height: 1;
+            vertical-align: middle;
+            animation: navBadgePop 0.25s ease-out;
+        }
+        @keyframes navBadgePop {
+            from { transform: scale(0.4); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
         .icon-btn {
             display: inline-flex;
             align-items: center;
@@ -444,12 +465,18 @@
         <div class="nav-links">
             <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint == 'index' }}">Главная</a>
             <a href="{{ url_for('games_list') }}" class="{{ 'active' if request.endpoint in ['games_list', 'game_new', 'game_edit'] }}">Игры</a>
-            <a href="{{ url_for('bookings_list') }}" class="{{ 'active' if request.endpoint == 'bookings_list' }}">Заявки</a>
-            <a href="{{ url_for('payments_list') }}" class="{{ 'active' if request.endpoint == 'payments_list' }}">Оплаты</a>
+            <a href="{{ url_for('bookings_list') }}" class="{{ 'active' if request.endpoint == 'bookings_list' }}">
+                Заявки<span class="nav-badge" id="nav-badge-bookings" {% if not nav_badges or not nav_badges.bookings %}style="display:none;"{% endif %}>+{{ nav_badges.bookings if nav_badges else 0 }}</span>
+            </a>
+            <a href="{{ url_for('payments_list') }}" class="{{ 'active' if request.endpoint == 'payments_list' }}">
+                Оплаты<span class="nav-badge" id="nav-badge-payments" {% if not nav_badges or not nav_badges.payments %}style="display:none;"{% endif %}>+{{ nav_badges.payments if nav_badges else 0 }}</span>
+            </a>
             <a href="{{ url_for('visits_list') }}" class="{{ 'active' if request.endpoint == 'visits_list' }}">Посещения</a>
             <a href="{{ url_for('clubs_list') }}" class="{{ 'active' if request.endpoint in ['clubs_list', 'club_new', 'club_edit'] }}">Клубы</a>
             <a href="{{ url_for('logs_list') }}" class="{{ 'active' if request.endpoint == 'logs_list' }}">Журнал</a>
-            <a href="{{ url_for('reviews_list') }}" class="{{ 'active' if request.endpoint == 'reviews_list' }}">Отзывы</a>
+            <a href="{{ url_for('reviews_list') }}" class="{{ 'active' if request.endpoint == 'reviews_list' }}">
+                Отзывы<span class="nav-badge" id="nav-badge-reviews" {% if not nav_badges or not nav_badges.reviews %}style="display:none;"{% endif %}>+{{ nav_badges.reviews if nav_badges else 0 }}</span>
+            </a>
         </div>
         <div class="nav-actions">
             <form method="post" action="{{ url_for('logout') }}" style="margin:0;">
@@ -523,6 +550,44 @@
             };
             setInterval(check, opts.intervalMs || 6000);
         };
+
+        // Бейджи "+N" рядом с "Заявки"/"Оплаты"/"Отзывы" в шапке — живут на
+        // ЛЮБОЙ странице CRM (не только на самих этих вкладках), обновляются
+        // поллингом того же /api/activity, который уже отдаёт new_bookings/
+        // new_payments/new_reviews относительно того, что админ последний раз
+        // видел (сессия, см. app.py). Только меняет цифру/видимость бейджа —
+        // никаких перезагрузок страницы.
+        (function () {
+            const badges = {
+                bookings: document.getElementById('nav-badge-bookings'),
+                payments: document.getElementById('nav-badge-payments'),
+                reviews: document.getElementById('nav-badge-reviews'),
+            };
+            if (!badges.bookings && !badges.payments && !badges.reviews) return;
+
+            function updateBadge(el, count) {
+                if (!el) return;
+                if (count > 0) {
+                    el.textContent = '+' + count;
+                    el.style.display = 'inline-flex';
+                } else {
+                    el.style.display = 'none';
+                }
+            }
+
+            function poll() {
+                fetch('/api/activity', { headers: { 'Accept': 'application/json' } })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (data) {
+                        if (!data) return;
+                        updateBadge(badges.bookings, data.new_bookings || 0);
+                        updateBadge(badges.payments, data.new_payments || 0);
+                        updateBadge(badges.reviews, data.new_reviews || 0);
+                    })
+                    .catch(function () { /* сеть недоступна — просто пропускаем цикл */ });
+            }
+            setInterval(poll, 8000);
+        })();
     </script>
     {% block extra_scripts %}{% endblock %}
 </body>
