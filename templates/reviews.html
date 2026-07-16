@@ -10,7 +10,7 @@
             <td>{{ r.user_name }}</td>
             <td>{{ '⭐' * r.rating }}</td>
             <td>{{ r.text }}</td>
-            <td>{{ r.created_at.strftime('%d.%m.%Y') }}</td>
+            <td>{{ r.created_at | local_dt('%d.%m.%Y') }}</td>
         </tr>
         {% else %}
         <tr><td colspan="4">Отзывов пока нет.</td></tr>

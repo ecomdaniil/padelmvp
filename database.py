@@ -992,6 +992,49 @@ def get_bookings_paginated(search: str = "", status: str = "", page: int = 1, pe
     return result
 
 
+def delete_old_bookings(days: int = 60) -> int:
+    """Удаляет бронирования на игры, которые прошли больше `days` дней
+    назад — критерий по дате самой ИГРЫ (games.game_date), а не по дате
+    создания брони: старые записи копятся годами и не нужны для работы
+    бота/CRM. Раз игра уже прошла больше `days` дней назад, у неё по
+    определению не может быть "будущих" броней — поэтому это условие
+    физически не может задеть недавние/будущие игры, а сама таблица games
+    здесь не трогается вообще (игры не удаляются, даже если у них не
+    осталось ни одной брони). payments удаляются автоматически каскадом
+    (payments.booking_id ON DELETE CASCADE)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM bookings b
+        USING games g
+        WHERE b.game_id = g.id
+          AND g.game_date < (CURRENT_DATE - %s * INTERVAL '1 day')
+        """,
+        (days,),
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return deleted
+
+
+def delete_old_admin_logs(days: int = 60) -> int:
+    """Удаляет записи журнала действий старше `days` дней по created_at."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM admin_logs WHERE created_at < NOW() - %s * INTERVAL '1 day'",
+        (days,),
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return deleted
+
+
 def get_game_details(game_id: int):
     """Полная информация об игре для карточки "Подробнее" в CRM: сама игра
     (с клубом, реальным числом занятых мест из bookings, собранными оплатами)

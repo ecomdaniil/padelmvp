@@ -26,6 +26,7 @@ from datetime import date, datetime, time as time_type
 from decimal import Decimal
 from functools import wraps
 
+import pytz
 from dotenv import load_dotenv
 from flask import (
     Flask, render_template, request, redirect,
@@ -140,6 +141,34 @@ def send_telegram_message(chat_id, text: str) -> bool:
 
 DEFAULT_PAGE_SIZE = int(os.getenv("CRM_PAGE_SIZE", "20"))
 
+# БД хранит created_at как naive-время в UTC (сессия Postgres настроена на
+# GMT, см. миграции) — при показе в CRM (журнал, отзывы, карточка игры)
+# переводим в локальную зону админа, иначе время визуально "отстаёт" на
+# несколько часов от реального. По умолчанию — московское время.
+APP_TIMEZONE = pytz.timezone(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
+
+# Сколько дней хранить старые брони/записи журнала перед автоочисткой —
+# см. _run_cleanup_job() и start_cleanup_scheduler() ближе к концу файла.
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "60"))
+
+
+def _to_local_dt(value):
+    """Переводит naive UTC datetime (как приходит из БД) в APP_TIMEZONE.
+    Если объект уже tz-aware — просто конвертирует. None передаётся как есть."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = pytz.utc.localize(value)
+    return value.astimezone(APP_TIMEZONE)
+
+
+@app.template_filter("local_dt")
+def local_dt_filter(value, fmt="%d.%m.%Y %H:%M"):
+    """Jinja-фильтр: {{ log.created_at | local_dt }} — форматирует datetime
+    из БД (UTC) в локальном времени администратора."""
+    local = _to_local_dt(value)
+    return local.strftime(fmt) if local else "—"
+
 # Тот же набор уровней, что и в боте (см. bot.py: VALID_LEVELS) — продублирован
 # здесь, чтобы не тянуть в CRM тяжёлые импорты aiogram/бота только за одной
 # константой. Если список уровней поменяется — обновите его в обоих местах.
@@ -169,6 +198,7 @@ ACTION_LABELS = {
     "update_status": "Изменение статуса",
     "confirm": "Подтверждение оплаты",
     "mark_visited": "Отметка посещения",
+    "cleanup": "Автоочистка данных",
 }
 ENTITY_LABELS = {
     "game": "Игра",
@@ -176,6 +206,7 @@ ENTITY_LABELS = {
     "payment": "Оплата",
     "club": "Клуб",
     "club_info": "Информация о клубе",
+    "system": "Системная задача",
 }
 app.jinja_env.filters["action_label"] = lambda a: ACTION_LABELS.get(a, a or "—")
 app.jinja_env.filters["entity_label"] = lambda e: ENTITY_LABELS.get(e, e) if e else "—"
@@ -366,11 +397,13 @@ def api_activity():
 
 def _json_value(value):
     """psycopg2 отдаёт Decimal/date/time/datetime, которые стандартный JSON
-    не умеет сериализовать сам — приводим к простым JSON-совместимым типам."""
+    не умеет сериализовать сам — приводим к простым JSON-совместимым типам.
+    datetime дополнительно переводится из UTC (как хранится в БД) в
+    локальное время администратора — см. _to_local_dt."""
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, datetime):
-        return value.strftime("%d.%m.%Y %H:%M")
+        return _to_local_dt(value).strftime("%d.%m.%Y %H:%M")
     if isinstance(value, date):
         return value.strftime("%d.%m.%Y")
     if isinstance(value, time_type):
@@ -1156,6 +1189,56 @@ def start_background_services():
     logger.info("Бот запущен в фоновом режиме")
 
 
+def _run_cleanup_job():
+    """Ежедневная очистка старых данных:
+    - bookings старше DATA_RETENTION_DAYS дней по дате самой ИГРЫ
+      (games.game_date) — брони удаляются только для игр, прошедших больше
+      этого срока назад, поэтому у затронутых игр физически не может быть
+      "будущих" броней, а сами игры (таблица games) эта задача не трогает
+      вообще, даже если у них не осталось ни одной брони.
+    - admin_logs старше DATA_RETENTION_DAYS дней по created_at.
+
+    Итоговая запись о количестве удалённых строк пишется в admin_logs
+    ПОСЛЕ обеих очисток — она создаётся уже позже точки отсчёта "старше N
+    дней", поэтому не попадёт под то же (или следующее) удаление логов."""
+    try:
+        deleted_bookings = db.delete_old_bookings(days=DATA_RETENTION_DAYS)
+        deleted_logs = db.delete_old_admin_logs(days=DATA_RETENTION_DAYS)
+        description = (
+            f"Автоочистка данных старше {DATA_RETENTION_DAYS} дн.: "
+            f"удалено бронирований — {deleted_bookings}, "
+            f"удалено записей журнала — {deleted_logs}."
+        )
+        log_admin_action("cleanup", "system", None, description=description)
+        logger.info(description)
+    except Exception as e:
+        logger.error("Ошибка ежедневной очистки старых данных: %s", e)
+
+
+def start_cleanup_scheduler():
+    """Планировщик ежедневной очистки — запускается всегда вместе с
+    процессом CRM (app.py), независимо от RUN_BOT_IN_BACKGROUND (в отличие
+    от напоминаний бота, которым нужен встроенный бот в этом же процессе).
+    Время (03:00) считается в APP_TIMEZONE, а не в UTC — иначе задача
+    срабатывала бы не ночью, а в 6 утра по московскому времени.
+
+    ВАЖНО про несколько gunicorn worker-процессов: как и с ботом (см.
+    start_background_services()), при --workers>1 каждый worker поднимет
+    свой планировщик и попытается выполнить очистку отдельно в 03:00.
+    Сами DELETE-запросы идемпотентны (повторное удаление уже удалённых
+    строк безвредно и просто отработает на 0 строк), но в журнале появится
+    по одной записи "Автоочистка..." от каждого воркера. Чтобы не плодить
+    дублирующиеся записи в журнале — используйте --workers 1 (см.
+    deploy.md/docker-compose.yml), как и рекомендовано для бота."""
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    scheduler = BackgroundScheduler(timezone=APP_TIMEZONE)
+    scheduler.add_job(_run_cleanup_job, "cron", hour=3, minute=0, id="daily_cleanup")
+    scheduler.start()
+    logger.info("Планировщик ежедневной очистки данных запущен (03:00 %s)", APP_TIMEZONE)
+    return scheduler
+
+
 # Держит БД CRM "тёплой" независимо от того, запущен ли бот в этом же
 # процессе — тот же смысл, что и database_async.keepalive_loop() для бота
 # (см. её docstring): без этого первая страница CRM после долгого простоя
@@ -1163,6 +1246,7 @@ def start_background_services():
 db.start_keepalive_thread()
 
 start_background_services()
+_cleanup_scheduler = start_cleanup_scheduler()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))

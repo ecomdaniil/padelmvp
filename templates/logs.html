@@ -21,7 +21,7 @@
         </tr>
         {% for log in logs %}
         <tr>
-            <td>{{ log.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+            <td>{{ log.created_at | local_dt }}</td>
             <td>{{ log.action | action_label }}</td>
             <td>{{ log.entity_type | entity_label }}</td>
             <td>{{ log.entity_id or '—' }}</td>
