@@ -39,8 +39,9 @@ _pool_lock = asyncio.Lock()
 
 
 def _prepare_dsn(url: str):
-    """asyncpg не всегда понимает sslmode= в DSN одинаково на всех версиях,
-    поэтому вынимаем его явно и передаём отдельным параметром ssl=."""
+    """asyncpg не всегда понимает sslmode=/channel_binding= в DSN одинаково,
+    поэтому вынимаем их явно: ssl передаём параметром ssl=, channel_binding
+    отбрасываем (нужен libpq, asyncpg его не использует)."""
     parts = urlsplit(url)
     pairs = parse_qsl(parts.query, keep_blank_values=True)
     ssl_mode = None
@@ -48,6 +49,8 @@ def _prepare_dsn(url: str):
     for key, value in pairs:
         if key == "sslmode":
             ssl_mode = value
+        elif key in {"channel_binding"}:
+            continue
         else:
             remaining.append((key, value))
     clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(remaining), parts.fragment))

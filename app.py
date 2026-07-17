@@ -57,7 +57,8 @@ load_dotenv()
 # поток + webhook на публичный HTTPS URL сервиса.
 _IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
 if _IS_RENDER:
-    os.environ.setdefault("RUN_BOT_IN_BACKGROUND", "1")
+    # Всегда включаем бота на Render (явный 0 больше не глушит деплой молча).
+    os.environ["RUN_BOT_IN_BACKGROUND"] = "1"
     os.environ.setdefault("SESSION_COOKIE_SECURE", "1")
     if not (os.getenv("WEBHOOK_URL") or "").strip():
         _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
@@ -69,6 +70,12 @@ if _IS_RENDER:
 LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.ERROR))
 logger = logging.getLogger(__name__)
+
+if _IS_RENDER:
+    logger.error(
+        "Render detected: RUN_BOT_IN_BACKGROUND=1, WEBHOOK_URL=%s",
+        os.getenv("WEBHOOK_URL") or "(missing)",
+    )
 
 app = Flask(__name__)
 
@@ -568,7 +575,13 @@ def index():
 
 @app.route("/health")
 def health_check():
-    return {"status": "ok"}, 200
+    """Публичный health для Render/uptime-cron. bot_ready=false значит
+    фоновый бот не поднялся (токен/БД/webhook) — CRM при этом может жить."""
+    return {
+        "status": "ok",
+        "bot_ready": bool(bot_instance and dp_instance and bot_loop),
+        "webhook_path": WEBHOOK_PATH,
+    }, 200
 
 
 @app.route("/api/activity")
@@ -1405,6 +1418,8 @@ def run_bot():
             logger.error("Ошибка задачи напоминаний: %s", e)
 
     async def _startup():
+        if not BOT_TOKEN:
+            raise RuntimeError("BOT_TOKEN не задан — бот на Render не запустится")
         await db_async.get_pool()
         # Держит БД "тёплой", чтобы /start и первое сообщение после паузы
         # не ждали холодный старт Neon (~5с) — см. database_async.py:keepalive_loop.
@@ -1417,11 +1432,16 @@ def run_bot():
         scheduler.start()
 
         if WEBHOOK_URL:
+            webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
             await bot_instance.set_webhook(
-                url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+                url=webhook_endpoint,
                 secret_token=WEBHOOK_SECRET_TOKEN,
+                drop_pending_updates=False,
             )
+            # ERROR-уровень — видно в Render Logs даже при LOG_LEVEL=ERROR.
+            logger.error("Telegram webhook зарегистрирован: %s", webhook_endpoint)
         else:
+            logger.error("WEBHOOK_URL пуст — бот уходит в long polling (на Render так нельзя)")
             await dp_instance.start_polling(bot_instance)
 
     try:
@@ -1431,7 +1451,7 @@ def run_bot():
             # в режиме webhook держим loop живым для feed_webhook_update.
             loop.run_forever()
     except Exception as e:
-        logger.error("Ошибка запуска бота: %s", e)
+        logger.exception("Ошибка запуска бота (CRM может работать, бот — нет): %s", e)
     finally:
         scheduler.shutdown(wait=False)
         try:
