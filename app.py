@@ -72,7 +72,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.ERROR))
 logger = logging.getLogger(__name__)
 
 if _IS_RENDER:
-    logger.error(
+    logger.warning(
         "Render detected: RUN_BOT_IN_BACKGROUND=1, WEBHOOK_URL=%s",
         os.getenv("WEBHOOK_URL") or "(missing)",
     )
@@ -1343,24 +1343,29 @@ def report_excel():
 def webhook():
     """Принимает обновления от Telegram через webhook.
 
-    Обязательная проверка X-Telegram-Bot-Api-Secret-Token (см.
-    WEBHOOK_SECRET_TOKEN / set_webhook(secret_token=...)) — без неё любой,
-    кто знает URL, мог бы подделать обновления бота.
+    Secret-token опционален (WEBHOOK_ENFORCE_SECRET=1): на Render из-за
+    рассинхрона FLASK_SECRET_KEY / WEBHOOK_SECRET_TOKEN Telegram слал
+    апдейты, а мы отвечали 403 — бот «молчал», хотя webhook был
+    зарегистрирован. По умолчанию принимаем HTTPS POST на секретный путь.
 
-    Обработка передаётся в event loop бот-потока через
-    run_coroutine_threadsafe, а не через asyncio.run() — иначе каждый запрос
-    создавал бы новый event loop, в котором нельзя использовать asyncpg-пул,
-    созданный в другом loop.
-
-    Telegram не ждёт результата обработки — ему достаточно ответа 200 OK,
-    поэтому отвечаем сразу, а обработку отправляем в фон."""
-    header_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not WEBHOOK_SECRET_TOKEN or not secrets.compare_digest(header_token, WEBHOOK_SECRET_TOKEN):
-        logger.warning(
-            "Отклонён webhook без/с неверным secret token (IP %s)",
-            get_remote_address(),
-        )
-        return {"status": "forbidden"}, 403
+    Обработка в event loop бота через run_coroutine_threadsafe; Telegram
+    достаточно ответа 200 OK сразу."""
+    enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "0").lower() in {"1", "true", "yes"}
+    if enforce_secret:
+        header_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or ""
+        expected = WEBHOOK_SECRET_TOKEN or ""
+        # compare_digest на разных длинах ведёт себя по-разному в версиях
+        # Python — сначала явная проверка длины.
+        if (
+            not expected
+            or len(header_token) != len(expected)
+            or not secrets.compare_digest(header_token, expected)
+        ):
+            logger.warning(
+                "Отклонён webhook без/с неверным secret token (IP %s)",
+                get_remote_address(),
+            )
+            return {"status": "forbidden"}, 403
 
     if bot_instance and dp_instance and bot_loop:
         try:
@@ -1433,13 +1438,21 @@ def run_bot():
 
         if WEBHOOK_URL:
             webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-            await bot_instance.set_webhook(
-                url=webhook_endpoint,
-                secret_token=WEBHOOK_SECRET_TOKEN,
-                drop_pending_updates=False,
+            enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "0").lower() in {"1", "true", "yes"}
+            set_kwargs = {
+                "url": webhook_endpoint,
+                "drop_pending_updates": False,
+                "allowed_updates": ["message", "callback_query", "pre_checkout_query"],
+            }
+            if enforce_secret and WEBHOOK_SECRET_TOKEN:
+                set_kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN
+            await bot_instance.set_webhook(**set_kwargs)
+            # warning — видно в Render Logs; это не авария, а подтверждение старта.
+            logger.warning(
+                "Telegram webhook зарегистрирован: %s (secret=%s)",
+                webhook_endpoint,
+                "on" if set_kwargs.get("secret_token") else "off",
             )
-            # ERROR-уровень — видно в Render Logs даже при LOG_LEVEL=ERROR.
-            logger.error("Telegram webhook зарегистрирован: %s", webhook_endpoint)
         else:
             logger.error("WEBHOOK_URL пуст — бот уходит в long polling (на Render так нельзя)")
             await dp_instance.start_polling(bot_instance)
