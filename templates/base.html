@@ -158,38 +158,100 @@
         }
         @media (max-width: 980px) {
             nav {
-                padding: 14px 16px;
+                padding: 12px 14px;
                 gap: 8px;
             }
             .nav-toggle {
                 display: inline-flex;
+                width: 44px;
+                height: 44px;
             }
             .nav-links {
                 display: none;
                 width: 100%;
                 order: 4;
                 flex-direction: column;
-                align-items: flex-start;
+                align-items: stretch;
                 padding-top: 10px;
                 border-top: 1px solid rgba(255,255,255,0.12);
+                gap: 4px;
             }
             .nav-links.open {
                 display: flex;
             }
+            .nav-links a {
+                width: 100%;
+                padding: 12px 14px;
+                border-radius: 12px;
+                font-size: 15px;
+            }
             .nav-actions {
                 margin-left: 0;
-                margin-right: 8px;
+                margin-right: 4px;
+            }
+            nav .brand {
+                font-size: 14px;
+                white-space: normal;
+                line-height: 1.25;
+            }
+            nav .brand-block {
+                padding: 8px 12px;
+                max-width: calc(100% - 100px);
             }
         }
         @media (max-width: 640px) {
             .nav-actions {
-                width: 100%;
+                width: auto;
                 justify-content: flex-end;
-                margin-top: 4px;
+                margin-top: 0;
             }
             .container {
-                padding: 0 14px;
+                margin: 14px auto 24px;
+                padding: 0 12px;
+                padding-left: max(12px, env(safe-area-inset-left));
+                padding-right: max(12px, env(safe-area-inset-right));
+                padding-bottom: max(24px, env(safe-area-inset-bottom));
             }
+            h1 { font-size: 20px; margin-bottom: 12px; }
+            .card, .stat-card { padding: 14px; border-radius: 16px; }
+            .stats-grid {
+                grid-template-columns: 1fr;
+                gap: 10px;
+            }
+            .top-actions {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .top-actions .btn,
+            .btn {
+                width: 100%;
+                text-align: center;
+                padding: 12px 14px;
+                font-size: 15px;
+                min-height: 44px;
+            }
+            form {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            select, input, textarea {
+                width: 100%;
+                max-width: 100%;
+                font-size: 16px; /* iOS не зумит поля */
+                min-height: 44px;
+                padding: 12px;
+            }
+            th, td { padding: 10px 10px; font-size: 13px; }
+            .table-scroll {
+                margin: 0 -4px;
+                border-radius: 12px;
+                border: 1px solid var(--border);
+            }
+            .table-scroll table {
+                min-width: 520px;
+            }
+            .flash { font-size: 14px; }
         }
         .theme-toggle {
             display: none;
@@ -262,11 +324,7 @@
             min-width: 560px;
         }
         @media (max-width: 600px) {
-            h1 { font-size: 20px; }
-            .card, .stat-card { padding: 14px; border-radius: 16px; }
-            th, td { padding: 9px 10px; font-size: 13px; }
-            .btn { padding: 7px 12px; font-size: 13px; }
-            .container { margin: 18px auto 28px; }
+            /* подробные mobile-правила выше в блоке 640px */
         }
         @keyframes pageEnter {
             from { opacity: 0; transform: translateY(10px); }
