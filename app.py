@@ -46,24 +46,31 @@ import database as db
 
 import threading
 import asyncio
+import time
 from aiogram import Bot, Dispatcher
 from aiogram.types import Update
 from aiogram.fsm.storage.memory import MemoryStorage
 
 load_dotenv()
 
-# Render (и похожие PaaS) задают RENDER / RENDER_EXTERNAL_URL. На ноутбуке
-# бот засыпает вместе с крышкой — в облаке он должен работать сам: фоновый
-# поток + webhook на публичный HTTPS URL сервиса.
+# Render (и похожие PaaS) задают RENDER / RENDER_EXTERNAL_URL.
 _IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
 if _IS_RENDER:
-    # Всегда включаем бота на Render (явный 0 больше не глушит деплой молча).
-    os.environ["RUN_BOT_IN_BACKGROUND"] = "1"
     os.environ.setdefault("SESSION_COOKIE_SECURE", "1")
-    if not (os.getenv("WEBHOOK_URL") or "").strip():
-        _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
-        if _external:
-            os.environ["WEBHOOK_URL"] = _external
+    # Меньше соединений = меньше RAM (иначе gunicorn WORKER TIMEOUT / SIGKILL OOM
+    # на free-инстансе ~512MB, когда CRM+бот+два пула живут в одном процессе).
+    os.environ.setdefault("DB_POOL_MIN_SIZE", "1")
+    os.environ.setdefault("DB_POOL_MAX_SIZE", "4")
+    os.environ.setdefault("ASYNC_DB_POOL_MIN_SIZE", "1")
+    os.environ.setdefault("ASYNC_DB_POOL_MAX_SIZE", "3")
+    # Бот в том же web-процессе по умолчанию (отдельный Background Worker на
+    # free Render часто недоступен). Явно RUN_BOT_IN_BACKGROUND=0 — только CRM.
+    os.environ.setdefault("RUN_BOT_IN_BACKGROUND", "1")
+    if os.getenv("RUN_BOT_IN_BACKGROUND", "1").lower() in {"1", "true", "yes"}:
+        if not (os.getenv("WEBHOOK_URL") or "").strip():
+            _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+            if _external:
+                os.environ["WEBHOOK_URL"] = _external
 
 # По умолчанию в логах остаются только ошибки — уровень можно поднять через
 # .env (LOG_LEVEL=INFO/DEBUG), например для отладки на staging.
@@ -73,7 +80,8 @@ logger = logging.getLogger(__name__)
 
 if _IS_RENDER:
     logger.warning(
-        "Render detected: RUN_BOT_IN_BACKGROUND=1, WEBHOOK_URL=%s",
+        "Render: RUN_BOT_IN_BACKGROUND=%s WEBHOOK_URL=%s",
+        os.getenv("RUN_BOT_IN_BACKGROUND"),
         os.getenv("WEBHOOK_URL") or "(missing)",
     )
 
@@ -1496,9 +1504,18 @@ def start_background_services():
     if os.getenv("RUN_BOT_IN_BACKGROUND", "0").lower() in {"0", "false", "no"}:
         return
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True, name="padel-bot")
+    def _start():
+        # Даём gunicorn пометить worker ready и не ловить WORKER TIMEOUT,
+        # пока бот поднимает asyncpg-пул + set_webhook (холодный Neon).
+        time.sleep(float(os.getenv("BOT_START_DELAY_SECONDS", "3")))
+        try:
+            run_bot()
+        except Exception:
+            logger.exception("Фоновый поток бота завершился с ошибкой")
+
+    bot_thread = threading.Thread(target=_start, daemon=True, name="padel-bot")
     bot_thread.start()
-    logger.info("Бот запущен в фоновом режиме")
+    logger.warning("Бот: фоновый поток запланирован (delay=%ss)", os.getenv("BOT_START_DELAY_SECONDS", "3"))
 
 
 def _run_cleanup_job():

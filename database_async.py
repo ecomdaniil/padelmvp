@@ -71,13 +71,10 @@ async def get_pool() -> asyncpg.Pool:
             _pool = await asyncpg.create_pool(
                 dsn=dsn,
                 ssl=ssl_option,
-                # min_size=2 держит пару соединений всегда открытыми, чтобы
-                # обычный запрос не платил цену TCP+TLS хендшейка с БД
-                # (нередко 100-300 мс на управляемых Postgres-провайдерах),
-                # который иначе случался бы при каждом "холодном" всплеске
-                # активности после периода простоя.
-                min_size=2,
-                max_size=10,
+                # На Render free держим min_size=1 — иначе CRM+бот+два пула
+                # легко ловят SIGKILL OOM (~512MB).
+                min_size=int(os.getenv("ASYNC_DB_POOL_MIN_SIZE", "2")),
+                max_size=int(os.getenv("ASYNC_DB_POOL_MAX_SIZE", "10")),
                 command_timeout=10,
             )
     return _pool
