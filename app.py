@@ -57,20 +57,16 @@ load_dotenv()
 _IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
 if _IS_RENDER:
     os.environ.setdefault("SESSION_COOKIE_SECURE", "1")
-    # Меньше соединений = меньше RAM (иначе gunicorn WORKER TIMEOUT / SIGKILL OOM
-    # на free-инстансе ~512MB, когда CRM+бот+два пула живут в одном процессе).
     os.environ.setdefault("DB_POOL_MIN_SIZE", "1")
     os.environ.setdefault("DB_POOL_MAX_SIZE", "4")
     os.environ.setdefault("ASYNC_DB_POOL_MIN_SIZE", "1")
     os.environ.setdefault("ASYNC_DB_POOL_MAX_SIZE", "3")
-    # Бот в том же web-процессе по умолчанию (отдельный Background Worker на
-    # free Render часто недоступен). Явно RUN_BOT_IN_BACKGROUND=0 — только CRM.
-    os.environ.setdefault("RUN_BOT_IN_BACKGROUND", "1")
-    if os.getenv("RUN_BOT_IN_BACKGROUND", "1").lower() in {"1", "true", "yes"}:
-        if not (os.getenv("WEBHOOK_URL") or "").strip():
-            _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
-            if _external:
-                os.environ["WEBHOOK_URL"] = _external
+    # Всегда включаем бота на web-сервисе Render (иначе bot_ready=false).
+    os.environ["RUN_BOT_IN_BACKGROUND"] = "1"
+    if not (os.getenv("WEBHOOK_URL") or "").strip():
+        _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+        if _external:
+            os.environ["WEBHOOK_URL"] = _external
 
 # По умолчанию в логах остаются только ошибки — уровень можно поднять через
 # .env (LOG_LEVEL=INFO/DEBUG), например для отладки на staging.
@@ -295,6 +291,23 @@ GAME_LEVELS = ["Новичок", "Любитель", "Продвинутый", "
 bot_instance = None
 dp_instance = None
 bot_loop = None
+bot_start_error = None
+_bot_services_started = False
+_bot_services_lock = threading.Lock()
+
+
+def get_bot_health() -> dict:
+    loop_running = bool(bot_loop is not None and getattr(bot_loop, "is_running", lambda: False)())
+    ready = bool(bot_instance and dp_instance and loop_running and not bot_start_error)
+    return {
+        "bot_ready": ready,
+        "bot_error": bot_start_error,
+        "bot_thread_started": _bot_services_started,
+        "bot_loop_running": loop_running,
+        "run_bot_flag": os.getenv("RUN_BOT_IN_BACKGROUND"),
+        "webhook_url": os.getenv("WEBHOOK_URL") or None,
+        "has_bot_token": bool(BOT_TOKEN),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -583,13 +596,10 @@ def index():
 
 @app.route("/health")
 def health_check():
-    """Публичный health для Render/uptime-cron. bot_ready=false значит
-    фоновый бот не поднялся (токен/БД/webhook) — CRM при этом может жить."""
-    return {
-        "status": "ok",
-        "bot_ready": bool(bot_instance and dp_instance and bot_loop),
-        "webhook_path": WEBHOOK_PATH,
-    }, 200
+    """Публичный health для Render/uptime-cron."""
+    payload = {"status": "ok", "webhook_path": WEBHOOK_PATH}
+    payload.update(get_bot_health())
+    return payload, 200
 
 
 @app.route("/api/activity")
@@ -1397,22 +1407,23 @@ def webhook():
 
 
 def run_bot():
-    """Запускает Telegram-бота в отдельном потоке с собственным event loop.
-
-    Loop живёт всё время работы процесса (run_forever в режиме webhook), это
-    позволяет Flask-обработчику webhook() безопасно передавать в него корутины
-    через run_coroutine_threadsafe и использовать один и тот же asyncpg-пул."""
-    global bot_instance, dp_instance, bot_loop
+    """Запускает Telegram-бота в отдельном потоке с собственным event loop."""
+    global bot_instance, dp_instance, bot_loop, bot_start_error
 
     from apscheduler.schedulers.background import BackgroundScheduler
     from bot import router, send_reminders, setup_bot_commands
     import database_async as db_async
 
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    bot_start_error = None
+    WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     bot_loop = loop
+
+    if not BOT_TOKEN:
+        bot_start_error = "BOT_TOKEN не задан"
+        raise RuntimeError(bot_start_error)
 
     bot_instance = Bot(token=BOT_TOKEN)
     dp_instance = Dispatcher(storage=MemoryStorage())
@@ -1421,9 +1432,6 @@ def run_bot():
     scheduler = BackgroundScheduler()
 
     def _reminders_job():
-        # BackgroundScheduler работает в СВОЁМ отдельном потоке — не может
-        # напрямую вызвать async send_reminders(), поэтому передаём корутину
-        # в event loop бота (см. bot.py:_make_reminder_job — тот же приём).
         future = asyncio.run_coroutine_threadsafe(send_reminders(bot_instance), loop)
         try:
             future.result(timeout=60)
@@ -1431,21 +1439,15 @@ def run_bot():
             logger.error("Ошибка задачи напоминаний: %s", e)
 
     async def _startup():
-        if not BOT_TOKEN:
-            raise RuntimeError("BOT_TOKEN не задан — бот на Render не запустится")
         await db_async.get_pool()
-        # Держит БД "тёплой", чтобы /start и первое сообщение после паузы
-        # не ждали холодный старт Neon (~5с) — см. database_async.py:keepalive_loop.
         asyncio.create_task(db_async.keepalive_loop())
         await setup_bot_commands(bot_instance)
 
-        # Интервал 15 минут — чтобы надёжно попадать в более узкое окно
-        # 2-часового напоминания (1ч45м-2ч15м), см. send_reminders в bot.py.
         scheduler.add_job(_reminders_job, "interval", minutes=15)
         scheduler.start()
 
         if WEBHOOK_URL:
-            webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
+            webhook_endpoint = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
             enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "0").lower() in {"1", "true", "yes"}
             set_kwargs = {
                 "url": webhook_endpoint,
@@ -1455,67 +1457,65 @@ def run_bot():
             if enforce_secret and WEBHOOK_SECRET_TOKEN:
                 set_kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN
             await bot_instance.set_webhook(**set_kwargs)
-            # warning — видно в Render Logs; это не авария, а подтверждение старта.
             logger.warning(
                 "Telegram webhook зарегистрирован: %s (secret=%s)",
                 webhook_endpoint,
                 "on" if set_kwargs.get("secret_token") else "off",
             )
         else:
-            logger.error("WEBHOOK_URL пуст — бот уходит в long polling (на Render так нельзя)")
+            logger.warning("WEBHOOK_URL пуст — long polling")
+            await bot_instance.delete_webhook(drop_pending_updates=False)
             await dp_instance.start_polling(bot_instance)
 
     try:
         loop.run_until_complete(_startup())
         if WEBHOOK_URL:
-            # В режиме long polling start_polling уже блокирует навсегда;
-            # в режиме webhook держим loop живым для feed_webhook_update.
+            logger.warning("Bot event loop run_forever()")
             loop.run_forever()
     except Exception as e:
-        logger.exception("Ошибка запуска бота (CRM может работать, бот — нет): %s", e)
+        bot_start_error = f"{type(e).__name__}: {e}"
+        logger.exception("Ошибка запуска бота: %s", e)
     finally:
         scheduler.shutdown(wait=False)
         try:
-            loop.run_until_complete(db_async.close_pool())
+            if not loop.is_closed():
+                loop.run_until_complete(db_async.close_pool())
         except Exception:
             pass
-        loop.close()
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
 
 
 def start_background_services():
-    """Запускает бота в фоне только если явно разрешено в .env.
+    """Запускает бота в worker-процессе. Idempotent (gunicorn post_worker_init)."""
+    global _bot_services_started, bot_start_error
 
-    Раньше здесь была проверка `if __name__ != "__main__": return`, из-за
-    которой фоновый бот фактически НИКОГДА не запускался под gunicorn
-    (gunicorn импортирует модуль как "app", а не выполняет его как скрипт,
-    поэтому __name__ всегда отличен от "__main__") — то есть
-    RUN_BOT_IN_BACKGROUND=1 из .env.example/deploy.md под gunicorn ничего
-    не делал, и webhook отвечал {"status": "bot not ready"}.
-
-    ВАЖНО про несколько gunicorn worker-процессов: каждый worker — это
-    отдельный процесс со своей памятью, поэтому при --workers>1 в каждом из
-    них поднимется собственный поток бота, свой APScheduler (напоминания
-    будут слаться по разу от каждого воркера) и свой in-memory кэш (см.
-    cache.py). Поэтому при RUN_BOT_IN_BACKGROUND=1 нужно либо запускать
-    gunicorn с --workers 1 (см. docker-compose.yml), либо переносить бота в
-    отдельный сервис/процесс (RUN_BOT_IN_BACKGROUND=0 + отдельный `python
-    bot.py`), и в обоих случаях — задавать REDIS_URL, если процессов больше
-    одного, чтобы кэш и rate-limit были общими."""
     if os.getenv("RUN_BOT_IN_BACKGROUND", "0").lower() in {"0", "false", "no"}:
+        bot_start_error = "RUN_BOT_IN_BACKGROUND выключен"
+        logger.warning("Бот не стартует: %s", bot_start_error)
         return
 
+    with _bot_services_lock:
+        if _bot_services_started:
+            return
+        _bot_services_started = True
+
     def _start():
-        # Даём gunicorn пометить worker ready и не ловить WORKER TIMEOUT,
-        # пока бот поднимает asyncpg-пул + set_webhook (холодный Neon).
-        time.sleep(float(os.getenv("BOT_START_DELAY_SECONDS", "3")))
+        delay = float(os.getenv("BOT_START_DELAY_SECONDS", "0"))
+        if delay > 0:
+            time.sleep(delay)
         try:
             run_bot()
-        except Exception:
+        except Exception as e:
+            global bot_start_error
+            bot_start_error = f"{type(e).__name__}: {e}"
             logger.exception("Фоновый поток бота завершился с ошибкой")
 
-    bot_thread = threading.Thread(target=_start, daemon=True, name="padel-bot")
-    bot_thread.start()
-    logger.warning("Бот: фоновый поток запланирован (delay=%ss)", os.getenv("BOT_START_DELAY_SECONDS", "3"))
+    threading.Thread(target=_start, daemon=True, name="padel-bot").start()
+    logger.warning("Бот: фоновый поток запущен")
 
 
 def _run_cleanup_job():
@@ -1574,12 +1574,19 @@ def start_cleanup_scheduler():
 # ждала бы холодный старт Neon.
 db.start_keepalive_thread()
 
-start_background_services()
+# Под gunicorn бота стартует gunicorn.conf.py:post_worker_init (в worker).
+# При `python app.py` — стартуем здесь.
 _cleanup_scheduler = start_cleanup_scheduler()
+if os.getenv("GUNICORN_PID") is None and __name__ == "__main__":
+    # ниже app.run — старт бота в __main__ блоке
+    pass
+elif os.getenv("GUNICORN_PID") is None and not _IS_RENDER:
+    start_background_services()
 
 if __name__ == '__main__':
     # Локально по умолчанию только localhost; на PaaS (Render и т.п.) задайте
     # HOST=0.0.0.0. Debug — только через FLASK_DEBUG=1.
+    start_background_services()
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", 5000))
     app.run(host=host, port=port, debug=app.debug)
