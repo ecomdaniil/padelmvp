@@ -61,8 +61,12 @@ if _IS_RENDER:
     os.environ.setdefault("DB_POOL_MAX_SIZE", "4")
     os.environ.setdefault("ASYNC_DB_POOL_MIN_SIZE", "1")
     os.environ.setdefault("ASYNC_DB_POOL_MAX_SIZE", "3")
-    # Всегда включаем бота на web-сервисе Render (иначе bot_ready=false).
-    os.environ["RUN_BOT_IN_BACKGROUND"] = "1"
+    # Бот по умолчанию включён, но можно выключить RUN_BOT_IN_BACKGROUND=0
+    # на Render Dashboard, если нужен только CRM (восстановление после OOM).
+    os.environ.setdefault("RUN_BOT_IN_BACKGROUND", "1")
+    # Дать gunicorn ответить на /health до тяжёлого старта aiogram+asyncpg —
+    # иначе Render health check / cron висят на белом экране.
+    os.environ.setdefault("BOT_START_DELAY_SECONDS", "25")
     if not (os.getenv("WEBHOOK_URL") or "").strip():
         _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
         if _external:
@@ -595,8 +599,9 @@ def index():
 
 
 @app.route("/health")
+@limiter.exempt
 def health_check():
-    """Публичный health для Render/uptime-cron."""
+    """Публичный health для Render/uptime-cron. Без БД и без блокировок."""
     payload = {"status": "ok", "webhook_path": WEBHOOK_PATH}
     payload.update(get_bot_health())
     return payload, 200
@@ -1489,9 +1494,33 @@ def run_bot():
             pass
 
 
+_infra_started = False
+_infra_lock = threading.Lock()
+_cleanup_scheduler = None
+
+
+def start_infra_services():
+    """Keepalive БД + ежедневная очистка. Не блокирует HTTP. Idempotent."""
+    global _infra_started, _cleanup_scheduler
+    with _infra_lock:
+        if _infra_started:
+            return
+        _infra_started = True
+    try:
+        db.start_keepalive_thread()
+    except Exception:
+        logger.exception("Не удалось запустить DB keepalive")
+    try:
+        _cleanup_scheduler = start_cleanup_scheduler()
+    except Exception:
+        logger.exception("Не удалось запустить cleanup scheduler")
+
+
 def start_background_services():
     """Запускает бота в worker-процессе. Idempotent (gunicorn post_worker_init)."""
     global _bot_services_started, bot_start_error
+
+    start_infra_services()
 
     if os.getenv("RUN_BOT_IN_BACKGROUND", "0").lower() in {"0", "false", "no"}:
         bot_start_error = "RUN_BOT_IN_BACKGROUND выключен"
@@ -1506,6 +1535,7 @@ def start_background_services():
     def _start():
         delay = float(os.getenv("BOT_START_DELAY_SECONDS", "0"))
         if delay > 0:
+            logger.warning("Бот: ждём %.0fс перед стартом (чтобы /health был жив)", delay)
             time.sleep(delay)
         try:
             run_bot()
@@ -1515,7 +1545,7 @@ def start_background_services():
             logger.exception("Фоновый поток бота завершился с ошибкой")
 
     threading.Thread(target=_start, daemon=True, name="padel-bot").start()
-    logger.warning("Бот: фоновый поток запущен")
+    logger.warning("Бот: фоновый поток запланирован")
 
 
 def _run_cleanup_job():
@@ -1568,20 +1598,13 @@ def start_cleanup_scheduler():
     return scheduler
 
 
-# Держит БД CRM "тёплой" независимо от того, запущен ли бот в этом же
-# процессе — тот же смысл, что и database_async.keepalive_loop() для бота
-# (см. её docstring): без этого первая страница CRM после долгого простоя
-# ждала бы холодный старт Neon.
-db.start_keepalive_thread()
-
-# Под gunicorn бота стартует gunicorn.conf.py:post_worker_init (в worker).
-# При `python app.py` — стартуем здесь.
-_cleanup_scheduler = start_cleanup_scheduler()
-if os.getenv("GUNICORN_PID") is None and __name__ == "__main__":
-    # ниже app.run — старт бота в __main__ блоке
-    pass
-elif os.getenv("GUNICORN_PID") is None and not _IS_RENDER:
-    start_background_services()
+# Keepalive/cleanup/бот НЕ стартуем при import — иначе под gunicorn worker
+# может зависнуть до bind, а Render healthCheckPath=/health даст белый экран.
+# Старт: gunicorn.conf.py post_worker_init → start_infra/background_services,
+# либо python app.py ниже.
+if os.getenv("GUNICORN_PID") is None and not _IS_RENDER and __name__ != "__main__":
+    # Импорт модуля локально без gunicorn (редко) — поднимем infra без бота.
+    start_infra_services()
 
 if __name__ == '__main__':
     # Локально по умолчанию только localhost; на PaaS (Render и т.п.) задайте

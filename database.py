@@ -61,6 +61,9 @@ def _get_pool():
             _pool = psycopg2_pool.ThreadedConnectionPool(
                 DB_POOL_MIN_SIZE, DB_POOL_MAX_SIZE, DATABASE_URL,
                 cursor_factory=RealDictCursor,
+                # Не висим минутами, если Neon/сеть недоступны — иначе
+                # gunicorn worker не отвечает на /health и Render «белый экран».
+                connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
                 # TCP keepalive — чтобы Neon/прокси не роняли «тихие»
                 # соединения из пула между запросами CRM.
                 keepalives=1,

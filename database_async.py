@@ -76,6 +76,7 @@ async def get_pool() -> asyncpg.Pool:
                 min_size=int(os.getenv("ASYNC_DB_POOL_MIN_SIZE", "2")),
                 max_size=int(os.getenv("ASYNC_DB_POOL_MAX_SIZE", "10")),
                 command_timeout=10,
+                timeout=float(os.getenv("ASYNC_DB_CONNECT_TIMEOUT", "10")),
             )
     return _pool
 
