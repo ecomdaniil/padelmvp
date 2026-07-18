@@ -373,6 +373,15 @@ def _migrate_games_table(cur):
     cur.execute(
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS booked_places INTEGER NOT NULL DEFAULT 0;"
     )
+    # Предупреждение за 3ч и автоотмена за 1ч при недоборе состава.
+    cur.execute(
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS underfill_warn_3h_sent "
+        "BOOLEAN NOT NULL DEFAULT FALSE;"
+    )
+    cur.execute(
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS underfill_cancelled "
+        "BOOLEAN NOT NULL DEFAULT FALSE;"
+    )
 
 
 def _migrate_admin_logs_table(cur):
@@ -489,6 +498,14 @@ def _create_indexes(cur):
         cur.execute(statement)
 
 
+def _migrate_club_info_table(cur):
+    """admin_telegram_id — куда бот шлёт сообщения «Связаться с админом»
+    и уведомления о записях, если ADMIN_CHAT_ID в env не задан (часто на Render)."""
+    cur.execute(
+        "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS admin_telegram_id BIGINT;"
+    )
+
+
 def migrate_db():
     """Запускает миграции без пересоздания таблиц. Безопасно вызывать повторно."""
     conn = get_connection()
@@ -498,6 +515,7 @@ def migrate_db():
     _migrate_bookings_table(cur)
     _migrate_payments_table(cur)
     _migrate_admin_logs_table(cur)
+    _migrate_club_info_table(cur)
     _create_indexes(cur)
     conn.commit()
     cur.close()
@@ -2050,14 +2068,49 @@ def get_club_info():
     return info
 
 
-def update_club_info(name: str, description: str, contact_phone: str, contact_email: str = ""):
+def update_club_info(
+    name: str,
+    description: str,
+    contact_phone: str,
+    contact_email: str = "",
+    admin_telegram_id=None,
+):
+    """admin_telegram_id=None — не менять колонку; ''/0 — очистить."""
+    conn = get_connection()
+    cur = conn.cursor()
+    if admin_telegram_id is None:
+        cur.execute(
+            """UPDATE club_info
+               SET name = %s, description = %s, contact_phone = %s,
+                   contact_email = %s, updated_at = NOW()
+               WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
+            (name, description, contact_phone, contact_email),
+        )
+    else:
+        tid = None
+        if admin_telegram_id not in ("", 0, "0"):
+            tid = int(admin_telegram_id)
+        cur.execute(
+            """UPDATE club_info
+               SET name = %s, description = %s, contact_phone = %s,
+                   contact_email = %s, admin_telegram_id = %s, updated_at = NOW()
+               WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
+            (name, description, contact_phone, contact_email, tid),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def set_club_admin_telegram_id(telegram_id: int) -> None:
+    """Привязка Telegram ID админа из бота (/bindadmin) или CRM."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """UPDATE club_info
-           SET name = %s, description = %s, contact_phone = %s, contact_email = %s, updated_at = NOW()
+           SET admin_telegram_id = %s, updated_at = NOW()
            WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
-        (name, description, contact_phone, contact_email),
+        (int(telegram_id),),
     )
     conn.commit()
     cur.close()

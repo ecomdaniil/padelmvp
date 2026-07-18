@@ -231,6 +231,7 @@ async def get_upcoming_games_with_slots() -> list:
             GROUP BY game_id
         ) bk ON bk.game_id = g.id
         WHERE (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR}
+          AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
           AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) < g.total_slots
         ORDER BY g.game_date, g.game_time
         """
@@ -263,6 +264,7 @@ async def get_games_needing_reminder_24h() -> list:
         f"""
         SELECT * FROM games
         WHERE reminder_sent = FALSE
+          AND COALESCE(underfill_cancelled, FALSE) = FALSE
           AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '23 hours'
                                             AND {_LOCAL_NOW_EXPR} + INTERVAL '25 hours'
         """
@@ -279,11 +281,68 @@ async def get_games_needing_reminder_2h() -> list:
         f"""
         SELECT * FROM games
         WHERE reminder_2h_sent = FALSE
+          AND COALESCE(underfill_cancelled, FALSE) = FALSE
           AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '1 hour 45 minutes'
                                             AND {_LOCAL_NOW_EXPR} + INTERVAL '2 hours 15 minutes'
         """
     )
     return _to_dict_list(rows)
+
+
+_TAKEN_EXPR = (
+    "(COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0))"
+)
+
+
+async def _games_underfill_in_window(start_interval: str, end_interval: str, extra_where: str) -> list:
+    """Игры с недобором состава в заданном окне до старта (Москва)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        f"""
+        SELECT g.*,
+               LEAST({_TAKEN_EXPR}, g.total_slots) AS taken
+        FROM games g
+        LEFT JOIN (
+            SELECT game_id, SUM(slots_count) AS taken
+            FROM bookings
+            WHERE status != 'отменена'
+            GROUP BY game_id
+        ) bk ON bk.game_id = g.id
+        WHERE COALESCE(g.underfill_cancelled, FALSE) = FALSE
+          AND {_TAKEN_EXPR} < g.total_slots
+          AND {_TAKEN_EXPR} > 0
+          AND (g.game_date + g.game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '{start_interval}'
+                                            AND {_LOCAL_NOW_EXPR} + INTERVAL '{end_interval}'
+          AND {extra_where}
+        ORDER BY g.game_date, g.game_time
+        """
+    )
+    return _to_dict_list(rows)
+
+
+async def get_games_needing_underfill_warn_3h() -> list:
+    """За ~3 часа до старта: состав неполный — предупредить записавшихся."""
+    return await _games_underfill_in_window(
+        "2 hours 45 minutes",
+        "3 hours 15 minutes",
+        "COALESCE(g.underfill_warn_3h_sent, FALSE) = FALSE",
+    )
+
+
+async def get_games_needing_underfill_cancel_1h() -> list:
+    """За ~1 час до старта: состав всё ещё неполный — автоотмена + возврат."""
+    return await _games_underfill_in_window(
+        "45 minutes",
+        "1 hour 15 minutes",
+        "TRUE",
+    )
+
+
+async def mark_underfill_warn_3h_sent(game_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE games SET underfill_warn_3h_sent = TRUE WHERE id = $1", game_id
+    )
 
 
 async def mark_reminder_24h_sent(game_id: int) -> None:
@@ -334,6 +393,8 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
             if game is None:
                 return {"status": "not_found", "booking": None, "game": None}
             game_dict = _to_dict(game)
+            if game_dict.get("underfill_cancelled"):
+                return {"status": "not_found", "booking": None, "game": game_dict}
 
             # Нельзя записаться на уже начавшуюся/прошедшую игру (по Москве).
             still_upcoming = await conn.fetchval(
@@ -375,18 +436,147 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
 
 
 async def get_active_bookings_for_user(user_id: int) -> list:
+    """Только предстоящие (ещё не начавшиеся) незакрытые записи."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
-        SELECT b.*, g.game_date, g.game_time, g.location, g.price
+        f"""
+        SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots
         FROM bookings b
         JOIN games g ON g.id = b.game_id
-        WHERE b.user_id = $1 AND b.status != 'отменена'
+        WHERE b.user_id = $1
+          AND b.status != 'отменена'
+          AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+          AND (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR}
         ORDER BY g.game_date, g.game_time
         """,
         user_id,
     )
     return _to_dict_list(rows)
+
+
+async def get_past_bookings_for_user(user_id: int) -> list:
+    """Сыгранные / уже прошедшие игры (не отменённые записи)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        f"""
+        SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots
+        FROM bookings b
+        JOIN games g ON g.id = b.game_id
+        WHERE b.user_id = $1
+          AND b.status != 'отменена'
+          AND (g.game_date + g.game_time) < {_LOCAL_NOW_EXPR}
+        ORDER BY g.game_date DESC, g.game_time DESC
+        """,
+        user_id,
+    )
+    return _to_dict_list(rows)
+
+
+async def get_club_admin_telegram_id() -> Optional[int]:
+    """Telegram ID админа из CRM (club_info), если задан."""
+    pool = await get_pool()
+    value = await pool.fetchval(
+        """
+        SELECT admin_telegram_id FROM club_info
+        ORDER BY id DESC LIMIT 1
+        """
+    )
+    return int(value) if value is not None else None
+
+
+async def set_club_admin_telegram_id(telegram_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE club_info
+        SET admin_telegram_id = $1, updated_at = NOW()
+        WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)
+        """,
+        int(telegram_id),
+    )
+
+
+async def cancel_underfilled_game(game_id: int) -> dict:
+    """Автоотмена игры из‑за недобора: все активные брони → «отменена»,
+    подтверждённые оплаты → «возврат». Идемпотентно (повторный вызов — already).
+
+    Возвращает:
+      status: not_found | already | full | ok
+      game, cancelled: [{telegram_id, name, booking_id, refunded, amount}]
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            game = await conn.fetchrow(
+                "SELECT * FROM games WHERE id = $1 FOR UPDATE", game_id
+            )
+            if game is None:
+                return {"status": "not_found", "game": None, "cancelled": []}
+            if game["underfill_cancelled"]:
+                return {"status": "already", "game": _to_dict(game), "cancelled": []}
+
+            taken = await conn.fetchval(
+                """SELECT COALESCE(SUM(slots_count), 0) FROM bookings
+                   WHERE game_id = $1 AND status != 'отменена'""",
+                game_id,
+            )
+            effective = int(taken) + int(game["booked_places"] or 0)
+            if effective >= game["total_slots"]:
+                return {"status": "full", "game": _to_dict(game), "cancelled": []}
+
+            bookings = await conn.fetch(
+                """
+                SELECT b.id AS booking_id, u.telegram_id, u.name
+                FROM bookings b
+                JOIN users u ON u.id = b.user_id
+                WHERE b.game_id = $1 AND b.status != 'отменена'
+                FOR UPDATE OF b
+                """,
+                game_id,
+            )
+
+            cancelled = []
+            for row in bookings:
+                payment = await conn.fetchrow(
+                    """SELECT id, amount, status FROM payments
+                       WHERE booking_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                    row["booking_id"],
+                )
+                await conn.execute(
+                    "UPDATE bookings SET status = 'отменена' WHERE id = $1",
+                    row["booking_id"],
+                )
+                refunded = False
+                amount = None
+                if payment is not None and payment["status"] == "подтверждена":
+                    await conn.execute(
+                        "UPDATE payments SET status = 'возврат' WHERE id = $1",
+                        payment["id"],
+                    )
+                    refunded = True
+                    amount = float(payment["amount"]) if payment["amount"] is not None else None
+                elif payment is not None and payment["status"] == "ожидает":
+                    await conn.execute(
+                        "DELETE FROM payments WHERE id = $1 AND status = 'ожидает'",
+                        payment["id"],
+                    )
+                cancelled.append({
+                    "telegram_id": row["telegram_id"],
+                    "name": row["name"],
+                    "booking_id": row["booking_id"],
+                    "refunded": refunded,
+                    "amount": amount,
+                })
+
+            await conn.execute(
+                """UPDATE games
+                   SET underfill_cancelled = TRUE, underfill_warn_3h_sent = TRUE
+                   WHERE id = $1""",
+                game_id,
+            )
+            game_dict = _to_dict(game)
+            game_dict["underfill_cancelled"] = True
+            return {"status": "ok", "game": game_dict, "cancelled": cancelled, "taken": effective}
 
 
 async def get_booking_by_id(booking_id: int) -> Optional[dict]:

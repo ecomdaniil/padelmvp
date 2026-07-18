@@ -25,10 +25,11 @@ import html
 import logging
 import os
 import re
+import secrets
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -62,6 +63,7 @@ from bot_content import (
     BTN_GAMES,
     BTN_MAIN_MENU,
     BTN_MY_BOOKINGS,
+    BTN_PAST_GAMES,
     BTN_STATS,
     COACHES,
     MENU_BUTTONS,
@@ -70,7 +72,16 @@ from bot_content import (
 
 load_dotenv()
 
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+# ADMIN_CHAT_ID из env (можно несколько через запятую). Дополнительно —
+# club_info.admin_telegram_id из CRM / команды /bindadmin.
+_ADMIN_CHAT_IDS_ENV = [
+    part.strip()
+    for part in (os.getenv("ADMIN_CHAT_ID") or "").split(",")
+    if part.strip()
+]
+# Обратная совместимость: старый код и проверки читают «первый» id.
+ADMIN_CHAT_ID = _ADMIN_CHAT_IDS_ENV[0] if _ADMIN_CHAT_IDS_ENV else None
+ADMIN_BIND_TOKEN = (os.getenv("ADMIN_BIND_TOKEN") or "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 _FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY") or ""
@@ -232,8 +243,8 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_GAMES), KeyboardButton(text=BTN_MY_BOOKINGS)],
-            [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_COACHES)],
-            [KeyboardButton(text=BTN_ABOUT_PADEL)],
+            [KeyboardButton(text=BTN_PAST_GAMES), KeyboardButton(text=BTN_STATS)],
+            [KeyboardButton(text=BTN_COACHES), KeyboardButton(text=BTN_ABOUT_PADEL)],
             [KeyboardButton(text=BTN_CONTACT_ADMIN)],
             [KeyboardButton(text=BTN_MAIN_MENU)],
         ],
@@ -291,11 +302,57 @@ def _html(value) -> str:
     return html.escape(str(value), quote=False)
 
 
-def _is_admin_user(user_id: Optional[int]) -> bool:
-    """Только личный ADMIN_CHAT_ID может отвечать игрокам от имени клуба."""
-    if not ADMIN_CHAT_ID or user_id is None:
+async def _resolve_admin_chat_ids() -> List[int]:
+    """Список chat_id админов: env ADMIN_CHAT_ID + club_info.admin_telegram_id."""
+    ids: List[int] = []
+    for raw in _ADMIN_CHAT_IDS_ENV:
+        try:
+            ids.append(int(raw))
+        except ValueError:
+            logger.error("ADMIN_CHAT_ID содержит нечисловое значение: %r", raw)
+    try:
+        db_id = await db.get_club_admin_telegram_id()
+        if db_id is not None:
+            ids.append(int(db_id))
+    except Exception as e:
+        logger.error("Не удалось прочитать admin_telegram_id из БД: %s", e)
+    # уникальные, порядок сохраняем
+    seen = set()
+    unique = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            unique.append(i)
+    return unique
+
+
+async def _is_admin_user(user_id: Optional[int]) -> bool:
+    """Только личный telegram id админа может отвечать игрокам от имени клуба."""
+    if user_id is None:
         return False
-    return str(user_id) == str(ADMIN_CHAT_ID)
+    admin_ids = await _resolve_admin_chat_ids()
+    return int(user_id) in admin_ids
+
+
+async def _send_admin_message(bot: Bot, text: str, **kwargs) -> Optional[Any]:
+    """Шлёт сообщение всем известным админам. Возвращает первое успешное Message."""
+    admin_ids = await _resolve_admin_chat_ids()
+    if not admin_ids:
+        logger.warning("Нет ADMIN_CHAT_ID / club_info.admin_telegram_id — сообщение админу пропущено")
+        return None
+    first_ok = None
+    last_error = None
+    for chat_id in admin_ids:
+        try:
+            sent = await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            if first_ok is None:
+                first_ok = sent
+        except Exception as e:
+            last_error = e
+            logger.error("Не удалось отправить сообщение админу %s: %s", chat_id, e)
+    if first_ok is None and last_error is not None:
+        raise last_error
+    return first_ok
 
 
 def _profile_keyboard() -> InlineKeyboardMarkup:
@@ -312,7 +369,8 @@ async def show_main_menu(message: Message, user: dict):
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         "Выберите раздел ниже для быстрого доступа:\n"
         "• 🎾 Игры — посмотреть и записаться\n"
-        "• 📋 Мои записи — посмотреть статус заявок\n"
+        "• 📋 Мои записи — предстоящие заявки\n"
+        "• 🏆 Сыгранные игры — история прошедших игр\n"
         "• 📊 Моя статистика — оценить активность\n"
         "• 💬 Связаться с администратором — задать вопрос",
         reply_markup=main_menu_keyboard(),
@@ -788,7 +846,7 @@ async def _show_games(
 
 
 async def _show_my_bookings(message: Message):
-    """Показывает активные записи пользователя."""
+    """Показывает предстоящие (ещё не начавшиеся) записи пользователя."""
     user = await _require_registered(message.from_user.id)
     if not user:
         await message.answer(
@@ -801,8 +859,8 @@ async def _show_my_bookings(message: Message):
     bookings = await db.get_active_bookings_for_user(user["id"])
     if not bookings:
         await message.answer(
-            "📋 У тебя пока нет активных записей.\n\n"
-            "Посмотри доступные игры в разделе «🎾 Игры»",
+            "📋 У тебя нет предстоящих записей.\n\n"
+            "Посмотри доступные игры в «🎾 Игры» или историю в «🏆 Сыгранные игры».",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -810,7 +868,7 @@ async def _show_my_bookings(message: Message):
     await message.answer(
         "📋 <b>Твои записи</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Нажми «Отменить», если не сможешь прийти:",
+        "Только предстоящие игры. Нажми «Отменить», если не сможешь прийти:",
         parse_mode="HTML",
     )
 
@@ -827,13 +885,60 @@ async def _show_my_bookings(message: Message):
         ])
         return text, keyboard
 
-    # Как и в _show_games, отправляем карточки конкурентно, а не по одной,
-    # оборачивая каждый answer() в настоящую корутину (см. _send_answer).
     sends = [_send_answer(message, *_booking_card(b)) for b in bookings]
     results = await asyncio.gather(*sends, return_exceptions=True)
     for b, result in zip(bookings, results):
         if isinstance(result, Exception):
             logger.error("Не удалось отправить карточку записи #%s: %s", b.get("id"), result)
+
+
+async def _show_past_bookings(message: Message):
+    """История сыгранных / уже прошедших игр."""
+    user = await _require_registered(message.from_user.id)
+    if not user:
+        await message.answer(
+            "❌ Сначала заполни анкету.\n"
+            "Отправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    bookings = await db.get_past_bookings_for_user(user["id"])
+    if not bookings:
+        await message.answer(
+            "🏆 Пока нет сыгранных игр.\n\n"
+            "После первой прошедшей игры она появится здесь.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "🏆 <b>Сыгранные игры</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "История прошедших записей:",
+        parse_mode="HTML",
+    )
+
+    def _past_card(b: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+        if b["status"] == "посещена":
+            status_line = "✅ Посещена"
+        elif b["status"] == "подтверждена":
+            status_line = "📌 Подтверждена"
+        else:
+            status_line = f"📌 {b['status']}"
+        text = (
+            f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
+            f"📍 {b['location']}\n"
+            f"👥 Мест: {b.get('slots_count', 1)}\n"
+            f"{status_line}"
+        )
+        return text, None
+
+    sends = [_send_answer(message, *_past_card(b)) for b in bookings]
+    results = await asyncio.gather(*sends, return_exceptions=True)
+    for b, result in zip(bookings, results):
+        if isinstance(result, Exception):
+            logger.error("Не удалось отправить карточку сыгранной игры #%s: %s", b.get("id"), result)
 
 
 def _format_statistics(stats: dict) -> str:
@@ -880,6 +985,11 @@ async def menu_games(message: Message):
 @router.message(F.text == BTN_MY_BOOKINGS)
 async def menu_my_bookings(message: Message):
     await _show_my_bookings(message)
+
+
+@router.message(F.text == BTN_PAST_GAMES)
+async def menu_past_games(message: Message):
+    await _show_past_bookings(message)
 
 
 @router.message(F.text == BTN_ABOUT_PADEL)
@@ -957,6 +1067,35 @@ async def show_coach_detail(callback: CallbackQuery):
     )
 
 
+@router.message(Command("bindadmin"))
+async def cmd_bindadmin(message: Message):
+    """Привязка Telegram ID админа: /bindadmin <токен из ADMIN_BIND_TOKEN>.
+    Нужно, если на Render не задан ADMIN_CHAT_ID и связь с админом «недоступна»."""
+    parts = (message.text or "").split(maxsplit=1)
+    token = parts[1].strip() if len(parts) > 1 else ""
+    if not ADMIN_BIND_TOKEN:
+        await message.answer(
+            "Привязка через бота выключена. Укажи ADMIN_CHAT_ID в env "
+            "или Telegram ID в CRM → «О клубе»."
+        )
+        return
+    if not token or not secrets.compare_digest(token, ADMIN_BIND_TOKEN):
+        await message.answer("❌ Неверный токен.")
+        return
+    try:
+        await db.set_club_admin_telegram_id(message.from_user.id)
+    except Exception as e:
+        logger.error("bindadmin failed: %s", e)
+        await message.answer("❌ Не удалось сохранить. Попробуй позже.")
+        return
+    await message.answer(
+        f"✅ Готово. Твой Telegram ID <code>{message.from_user.id}</code> "
+        "сохранён как администратор бота.\n"
+        "Теперь «Связаться с администратором» будет работать.",
+        parse_mode="HTML",
+    )
+
+
 @router.message(F.text == BTN_CONTACT_ADMIN)
 @router.message(Command("help"))
 async def menu_contact_admin(message: Message, state: FSMContext):
@@ -1005,41 +1144,42 @@ async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
     user_message = message.text.strip()
     await state.clear()
 
-    if ADMIN_CHAT_ID:
-        admin_text = (
-            "💬 <b>Сообщение от игрока (/help)</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 {_html(user['name'])}\n"
-            f"📞 {_html(user['phone'])}\n"
-            f"🆔 Telegram ID: {message.from_user.id}\n\n"
-            f"📝 {_html(user_message)}"
-        )
-        # Кнопка «Ответить» — нажатие запускает FSM-диалог AdminReply прямо
-        # в чате администратора (см. admin_reply_start/admin_reply_send):
-        # он пишет обычный текст, бот сам находит нужного игрока по
-        # telegram_id, зашитому в callback_data, и пересылает ответ.
-        admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply_to:{message.from_user.id}")]
-        ])
-        try:
-            await bot.send_message(
-                ADMIN_CHAT_ID, admin_text, parse_mode="HTML", reply_markup=admin_keyboard
-            )
-            await message.answer(
-                "✅ Сообщение отправлено администратору!\n\n"
-                "Ответ придёт в этот чат.",
-                reply_markup=main_menu_keyboard(),
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение админу: {e}")
-            await message.answer(
-                "❌ Не удалось отправить сообщение.\n"
-                "Попробуй позже.",
-                reply_markup=main_menu_keyboard(),
-            )
-    else:
+    admin_ids = await _resolve_admin_chat_ids()
+    if not admin_ids:
         await message.answer(
             "⚠️ Связь с администратором временно недоступна.\n\n"
+            "Администратору нужно указать свой Telegram ID в CRM "
+            "(«О клубе») или в переменной ADMIN_CHAT_ID на сервере.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    admin_text = (
+        "💬 <b>Сообщение от игрока (/help)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 {_html(user['name'])}\n"
+        f"📞 {_html(user['phone'])}\n"
+        f"🆔 Telegram ID: {message.from_user.id}\n\n"
+        f"📝 {_html(user_message)}"
+    )
+    # Кнопка «Ответить» — нажатие запускает FSM-диалог AdminReply прямо
+    # в чате администратора (см. admin_reply_start/admin_reply_send).
+    admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply_to:{message.from_user.id}")]
+    ])
+    try:
+        await _send_admin_message(
+            bot, admin_text, parse_mode="HTML", reply_markup=admin_keyboard
+        )
+        await message.answer(
+            "✅ Сообщение отправлено администратору!\n\n"
+            "Ответ придёт в этот чат.",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        logger.error("Не удалось отправить сообщение админу: %s", e)
+        await message.answer(
+            "❌ Не удалось отправить сообщение.\n"
             "Попробуй позже.",
             reply_markup=main_menu_keyboard(),
         )
@@ -1047,8 +1187,8 @@ async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("reply_to:"))
 async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
-    """Админ нажал «↩️ Ответить» — только ADMIN_CHAT_ID (личный telegram id)."""
-    if not _is_admin_user(callback.from_user.id):
+    """Админ нажал «↩️ Ответить» — только telegram id из списка админов."""
+    if not await _is_admin_user(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
     target_telegram_id = int(callback.data.split(":", 1)[1])
@@ -1064,7 +1204,7 @@ async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(StateFilter(AdminReply.waiting_for_reply))
 async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
-    if not _is_admin_user(message.from_user.id):
+    if not await _is_admin_user(message.from_user.id):
         await state.clear()
         await message.answer("❌ Недостаточно прав.")
         return
@@ -1119,10 +1259,6 @@ async def _notify_admin_new_booking(
     """Отправляет админу уведомление о новой записи игрока на корт и
     сохраняет message_id в bookings.admin_notify_message_id — при отмене
     до оплаты это сообщение удаляется (см. _delete_admin_booking_notify)."""
-    if not ADMIN_CHAT_ID:
-        logger.warning("ADMIN_CHAT_ID не задан — уведомление о записи пропущено")
-        return
-
     game_datetime = (
         f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
     )
@@ -1138,11 +1274,9 @@ async def _notify_admin_new_booking(
         f"🆔 ID заявки: {booking_id}"
     )
     try:
-        sent = await bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=notification_text,
-            parse_mode="HTML",
-        )
+        sent = await _send_admin_message(bot, notification_text, parse_mode="HTML")
+        if sent is None:
+            return
         try:
             await db.set_booking_admin_notify_message(booking_id, sent.message_id)
         except Exception as e:
@@ -1150,25 +1284,20 @@ async def _notify_admin_new_booking(
                 "Не удалось сохранить message_id уведомления для брони #%s: %s",
                 booking_id, e,
             )
-        logger.debug(
-            "Уведомление о записи #%s отправлено админу (игрок: %s, msg=%s)",
-            booking_id,
-            user["name"],
-            sent.message_id,
-        )
     except Exception as e:
         logger.error("Не удалось отправить уведомление админу о записи #%s: %s", booking_id, e)
 
 
 async def _delete_admin_booking_notify(bot: Bot, message_id: Optional[int]) -> None:
     """Удаляет у админа сообщение о записи, если бронь отменена до оплаты."""
-    if not ADMIN_CHAT_ID or not message_id:
+    if not message_id:
         return
-    try:
-        await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=message_id)
-    except Exception as e:
-        # Сообщение могли уже удалить вручную / слишком старое — не критично.
-        logger.debug("Не удалось удалить уведомление админу msg=%s: %s", message_id, e)
+    for chat_id in await _resolve_admin_chat_ids():
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            return
+        except Exception as e:
+            logger.debug("Не удалось удалить уведомление админу %s msg=%s: %s", chat_id, message_id, e)
 
 
 @router.message(Command("games"))
@@ -1527,26 +1656,24 @@ async def process_paid_notify(callback: CallbackQuery):
         "Администратор подтвердит её в ближайшее время."
     )
 
-    if ADMIN_CHAT_ID:
-        try:
-            display_name = user.get("name") or callback.from_user.full_name or "Игрок"
-            username = callback.from_user.username
-            username_part = f" (@{_html(username)})" if username else ""
-
-            await callback.bot.send_message(
-                ADMIN_CHAT_ID,
-                "💰 <b>Игрок сообщил об оплате</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Пользователь {_html(display_name)}{username_part} сообщил об оплате "
-                f"брони №{payment['booking_id']}\n\n"
-                f"🆔 Платёж #{payment_id}\n"
-                f"💳 Способ: {_html(payment.get('method') or '—')}\n"
-                f"💰 Сумма: {_html(payment['amount'])} ₽\n\n"
-                "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Не удалось уведомить админа об оплате #%s: %s", payment_id, e)
+    try:
+        display_name = user.get("name") or callback.from_user.full_name or "Игрок"
+        username = callback.from_user.username
+        username_part = f" (@{_html(username)})" if username else ""
+        await _send_admin_message(
+            callback.bot,
+            "💰 <b>Игрок сообщил об оплате</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Пользователь {_html(display_name)}{username_part} сообщил об оплате "
+            f"брони №{payment['booking_id']}\n\n"
+            f"🆔 Платёж #{payment_id}\n"
+            f"💳 Способ: {_html(payment.get('method') or '—')}\n"
+            f"💰 Сумма: {_html(payment['amount'])} ₽\n\n"
+            "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Не удалось уведомить админа об оплате #%s: %s", payment_id, e)
 
 
 @router.pre_checkout_query()
@@ -1613,14 +1740,13 @@ async def process_successful_payment(message: Message):
 
     await message.answer("✅ Оплата картой прошла успешно! Спасибо 🎾")
 
-    if ADMIN_CHAT_ID:
-        try:
-            await message.bot.send_message(
-                ADMIN_CHAT_ID,
-                f"💳 Оплата #{payment_id} подтверждена автоматически (Telegram Payments).",
-            )
-        except Exception as e:
-            logger.error("Не удалось уведомить админа об автооплате #%s: %s", payment_id, e)
+    try:
+        await _send_admin_message(
+            message.bot,
+            f"💳 Оплата #{payment_id} подтверждена автоматически (Telegram Payments).",
+        )
+    except Exception as e:
+        logger.error("Не удалось уведомить админа об автооплате #%s: %s", payment_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1652,22 +1778,21 @@ async def _notify_refund(callback: CallbackQuery, user: dict, booking_id: int, g
     username = callback.from_user.username
     username_part = f" (@{username})" if username else ""
 
-    if ADMIN_CHAT_ID:
-        try:
-            await callback.bot.send_message(
-                ADMIN_CHAT_ID,
-                "❌ <b>Отмена записи с возвратом оплаты</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Пользователь {user['name']}{username_part} отменил запись "
-                f"на корт (бронь №{booking_id}) более чем за 12 часов до начала\n\n"
-                f"📅 {game_dt}\n"
-                f"📍 {location}\n"
-                f"💰 К возврату: {amount:.0f} ₽\n\n"
-                "Статус оплаты изменён на «возврат» — оформите возврат средств игроку.",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Не удалось уведомить админа об отмене брони №%s: %s", booking_id, e)
+    try:
+        await _send_admin_message(
+            callback.bot,
+            "❌ <b>Отмена записи с возвратом оплаты</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Пользователь {_html(user['name'])}{username_part} отменил запись "
+            f"на корт (бронь №{booking_id}) более чем за 12 часов до начала\n\n"
+            f"📅 {_html(game_dt)}\n"
+            f"📍 {_html(location)}\n"
+            f"💰 К возврату: {amount:.0f} ₽\n\n"
+            "Статус оплаты изменён на «возврат» — оформите возврат средств игроку.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Не удалось уведомить админа об отмене брони №%s: %s", booking_id, e)
 
     description = (
         f"Возврат оплаты {amount:.0f} ₽ по брони №{booking_id}: пользователь "
@@ -1965,9 +2090,134 @@ async def _send_reminder_batch(
         await mark_sent(game["id"])
 
 
+async def _process_underfill_warnings(bot: Bot) -> None:
+    """За ~3 часа до игры: если состав неполный — предупредить записавшихся."""
+    games = await db.get_games_needing_underfill_warn_3h()
+    for game in games:
+        taken = int(game.get("taken") or 0)
+        total = int(game["total_slots"])
+        game_dt = f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+        text = (
+            "⚠️ <b>Набор на игру ещё не полный</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📅 {game_dt}\n"
+            f"📍 {_html(game['location'])}\n"
+            f"👥 Сейчас записано: <b>{taken}/{total}</b>\n\n"
+            "Если за <b>1 час</b> до начала не соберётся полный состав "
+            f"(<b>{total}/{total}</b>), запись <b>автоматически отменится</b>, "
+            "а оплатившим игрокам будет оформлен возврат.\n\n"
+            "Пригласи друзей или посмотри другие игры в разделе «🎾 Игры»."
+        )
+        participants = await db.get_participants_for_game(game["id"])
+        sends = [
+            bot.send_message(p["telegram_id"], text, parse_mode="HTML")
+            for p in participants
+        ]
+        results = await asyncio.gather(*sends, return_exceptions=True)
+        for p, result in zip(participants, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Не удалось отправить предупреждение о недоборе user=%s: %s",
+                    p["telegram_id"], result,
+                )
+        await db.mark_underfill_warn_3h_sent(game["id"])
+        try:
+            await _send_admin_message(
+                bot,
+                "⚠️ <b>Недобор на игру (за 3 часа)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📅 {game_dt}\n"
+                f"📍 {_html(game['location'])}\n"
+                f"👥 {taken}/{total}\n\n"
+                "Игрокам отправлено предупреждение. Если за час до старта "
+                "состав не станет полным — игра отменится автоматически.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить админа о недоборе игры #%s: %s", game["id"], e)
+
+
+async def _process_underfill_cancels(bot: Bot) -> None:
+    """За ~1 час до игры: если состав всё ещё неполный — отменить и вернуть оплату."""
+    games = await db.get_games_needing_underfill_cancel_1h()
+    for game in games:
+        result = await db.cancel_underfilled_game(game["id"])
+        if result["status"] != "ok":
+            continue
+        _invalidate_games_cache()
+        game_row = result["game"] or game
+        taken = int(result.get("taken") or game.get("taken") or 0)
+        total = int(game_row["total_slots"])
+        game_dt = (
+            f"{game_row['game_date'].strftime('%d.%m.%Y')} "
+            f"в {str(game_row['game_time'])[:5]}"
+        )
+        for item in result["cancelled"]:
+            if item["refunded"]:
+                amount = item["amount"]
+                amount_line = (
+                    f"\n💰 Возврат оплаты: <b>{amount:.0f} ₽</b> — "
+                    "средства вернутся в ближайшее время."
+                    if amount is not None else
+                    "\n💰 Возврат оплаты будет оформлен в ближайшее время."
+                )
+            else:
+                amount_line = ""
+            text = (
+                "❌ <b>Игра отменена: не собрался полный состав</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📅 {game_dt}\n"
+                f"📍 {_html(game_row['location'])}\n"
+                f"👥 Было записано: <b>{taken}/{total}</b>\n"
+                f"{amount_line}\n\n"
+                "Запишись на другую игру в разделе «🎾 Игры» — "
+                "там уже ждут свободные корты."
+            )
+            try:
+                await bot.send_message(item["telegram_id"], text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(
+                    "Не удалось уведомить игрока %s об автоотмене: %s",
+                    item["telegram_id"], e,
+                )
+
+        refund_count = sum(1 for x in result["cancelled"] if x["refunded"])
+        try:
+            await _send_admin_message(
+                bot,
+                "❌ <b>Автоотмена игры (недобор)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📅 {game_dt}\n"
+                f"📍 {_html(game_row['location'])}\n"
+                f"👥 Состав: {taken}/{total}\n"
+                f"📋 Отменено записей: {len(result['cancelled'])}\n"
+                f"💸 К возврату оплат: {refund_count}\n\n"
+                "Проверь раздел «Оплаты» в CRM и оформи возвраты со статусом «возврат».",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить админа об автоотмене #%s: %s", game["id"], e)
+
+        try:
+            await db.log_action(
+                action="cleanup",
+                entity_type="game",
+                entity_id=game["id"],
+                description=(
+                    f"Автоотмена игры #{game['id']} ({game_dt}) из‑за недобора "
+                    f"{taken}/{total}: отменено записей {len(result['cancelled'])}, "
+                    f"возвратов {refund_count}."
+                ),
+                old_value=f"{taken}/{total}",
+                new_value="отменена (недобор)",
+            )
+        except Exception as e:
+            logger.error("Не удалось записать admin_log автоотмены #%s: %s", game["id"], e)
+
+
 async def send_reminders(bot: Bot):
     """Запускается планировщиком (см. main()/app.py:run_bot) каждые 15
-    минут: проверяет, кому пора напомнить за 24 и за 2 часа до игры."""
+    минут: напоминания за 24/2 часа + предупреждение/автоотмена при недоборе."""
     games_24h = await db.get_games_needing_reminder_24h()
     await _send_reminder_batch(
         bot, games_24h, "Через 24 часа", db.mark_reminder_24h_sent,
@@ -1976,6 +2226,9 @@ async def send_reminders(bot: Bot):
 
     games_2h = await db.get_games_needing_reminder_2h()
     await _send_reminder_batch(bot, games_2h, "Через 2 часа", db.mark_reminder_2h_sent)
+
+    await _process_underfill_warnings(bot)
+    await _process_underfill_cancels(bot)
 
 
 def _make_reminder_job(bot: Bot, loop: asyncio.AbstractEventLoop):

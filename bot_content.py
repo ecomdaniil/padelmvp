@@ -9,6 +9,7 @@ bot_content.py
 BTN_MAIN_MENU = "🏠 Главное меню"
 BTN_GAMES = "🎾 Игры"
 BTN_MY_BOOKINGS = "📋 Мои записи"
+BTN_PAST_GAMES = "🏆 Сыгранные игры"
 BTN_CONTACT_ADMIN = "💬 Связаться с администратором"
 BTN_ABOUT_PADEL = "ℹ️ Главное об игре"
 BTN_STATS = "📊 Моя статистика"
@@ -18,6 +19,7 @@ MENU_BUTTONS = {
     BTN_MAIN_MENU,
     BTN_GAMES,
     BTN_MY_BOOKINGS,
+    BTN_PAST_GAMES,
     BTN_CONTACT_ADMIN,
     BTN_ABOUT_PADEL,
     BTN_STATS,

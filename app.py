@@ -1279,11 +1279,17 @@ def about_club():
 @login_required
 def about_club_update():
     old_info = db.get_club_info()
+    raw_admin_id = (request.form.get("admin_telegram_id") or "").strip()
+    admin_telegram_id = raw_admin_id  # '' очищает; число — сохраняет
+    if raw_admin_id and not raw_admin_id.isdigit():
+        flash("Telegram ID администратора должен быть числом")
+        return redirect(url_for("about_club"))
     db.update_club_info(
         name=request.form["name"],
         description=request.form["description"],
         contact_phone=request.form["contact_phone"],
         contact_email=request.form.get("contact_email", ""),
+        admin_telegram_id=admin_telegram_id,
     )
     new_info = db.get_club_info()
     description = f"Информация о клубе обновлена: {_describe_club_info_diff(dict(old_info) if old_info else {}, dict(new_info) if new_info else {})}"
@@ -1439,7 +1445,7 @@ def run_bot():
     def _reminders_job():
         future = asyncio.run_coroutine_threadsafe(send_reminders(bot_instance), loop)
         try:
-            future.result(timeout=60)
+            future.result(timeout=120)
         except Exception as e:
             logger.error("Ошибка задачи напоминаний: %s", e)
 
@@ -1506,6 +1512,10 @@ def start_infra_services():
         if _infra_started:
             return
         _infra_started = True
+    try:
+        db.migrate_db()
+    except Exception:
+        logger.exception("migrate_db при старте не удалась")
     try:
         db.start_keepalive_thread()
     except Exception:
