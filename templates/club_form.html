@@ -8,6 +8,10 @@
             <input type="text" name="name" value="{{ club.name if club else '' }}" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
         </div>
         <div style="margin-bottom: 12px;">
+            <label style="display: block; margin-bottom: 4px; font-weight: 500;">Город *</label>
+            <input type="text" name="city" value="{{ club.city if club and club.city else '' }}" required placeholder="Например, Москва" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+        </div>
+        <div style="margin-bottom: 12px;">
             <label style="display: block; margin-bottom: 4px; font-weight: 500;">Адрес *</label>
             <input type="text" name="address" value="{{ club.address if club else '' }}" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
         </div>

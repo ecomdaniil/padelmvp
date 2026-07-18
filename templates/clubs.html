@@ -6,18 +6,19 @@
     </div>
     <table>
         <tr>
-            <th>Название</th><th>Адрес</th><th>Телефон</th><th>Описание</th><th></th>
+            <th>Название</th><th>Город</th><th>Адрес</th><th>Телефон</th><th>Описание</th><th></th>
         </tr>
         {% for c in clubs %}
         <tr>
             <td>{{ c.name }}</td>
+            <td>{{ c.city or '—' }}</td>
             <td>{{ c.address }}</td>
             <td>{{ c.phone }}</td>
             <td>{{ c.description or '—' }}</td>
             <td><a class="btn btn-secondary" href="{{ url_for('club_edit', club_id=c.id) }}">Изменить</a></td>
         </tr>
         {% else %}
-        <tr><td colspan="5">Клубов пока нет. Добавьте первый!</td></tr>
+        <tr><td colspan="6">Клубов пока нет. Добавьте первый!</td></tr>
         {% endfor %}
     </table>
     {% include "_pagination.html" %}

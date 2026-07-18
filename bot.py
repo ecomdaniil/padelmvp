@@ -4,7 +4,7 @@ bot.py
 Telegram-бот для игроков в падел.
 
 Что умеет:
-- /start — расширенная анкета (имя, возраст, город, опыт, инвентарь, правила, телефон)
+- /start — расширенная анкета (имя, возраст, опыт, инвентарь, правила, телефон)
 - /menu — главное меню, /myprofile — мой профиль, /help — написать администратору
 - показывает список ближайших игр, спрашивает количество мест (1-4) и
   позволяет записаться с автоматическим расчётом цены
@@ -218,7 +218,6 @@ PADEL_RULES_TEXT = (
 class RegistrationForm(StatesGroup):
     waiting_for_name = State()
     waiting_for_age = State()
-    waiting_for_city = State()
     waiting_for_level = State()
     waiting_for_inventory = State()
     waiting_for_rules = State()
@@ -282,7 +281,6 @@ def _format_profile(user: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Имя: {_html(user['name'])}\n"
         f"Возраст: {_html(user.get('age') or '—')}\n"
-        f"Город: {_html(user.get('city') or '—')}\n"
         f"Опыт: {_html(user['level'])}\n"
         f"Свой инвентарь: {inventory}\n"
         f"Нужны правила: {rules}\n"
@@ -390,7 +388,7 @@ async def _start_questionnaire(message: Message, state: FSMContext, is_edit: boo
     await message.answer(
         f"{greeting}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 1 из 7</b>\n\n"
+        "📝 <b>Вопрос 1 из 6</b>\n\n"
         "👤 Как тебя зовут?\n\n"
         "<i>Напиши имя как обычно: например, Александр</i>",
         reply_markup=ReplyKeyboardRemove(),
@@ -410,7 +408,7 @@ async def _save_profile(message: Message, state: FSMContext):
             phone=data["phone"],
             level=data["level"],
             age=data.get("age"),
-            city=data.get("city"),
+            city=None,
             has_inventory=data.get("has_inventory"),
             needs_rules=data.get("needs_rules"),
         )
@@ -422,7 +420,7 @@ async def _save_profile(message: Message, state: FSMContext):
             phone=data["phone"],
             level=data["level"],
             age=data.get("age"),
-            city=data.get("city"),
+            city=None,
             has_inventory=data.get("has_inventory"),
             needs_rules=data.get("needs_rules"),
         )
@@ -439,7 +437,6 @@ async def _save_profile(message: Message, state: FSMContext):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Имя: {data['name']}\n"
         f"Возраст: {data.get('age')}\n"
-        f"Город: {data.get('city')}\n"
         f"Опыт: {data['level']}\n"
         f"Инвентарь: {inventory_text}\n"
         f"Правила объяснены: {rules_text}\n"
@@ -543,7 +540,7 @@ async def process_name(message: Message, state: FSMContext):
     await state.set_state(RegistrationForm.waiting_for_age)
     await message.answer(
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 2 из 7</b>\n\n"
+        "📝 <b>Вопрос 2 из 6</b>\n\n"
         "🎂 Сколько тебе лет?\n\n"
         "<i>Введи число, например: 28</i>",
         parse_mode="HTML",
@@ -567,27 +564,10 @@ async def process_age(message: Message, state: FSMContext):
         return
 
     await state.update_data(age=age)
-    await state.set_state(RegistrationForm.waiting_for_city)
-    await message.answer(
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 3 из 7</b>\n\n"
-        "🏙 Из какого ты города?",
-        parse_mode="HTML",
-    )
-
-
-@router.message(StateFilter(RegistrationForm.waiting_for_city))
-async def process_city(message: Message, state: FSMContext):
-    city = _safe_text(message)
-    if len(city) < 2:
-        await message.answer("❌ Укажи название города, например: Москва или Санкт-Петербург")
-        return
-
-    await state.update_data(city=city)
     await state.set_state(RegistrationForm.waiting_for_level)
     await message.answer(
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 4 из 7</b>\n\n"
+        "📝 <b>Вопрос 3 из 6</b>\n\n"
         "🎾 Какой у тебя опыт игры в падел?\n\n"
         "<i>Выбери вариант из кнопок ниже:</i>",
         reply_markup=EXPERIENCE_KEYBOARD,
@@ -610,7 +590,7 @@ async def process_level(message: Message, state: FSMContext):
     await state.set_state(RegistrationForm.waiting_for_inventory)
     await message.answer(
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 5 из 7</b>\n\n"
+        "📝 <b>Вопрос 4 из 6</b>\n\n"
         "🎒 Есть ли у тебя свой инвентарь (ракетка, мячи)?",
         reply_markup=YES_NO_KEYBOARD,
         parse_mode="HTML",
@@ -639,7 +619,7 @@ async def process_inventory(message: Message, state: FSMContext):
 
     await message.answer(
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 6 из 7</b>\n\n"
+        "📝 <b>Вопрос 5 из 6</b>\n\n"
         "📖 Нужно ли объяснить правила игры в падел?",
         reply_markup=YES_NO_KEYBOARD,
         parse_mode="HTML",
@@ -665,7 +645,7 @@ async def process_rules(message: Message, state: FSMContext):
     await state.set_state(RegistrationForm.waiting_for_phone)
     await message.answer(
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📝 <b>Вопрос 7 из 7 (последний!)</b>\n\n"
+        "📝 <b>Вопрос 6 из 6 (последний!)</b>\n\n"
         "📞 Оставь свой номер телефона.\n\n"
         "<i>Введи только цифры, например: 79001234567</i>",
         reply_markup=ReplyKeyboardRemove(),

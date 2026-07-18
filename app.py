@@ -404,6 +404,8 @@ def _describe_club_diff(old: dict, new: dict) -> str:
     changes = []
     if old.get("name") != new.get("name"):
         changes.append(f"название изменено с «{old.get('name')}» на «{new.get('name')}»")
+    if (old.get("city") or "") != (new.get("city") or ""):
+        changes.append(f"город изменён с «{old.get('city') or '—'}» на «{new.get('city') or '—'}»")
     if old.get("address") != new.get("address"):
         changes.append(f"адрес изменён с «{old.get('address')}» на «{new.get('address')}»")
     if old.get("phone") != new.get("phone"):
@@ -740,12 +742,10 @@ def _validate_game_values(values, clubs_by_id, actual_taken: int = 0):
     except ValueError:
         errors.append("Укажите корректное время игры.")
 
-    if not values["city"]:
-        errors.append("Укажите город.")
-    parsed["city"] = values["city"][:100]
-
     parsed["club_id"] = None
-    if values["club_id"]:
+    if not values["club_id"]:
+        errors.append("Выберите клуб — город и адрес подставятся из него.")
+    else:
         try:
             club_id_int = int(values["club_id"])
         except ValueError:
@@ -755,10 +755,20 @@ def _validate_game_values(values, clubs_by_id, actual_taken: int = 0):
                 errors.append("Выбранный клуб не найден.")
             else:
                 parsed["club_id"] = club_id_int
+                club = clubs_by_id[club_id_int]
+                # Если поля пустые (JS не сработал) — берём из клуба.
+                if not values["city"] and club.get("city"):
+                    values["city"] = club["city"]
+                if not values["address"] and club.get("address"):
+                    values["address"] = club["address"]
+
+    if not values["city"]:
+        errors.append("Укажите город (или выберите клуб с заполненным городом).")
+    parsed["city"] = (values["city"] or "")[:100]
 
     if not values["address"]:
         errors.append("Укажите адрес.")
-    parsed["address"] = values["address"][:255]
+    parsed["address"] = (values["address"] or "")[:255]
 
     try:
         price = float(values["price"].replace(",", "."))
@@ -1208,13 +1218,20 @@ def clubs_list():
 @login_required
 def club_new():
     if request.method == "POST":
+        city = (request.form.get("city") or "").strip()
+        if not city:
+            flash("Укажите город клуба")
+            return render_template("club_form.html", club=None)
         club = db.create_club(
             name=request.form["name"],
+            city=city,
             address=request.form["address"],
             phone=request.form["phone"],
             description=request.form.get("description", ""),
         )
-        description = f"Клуб «{club['name']}» добавлен ({club['address']})"
+        description = (
+            f"Клуб «{club['name']}» добавлен ({club.get('city') or '—'}, {club['address']})"
+        )
         log_admin_action("create", "club", club["id"], description=description)
         flash("Клуб добавлен")
         return redirect(url_for("clubs_list"))
@@ -1230,10 +1247,15 @@ def club_edit(club_id):
         return redirect(url_for("clubs_list"))
 
     if request.method == "POST":
+        city = (request.form.get("city") or "").strip()
+        if not city:
+            flash("Укажите город клуба")
+            return render_template("club_form.html", club=club)
         old_snapshot = dict(club)
         db.update_club(
             club_id=club_id,
             name=request.form["name"],
+            city=city,
             address=request.form["address"],
             phone=request.form["phone"],
             description=request.form.get("description", ""),

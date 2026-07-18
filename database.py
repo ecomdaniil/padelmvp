@@ -294,6 +294,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS clubs (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
+            city TEXT NOT NULL DEFAULT '',
             address TEXT NOT NULL,
             phone TEXT NOT NULL,
             description TEXT,
@@ -498,6 +499,14 @@ def _create_indexes(cur):
         cur.execute(statement)
 
 
+def _migrate_clubs_table(cur):
+    """city — город площадки; при выборе клуба в форме игры подставляется
+    вместе с адресом."""
+    cur.execute(
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT '';"
+    )
+
+
 def _migrate_club_info_table(cur):
     """admin_telegram_id — куда бот шлёт сообщения «Связаться с админом»
     и уведомления о записях, если ADMIN_CHAT_ID в env не задан (часто на Render).
@@ -519,6 +528,7 @@ def migrate_db():
     _migrate_bookings_table(cur)
     _migrate_payments_table(cur)
     _migrate_admin_logs_table(cur)
+    _migrate_clubs_table(cur)
     _migrate_club_info_table(cur)
     _create_indexes(cur)
     conn.commit()
@@ -1665,13 +1675,13 @@ def get_visits_paginated(page: int = 1, per_page: int = 20):
 # CLUBS — клубы/площадки
 # ---------------------------------------------------------------------------
 
-def create_club(name: str, address: str, phone: str, description: str = ""):
+def create_club(name: str, city: str, address: str, phone: str, description: str = ""):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO clubs (name, address, phone, description)
-           VALUES (%s, %s, %s, %s) RETURNING *""",
-        (name, address, phone, description),
+        """INSERT INTO clubs (name, city, address, phone, description)
+           VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+        (name, city, address, phone, description),
     )
     club = cur.fetchone()
     conn.commit()
@@ -1722,14 +1732,16 @@ def get_club_by_id(club_id: int):
     return club
 
 
-def update_club(club_id: int, name: str, address: str, phone: str, description: str = ""):
+def update_club(
+    club_id: int, name: str, city: str, address: str, phone: str, description: str = "",
+):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """UPDATE clubs
-           SET name = %s, address = %s, phone = %s, description = %s
+           SET name = %s, city = %s, address = %s, phone = %s, description = %s
            WHERE id = %s""",
-        (name, address, phone, description, club_id),
+        (name, city, address, phone, description, club_id),
     )
     conn.commit()
     cur.close()

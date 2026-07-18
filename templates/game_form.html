@@ -24,27 +24,32 @@
         </div>
 
         <div class="form-row">
-            <label for="city">Город *</label>
-            <input type="text" id="city" name="city" required maxlength="100"
-                   placeholder="Например, Москва"
-                   value="{{ values.city }}">
+            <label for="club_id">Клуб *</label>
+            <select id="club_id" name="club_id" required>
+                <option value="">— выберите клуб —</option>
+                {% for c in clubs %}
+                <option value="{{ c.id }}"
+                        data-city="{{ c.city or '' }}"
+                        data-address="{{ c.address }}"
+                        {% if values.club_id == c.id|string %}selected{% endif %}>
+                    {{ c.name }}{% if c.city %} ({{ c.city }}){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+            <small class="field-hint">Город и адрес подставятся из карточки клуба.</small>
         </div>
 
         <div class="form-row">
-            <label for="club_id">Клуб</label>
-            <select id="club_id" name="club_id" data-autofill-address>
-                <option value="">— не выбран —</option>
-                {% for c in clubs %}
-                <option value="{{ c.id }}" data-address="{{ c.address }}"
-                        {% if values.club_id == c.id|string %}selected{% endif %}>{{ c.name }}</option>
-                {% endfor %}
-            </select>
+            <label for="city">Город *</label>
+            <input type="text" id="city" name="city" required maxlength="100"
+                   placeholder="Выберите клуб — заполнится автоматически"
+                   value="{{ values.city }}">
         </div>
 
         <div class="form-row">
             <label for="address">Адрес *</label>
             <input type="text" id="address" name="address" required maxlength="255"
-                   placeholder="Улица, дом, корт"
+                   placeholder="Выберите клуб — заполнится автоматически"
                    value="{{ values.address }}">
         </div>
 
@@ -116,20 +121,28 @@
     </style>
 
     <script>
-        // Подсказка адреса из карточки выбранного клуба — заполняет поле
-        // "Адрес" только если оно ещё пустое, чтобы не перетирать то, что
-        // администратор уже ввёл вручную.
+        // Выбор клуба подставляет город и адрес из его карточки.
         (function () {
             const clubSelect = document.getElementById('club_id');
+            const cityInput = document.getElementById('city');
             const addressInput = document.getElementById('address');
-            if (!clubSelect || !addressInput) return;
-            clubSelect.addEventListener('change', function () {
+            if (!clubSelect || !cityInput || !addressInput) return;
+
+            function fillFromClub() {
                 const opt = clubSelect.options[clubSelect.selectedIndex];
-                const addr = opt ? opt.getAttribute('data-address') : '';
-                if (addr && !addressInput.value.trim()) {
-                    addressInput.value = addr;
-                }
-            });
+                if (!opt || !opt.value) return;
+                const city = opt.getAttribute('data-city') || '';
+                const addr = opt.getAttribute('data-address') || '';
+                if (city) cityInput.value = city;
+                if (addr) addressInput.value = addr;
+            }
+
+            clubSelect.addEventListener('change', fillFromClub);
+            // Если клуб уже выбран при открытии формы редактирования,
+            // а город/адрес пустые — дозаполним.
+            if (clubSelect.value && (!cityInput.value.trim() || !addressInput.value.trim())) {
+                fillFromClub();
+            }
         })();
 
         // "Занято вручную" — это ДОПОЛНИТЕЛЬНЫЕ места сверх уже забронированных
