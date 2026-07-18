@@ -1444,6 +1444,21 @@ async def process_booking_confirm(callback: CallbackQuery):
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
     )
+
+    # Если после этой записи состав ещё неполный (например 3/4 или 1/2) —
+    # предупреждаем до оплаты про автоотмену за час до старта.
+    try:
+        taken = await db.count_bookings_for_game(game_id)
+        taken = int(taken) + int(game.get("booked_places") or 0)
+        total_slots = int(game["total_slots"])
+        if taken < total_slots:
+            await callback.message.answer(
+                _underfill_booking_notice(taken, total_slots),
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logger.error("Не удалось проверить недобор после записи #%s: %s", booking_id, e)
+
     await callback.message.answer(
         _payment_prompt_text(total_price),
         reply_markup=_payment_method_keyboard(payment["id"]),
@@ -1454,6 +1469,19 @@ async def process_booking_confirm(callback: CallbackQuery):
 # ---------------------------------------------------------------------------
 # Оплата (интерфейс — рабочий; провайдер — заглушка, см. payment_provider.py)
 # ---------------------------------------------------------------------------
+
+def _underfill_booking_notice(taken: int, total_slots: int) -> str:
+    """Предупреждение перед оплатой, если корт ещё не укомплектован."""
+    return (
+        "⚠️ <b>Важно: набор на игру ещё не полный</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Сейчас записано: <b>{taken}/{total_slots}</b>\n\n"
+        "Если за <b>1 час</b> до начала игры не соберётся полный состав "
+        f"(<b>{total_slots}/{total_slots}</b>), запись <b>автоматически отменится</b>, "
+        "а оплата будет возвращена.\n\n"
+        "За 3 часа до старта мы дополнительно напомним, если мест всё ещё не хватает."
+    )
+
 
 def _payment_prompt_text(amount: float) -> str:
     return (
