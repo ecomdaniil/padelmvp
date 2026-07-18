@@ -57,12 +57,12 @@
                     <option value="desc" {% if sort_order == 'desc' %}selected{% endif %}>Сначала дальние</option>
                 </select>
             </div>
-            <div class="filter-check">
-                <input type="checkbox" id="show_past" name="show_past" value="1"
-                       {% if show_past %}checked{% endif %}>
-                <label for="show_past">
-                    Показывать прошедшие (в т.ч. пустые начавшиеся)
-                </label>
+            <div class="filter-field">
+                <label class="filter-label">Раздел</label>
+                <select name="show_past">
+                    <option value="" {% if not show_past %}selected{% endif %}>Актуальные игры</option>
+                    <option value="1" {% if show_past %}selected{% endif %}>Прошедшие игры</option>
+                </select>
             </div>
             <div class="filter-actions">
                 <button type="submit" class="btn">Фильтровать</button>
@@ -83,8 +83,10 @@
                     <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
                     <div class="game-card-number">№{{ g.id }}</div>
                 </div>
-                {% if g.is_live %}
+                {% if g.is_live and effective_taken > 0 %}
                 <span class="badge badge-live" title="Игра уже началась и ещё не закончилась">🟢 Идёт сейчас</span>
+                {% elif show_past and effective_taken == 0 %}
+                <span class="badge" style="background:#f1f5f9; color:#64748b;" title="Игра началась/прошла без игроков">Пустая</span>
                 {% endif %}
                 {% if is_full %}
                 <span class="badge badge-full" title="Все места заняты — бот не показывает эту игру пользователям">🚫 Мест нет</span>

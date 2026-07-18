@@ -650,11 +650,12 @@ def get_games_paginated(
     заполненности (fullness: "full" — только полностью занятые по реальным
     бронированиям, "available" — только со свободными местами, "" — все).
 
-    show_past — по умолчанию False: скрывает из основной вкладки
-    (а) игры, которые уже закончились (дата + время + длительность), и
-    (б) игры без игроков (0 броней и 0 ручных мест), у которых уже наступило
-    время старта — они видны только при включённом «Показывать прошедшие».
-    Админ всё равно может открыть игру по прямой ссылке /games/<id>/edit.
+    show_past — режим списка:
+      False (по умолчанию): только актуальные — ещё не начавшиеся, либо
+      уже идущие, но с игроками. Пустые игры с наступившим стартом и
+      полностью закончившиеся сюда НЕ попадают.
+      True: только прошедшие — закончившиеся ИЛИ пустые с наступившим
+      стартом (отдельный «раздел», без смешивания с будущими).
 
     sort_order — "asc" (по умолчанию: ближайшие даты сверху) или "desc"
     (сначала самые дальние/прошедшие). Возвращает dict с items/total/total_pages."""
@@ -681,16 +682,25 @@ def get_games_paginated(
     if city:
         where_clause += " AND g.city = %s"
         params.append(city)
-    if not show_past:
-        # Активный список: ещё не закончившиеся И не «пустые начавшиеся».
-        # Пустая игра (0 игроков) уходит в «прошедшие» сразу в момент старта,
-        # а не ждёт конца слота (duration_minutes).
+
+    # Пустая = нет броней через бота и нет ручных мест.
+    _empty_expr = "(COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) = 0"
+    _started_expr = f"(g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}"
+    _ended_expr = f"{_GAME_END_EXPR} < {_LOCAL_NOW_EXPR}"
+
+    if show_past:
+        # Только прошедшие: слот закончился ИЛИ пустая игра уже стартовала.
+        where_clause += f"""
+          AND (
+                {_ended_expr}
+                OR ({_started_expr} AND {_empty_expr})
+              )
+        """
+    else:
+        # Актуальные: слот ещё не закончился И не «пустая начавшаяся».
         where_clause += f"""
           AND {_GAME_END_EXPR} >= {_LOCAL_NOW_EXPR}
-          AND (
-                (g.game_date + g.game_time) > {_LOCAL_NOW_EXPR}
-                OR (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) > 0
-              )
+          AND NOT ({_started_expr} AND {_empty_expr})
         """
 
     # Занятость = СУММА реальных бронирований и ручного booked_places (та же
@@ -721,7 +731,11 @@ def get_games_paginated(
                c.name AS club_name,
                COALESCE(bk.taken, 0) AS taken,
                COALESCE(pm.collected, 0) AS collected,
-               ({_LOCAL_NOW_EXPR} >= (g.game_date + g.game_time) AND {_LOCAL_NOW_EXPR} < {_GAME_END_EXPR}) AS is_live,
+               (
+                   {_LOCAL_NOW_EXPR} >= (g.game_date + g.game_time)
+                   AND {_LOCAL_NOW_EXPR} < {_GAME_END_EXPR}
+                   AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) > 0
+               ) AS is_live,
                COUNT(*) OVER() AS total_count
         FROM games g
         LEFT JOIN clubs c ON c.id = g.club_id
