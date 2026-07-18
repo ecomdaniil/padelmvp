@@ -225,15 +225,20 @@
             .top-actions .btn,
             .btn {
                 width: 100%;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
                 text-align: center;
                 padding: 12px 14px;
                 font-size: 15px;
                 min-height: 44px;
+                line-height: 1.2;
             }
-            form {
+            form:not(.games-filters) {
                 display: flex;
                 flex-direction: column;
                 gap: 8px;
+                align-items: stretch;
             }
             select, input, textarea {
                 width: 100%;
@@ -353,15 +358,20 @@
             color: var(--primary);
         }
         .btn {
-            display: inline-block;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
             background: linear-gradient(90deg, var(--primary) 0%, var(--primary-2) 100%);
             color: white;
             padding: 8px 14px;
             border-radius: 999px;
             text-decoration: none;
             font-size: 14px;
+            line-height: 1.2;
             border: none;
             cursor: pointer;
+            box-sizing: border-box;
             transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.2s ease;
             box-shadow: 0 10px 20px rgba(37, 99, 235, 0.16);
         }

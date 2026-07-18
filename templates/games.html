@@ -6,66 +6,68 @@
         <a class="btn btn-secondary" href="{{ url_for('report_excel') }}">📊 Выгрузить отчёт в Excel</a>
     </div>
 
-    <div class="card" style="margin-bottom:18px; padding:14px 16px;">
-        <form method="get" style="display:flex; gap:12px; align-items:end; flex-wrap:wrap;">
-            <div style="min-width:170px;">
+    <div class="card games-filters-card">
+        <form method="get" class="games-filters">
+            <div class="filter-field">
                 <label class="filter-label">Уровень</label>
-                <select name="level" style="width:100%;">
+                <select name="level">
                     <option value="" {% if not selected_level %}selected{% endif %}>Все уровни</option>
                     {% for lvl in levels %}
                     <option value="{{ lvl }}" {% if selected_level == lvl %}selected{% endif %}>{{ lvl }}</option>
                     {% endfor %}
                 </select>
             </div>
-            <div style="min-width:170px;">
+            <div class="filter-field">
                 <label class="filter-label">Город</label>
-                <select name="city" style="width:100%;">
+                <select name="city">
                     <option value="" {% if not selected_city %}selected{% endif %}>Все города</option>
                     {% for c in cities %}
                     <option value="{{ c }}" {% if selected_city == c %}selected{% endif %}>{{ c }}</option>
                     {% endfor %}
                 </select>
             </div>
-            <div style="min-width:140px;">
+            <div class="filter-field">
                 <label class="filter-label">Дата с</label>
-                <input type="date" name="date_from" value="{{ date_from }}" style="width:100%;">
+                <input type="date" name="date_from" value="{{ date_from }}">
             </div>
-            <div style="min-width:140px;">
+            <div class="filter-field">
                 <label class="filter-label">Дата по</label>
-                <input type="date" name="date_to" value="{{ date_to }}" style="width:100%;">
+                <input type="date" name="date_to" value="{{ date_to }}">
             </div>
-            <div style="min-width:110px;">
+            <div class="filter-field">
                 <label class="filter-label">Время с</label>
-                <input type="time" name="time_from" value="{{ time_from }}" style="width:100%;">
+                <input type="time" name="time_from" value="{{ time_from }}">
             </div>
-            <div style="min-width:110px;">
+            <div class="filter-field">
                 <label class="filter-label">Время по</label>
-                <input type="time" name="time_to" value="{{ time_to }}" style="width:100%;">
+                <input type="time" name="time_to" value="{{ time_to }}">
             </div>
-            <div style="min-width:170px;">
+            <div class="filter-field">
                 <label class="filter-label">Заполненность</label>
-                <select name="fullness" style="width:100%;">
+                <select name="fullness">
                     <option value="" {% if not fullness %}selected{% endif %}>Все игры</option>
                     <option value="available" {% if fullness == 'available' %}selected{% endif %}>Есть свободные места</option>
                     <option value="full" {% if fullness == 'full' %}selected{% endif %}>Только заполненные</option>
                 </select>
             </div>
-            <div style="min-width:170px;">
+            <div class="filter-field">
                 <label class="filter-label">Сортировка по дате</label>
-                <select name="sort" style="width:100%;">
+                <select name="sort">
                     <option value="asc" {% if sort_order != 'desc' %}selected{% endif %}>Сначала ближайшие</option>
                     <option value="desc" {% if sort_order == 'desc' %}selected{% endif %}>Сначала дальние</option>
                 </select>
             </div>
-            <div style="display:flex; align-items:center; gap:6px; padding-bottom:8px;">
-                <input type="checkbox" id="show_past" name="show_past" value="1" style="width:auto;"
+            <div class="filter-check">
+                <input type="checkbox" id="show_past" name="show_past" value="1"
                        {% if show_past %}checked{% endif %}>
-                <label for="show_past" class="filter-label" style="margin-bottom:0; text-transform:none; font-size:13px;">
+                <label for="show_past">
                     Показывать прошедшие (в т.ч. пустые начавшиеся)
                 </label>
             </div>
-            <button type="submit" class="btn">Фильтровать</button>
-            <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
+            <div class="filter-actions">
+                <button type="submit" class="btn">Фильтровать</button>
+                <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
+            </div>
         </form>
     </div>
 
@@ -150,6 +152,29 @@
     </div>
 
     <style>
+        .games-filters-card {
+            margin-bottom: 18px;
+            padding: 14px 16px;
+        }
+        .games-filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: flex-end;
+            justify-content: flex-start;
+        }
+        .filter-field {
+            min-width: 150px;
+            flex: 0 1 170px;
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            text-align: left;
+        }
+        .filter-field select,
+        .filter-field input {
+            width: 100%;
+        }
         .filter-label {
             display: block;
             font-size: 11px;
@@ -157,6 +182,76 @@
             text-transform: uppercase;
             letter-spacing: 0.03em;
             margin-bottom: 4px;
+            text-align: left;
+        }
+        .filter-check {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            flex: 1 1 100%;
+            text-align: left;
+            padding-bottom: 2px;
+        }
+        .filter-check input {
+            width: auto;
+            min-width: 18px;
+            min-height: 18px;
+            margin-top: 2px;
+            flex: 0 0 auto;
+        }
+        .filter-check label {
+            margin: 0;
+            font-size: 13px;
+            color: var(--text);
+            line-height: 1.35;
+            text-align: left;
+            text-transform: none;
+            letter-spacing: 0;
+        }
+        .filter-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            justify-content: flex-start;
+        }
+        @media (max-width: 640px) {
+            .games-filters-card {
+                padding: 12px;
+                margin-left: 0;
+                margin-right: 0;
+            }
+            .games-filters {
+                flex-direction: column;
+                align-items: stretch;
+                justify-content: flex-start;
+                gap: 10px;
+            }
+            .filter-field {
+                min-width: 0;
+                width: 100%;
+                flex: 1 1 auto;
+            }
+            .filter-check {
+                width: 100%;
+                padding: 4px 0;
+            }
+            .filter-actions {
+                width: 100%;
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .filter-actions .btn {
+                width: 100%;
+            }
+            .game-card-actions {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .game-card-actions .btn,
+            .game-card-actions form .btn {
+                width: 100%;
+            }
         }
         .game-grid {
             display: grid;
