@@ -373,8 +373,11 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
     интерфейсе бота — это защита на уровне данных на случай ошибки/подмены
     callback_data.
 
-    Возвращает dict {"status": "ok"|"full"|"duplicate"|"not_found",
-    "booking": ..., "game": ...}.
+    За менее чем 1 час до старта нельзя взять часть мест: только выкуп
+    всех оставшихся (must_fill_all), иначе игра уйдёт в недобор.
+
+    Возвращает dict {"status": "ok"|"full"|"duplicate"|"not_found"|"must_fill_all",
+    "booking": ..., "game": ..., "free_slots": int?}.
 
     Отдаём game здесь же (мы и так уже сходили за ней в БД внутри
     транзакции) — раньше bot.py делал отдельный предварительный
@@ -397,14 +400,17 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                 return {"status": "not_found", "booking": None, "game": game_dict}
 
             # Нельзя записаться на уже начавшуюся/прошедшую игру (по Москве).
-            still_upcoming = await conn.fetchval(
+            timing = await conn.fetchrow(
                 f"""
-                SELECT (game_date + game_time) >= {_LOCAL_NOW_EXPR}
+                SELECT
+                    (game_date + game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming,
+                    (game_date + game_time) < {_LOCAL_NOW_EXPR} + INTERVAL '1 hour'
+                        AS within_last_hour
                 FROM games WHERE id = $1
                 """,
                 game_id,
             )
-            if not still_upcoming:
+            if not timing or not timing["still_upcoming"]:
                 return {"status": "not_found", "booking": None, "game": game_dict}
 
             existing = await conn.fetchrow(
@@ -423,9 +429,20 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
             # мимо бота, например по телефону) — это ДОПОЛНИТЕЛЬНЫЕ места
             # сверх реальных бронирований, поэтому складываем, а не берём
             # максимум, иначе бот пустил бы запись сверх реального лимита.
-            effective_taken = taken + (game_dict.get("booked_places") or 0)
-            if effective_taken + slots_count > game["total_slots"]:
-                return {"status": "full", "booking": None, "game": game_dict}
+            effective_taken = int(taken) + int(game_dict.get("booked_places") or 0)
+            free_slots = int(game["total_slots"]) - effective_taken
+            if free_slots <= 0 or effective_taken + slots_count > game["total_slots"]:
+                return {"status": "full", "booking": None, "game": game_dict, "free_slots": 0}
+
+            # Меньше часа до старта — только полный выкуп оставшихся мест.
+            if timing["within_last_hour"] and slots_count != free_slots:
+                return {
+                    "status": "must_fill_all",
+                    "booking": None,
+                    "game": game_dict,
+                    "free_slots": free_slots,
+                    "total_slots": int(game["total_slots"]),
+                }
 
             booking = await conn.fetchrow(
                 """INSERT INTO bookings (user_id, game_id, status, slots_count)
@@ -433,6 +450,49 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                 user_id, game_id, slots_count,
             )
             return {"status": "ok", "booking": _to_dict(booking), "game": game_dict}
+
+
+async def get_game_slot_offer(game_id: int) -> Optional[dict]:
+    """Данные для экрана «Сколько мест?»: свободно мест и флаг «меньше часа»."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        f"""
+        SELECT g.*,
+               LEAST(
+                   COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0),
+                   g.total_slots
+               ) AS taken,
+               (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming,
+               (g.game_date + g.game_time) < {_LOCAL_NOW_EXPR} + INTERVAL '1 hour'
+                   AS within_last_hour
+        FROM games g
+        LEFT JOIN (
+            SELECT game_id, SUM(slots_count) AS taken
+            FROM bookings
+            WHERE status != 'отменена'
+            GROUP BY game_id
+        ) bk ON bk.game_id = g.id
+        WHERE g.id = $1
+        """,
+        game_id,
+    )
+    if row is None:
+        return None
+    data = _to_dict(row)
+    if data.get("underfill_cancelled") or not data.get("still_upcoming"):
+        return None
+    taken = int(data.get("taken") or 0)
+    total = int(data["total_slots"])
+    free_slots = max(0, total - taken)
+    if free_slots <= 0:
+        return None
+    return {
+        "game": data,
+        "taken": taken,
+        "total_slots": total,
+        "free_slots": free_slots,
+        "within_last_hour": bool(data.get("within_last_hour")),
+    }
 
 
 async def get_active_bookings_for_user(user_id: int) -> list:

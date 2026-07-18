@@ -1316,27 +1316,56 @@ def _slots_choice_keyboard(game_id: int, max_slots: int) -> InlineKeyboardMarkup
     ])
 
 
+def _last_hour_fill_keyboard(game_id: int, free_slots: int) -> InlineKeyboardMarkup:
+    """Меньше часа до старта — только выкуп всех оставшихся мест."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"✅ Выкупить все {free_slots} мест",
+            callback_data=f"book_slots:{game_id}:{free_slots}",
+        )],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="book_back")],
+    ])
+
+
+def _must_fill_all_text(free_slots: int, total_slots: int) -> str:
+    return (
+        "⏰ <b>До начала игры меньше часа</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Частичную запись уже нельзя: игра скоро начнётся, и недобор "
+        f"состава (<b>{total_slots - free_slots}/{total_slots}</b> → нужно "
+        f"<b>{total_slots}/{total_slots}</b>) приведёт к отмене.\n\n"
+        f"Можно выкупить <b>все оставшиеся места ({free_slots})</b> "
+        "или не записываться."
+    )
+
+
 async def _prompt_slots_for_game(message: Message, game_id: int) -> bool:
     """Показывает вопрос «Сколько мест?» для игры. True — сообщение отправлено,
     False — игра недоступна / мест нет (ошибка уже отправлена вызывающему
     через return False — вызывающий сам решает, как ответить callback)."""
-    game = await db.get_game_by_id(game_id)
-    if not game:
+    offer = await db.get_game_slot_offer(game_id)
+    if not offer:
         return False
 
-    taken = await db.count_bookings_for_game(game_id)
-    # Учитываем и ручной booked_places из CRM — это ДОПОЛНИТЕЛЬНЫЕ места,
-    # занятые мимо бота (например, по телефону), поэтому складываем с
-    # реальными бронированиями, а не берём максимум.
-    effective_taken = taken + (game.get("booked_places") or 0)
-    free_slots = max(0, game["total_slots"] - effective_taken)
-    if free_slots <= 0:
-        return False
+    game = offer["game"]
+    free_slots = offer["free_slots"]
+    total_slots = offer["total_slots"]
+
+    # Меньше часа до старта — только полный выкуп оставшихся мест.
+    if offer["within_last_hour"]:
+        await message.answer(
+            _must_fill_all_text(free_slots, total_slots) +
+            f"\n\n💰 Цена за место: {game['price']} ₽\n"
+            f"Итого за {free_slots}: <b>{float(game['price']) * free_slots:.0f} ₽</b>",
+            reply_markup=_last_hour_fill_keyboard(game_id, free_slots),
+            parse_mode="HTML",
+        )
+        return True
 
     max_choice = min(MAX_SLOTS_PER_BOOKING, free_slots)
     await message.answer(
         "👥 <b>Сколько мест забронировать?</b>\n"
-        f"Свободно: {free_slots} из {game['total_slots']}\n"
+        f"Свободно: {free_slots} из {total_slots}\n"
         f"Цена за место: {game['price']} ₽\n\n"
         "Выбери количество:",
         reply_markup=_slots_choice_keyboard(game_id, max_choice),
@@ -1408,6 +1437,15 @@ async def process_booking_confirm(callback: CallbackQuery):
     if result["status"] == "full":
         await callback.message.answer(
             "К сожалению, свободных мест уже меньше, чем ты выбрал."
+        )
+        return
+    if result["status"] == "must_fill_all":
+        free_slots = int(result.get("free_slots") or 0)
+        total_slots = int(result.get("total_slots") or (result.get("game") or {}).get("total_slots") or 0)
+        await callback.message.answer(
+            _must_fill_all_text(free_slots, total_slots),
+            reply_markup=_last_hour_fill_keyboard(game_id, free_slots) if free_slots > 0 else None,
+            parse_mode="HTML",
         )
         return
     if result["status"] == "duplicate":
