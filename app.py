@@ -1284,12 +1284,14 @@ def about_club_update():
     if raw_admin_id and not raw_admin_id.isdigit():
         flash("Telegram ID администратора должен быть числом")
         return redirect(url_for("about_club"))
+    raw_admin_user = (request.form.get("admin_telegram_username") or "").strip().lstrip("@")
     db.update_club_info(
         name=request.form["name"],
         description=request.form["description"],
         contact_phone=request.form["contact_phone"],
         contact_email=request.form.get("contact_email", ""),
         admin_telegram_id=admin_telegram_id,
+        admin_telegram_username=raw_admin_user,
     )
     new_info = db.get_club_info()
     description = f"Информация о клубе обновлена: {_describe_club_info_diff(dict(old_info) if old_info else {}, dict(new_info) if new_info else {})}"

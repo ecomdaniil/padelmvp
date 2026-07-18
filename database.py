@@ -500,9 +500,13 @@ def _create_indexes(cur):
 
 def _migrate_club_info_table(cur):
     """admin_telegram_id — куда бот шлёт сообщения «Связаться с админом»
-    и уведомления о записях, если ADMIN_CHAT_ID в env не задан (часто на Render)."""
+    и уведомления о записях, если ADMIN_CHAT_ID в env не задан (часто на Render).
+    admin_telegram_username — отображаемый @username (например ecom_daniil)."""
     cur.execute(
         "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS admin_telegram_id BIGINT;"
+    )
+    cur.execute(
+        "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS admin_telegram_username TEXT;"
     )
 
 
@@ -2074,43 +2078,53 @@ def update_club_info(
     contact_phone: str,
     contact_email: str = "",
     admin_telegram_id=None,
+    admin_telegram_username=None,
 ):
-    """admin_telegram_id=None — не менять колонку; ''/0 — очистить."""
+    """admin_telegram_id=None — не менять id; ''/0 — очистить.
+    admin_telegram_username=None — не менять username; '' — очистить."""
     conn = get_connection()
     cur = conn.cursor()
-    if admin_telegram_id is None:
-        cur.execute(
-            """UPDATE club_info
-               SET name = %s, description = %s, contact_phone = %s,
-                   contact_email = %s, updated_at = NOW()
-               WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
-            (name, description, contact_phone, contact_email),
-        )
-    else:
+    sets = [
+        "name = %s",
+        "description = %s",
+        "contact_phone = %s",
+        "contact_email = %s",
+        "updated_at = NOW()",
+    ]
+    params = [name, description, contact_phone, contact_email]
+    if admin_telegram_id is not None:
         tid = None
         if admin_telegram_id not in ("", 0, "0"):
             tid = int(admin_telegram_id)
-        cur.execute(
-            """UPDATE club_info
-               SET name = %s, description = %s, contact_phone = %s,
-                   contact_email = %s, admin_telegram_id = %s, updated_at = NOW()
-               WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
-            (name, description, contact_phone, contact_email, tid),
-        )
+        sets.append("admin_telegram_id = %s")
+        params.append(tid)
+    if admin_telegram_username is not None:
+        uname = str(admin_telegram_username).lstrip("@").strip() or None
+        sets.append("admin_telegram_username = %s")
+        params.append(uname)
+    cur.execute(
+        f"""UPDATE club_info SET {', '.join(sets)}
+           WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
+        tuple(params),
+    )
     conn.commit()
     cur.close()
     conn.close()
 
 
-def set_club_admin_telegram_id(telegram_id: int) -> None:
+def set_club_admin_telegram_id(telegram_id: int, username: str = None) -> None:
     """Привязка Telegram ID админа из бота (/bindadmin) или CRM."""
     conn = get_connection()
     cur = conn.cursor()
+    uname = str(username).lstrip("@").strip() if username else None
+    uname = uname or None
     cur.execute(
         """UPDATE club_info
-           SET admin_telegram_id = %s, updated_at = NOW()
+           SET admin_telegram_id = %s,
+               admin_telegram_username = COALESCE(%s, admin_telegram_username),
+               updated_at = NOW()
            WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
-        (int(telegram_id),),
+        (int(telegram_id), uname),
     )
     conn.commit()
     cur.close()
