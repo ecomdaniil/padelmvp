@@ -1628,18 +1628,28 @@ def mark_booking_visited_and_get(booking_id: int):
     return row
 
 
+# Игроки «сыгравших» игр: бронь не отменена и время старта игры уже прошло
+# (по Москве). Раньше вкладка «Посещения» смотрела только status='посещена',
+# который почти никто не ставил вручную — список был пустым.
+_VISITS_WHERE = f"""
+    b.status != 'отменена'
+    AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+    AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+"""
+
+
 def get_all_visits():
-    """Все посещения с данными об игроках и играх."""
+    """Все сыгравшие игроки с данными об играх (для отчётов)."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT b.*, u.name AS user_name, u.phone AS user_phone,
-               g.game_date, g.game_time, g.location
+               g.id AS game_id, g.game_date, g.game_time, g.location
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         JOIN games g ON g.id = b.game_id
-        WHERE b.status = 'посещена'
-        ORDER BY g.game_date DESC, g.game_time DESC
+        WHERE {_VISITS_WHERE}
+        ORDER BY g.game_date DESC, g.game_time DESC, u.name
     """)
     visits = cur.fetchall()
     cur.close()
@@ -1648,7 +1658,9 @@ def get_all_visits():
 
 
 def get_visits_paginated(page: int = 1, per_page: int = 20):
-    """Посещения с пагинацией — для CRM."""
+    """Сыгравшие игроки с пагинацией — вкладка CRM «Посещения».
+    Показывает имя, телефон, № игры и дату для броней на уже начавшиеся
+    / прошедшие игры (не отменённые)."""
     page = max(1, page)
     offset = (page - 1) * per_page
 
@@ -1656,15 +1668,15 @@ def get_visits_paginated(page: int = 1, per_page: int = 20):
     cur = conn.cursor()
 
     cur.execute(
-        """
+        f"""
         SELECT b.*, u.name AS user_name, u.phone AS user_phone,
-               g.game_date, g.game_time, g.location,
+               g.id AS game_id, g.game_date, g.game_time, g.location,
                COUNT(*) OVER() AS total_count
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         JOIN games g ON g.id = b.game_id
-        WHERE b.status = 'посещена'
-        ORDER BY g.game_date DESC, g.game_time DESC
+        WHERE {_VISITS_WHERE}
+        ORDER BY g.game_date DESC, g.game_time DESC, u.name
         LIMIT %s OFFSET %s
         """,
         (per_page, offset),
@@ -1672,7 +1684,12 @@ def get_visits_paginated(page: int = 1, per_page: int = 20):
     visits = cur.fetchall()
     result = _paginated_from_window(
         cur, visits, page, per_page,
-        "SELECT COUNT(*) AS cnt FROM bookings WHERE status = 'посещена'",
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM bookings b
+        JOIN games g ON g.id = b.game_id
+        WHERE {_VISITS_WHERE}
+        """,
     )
     cur.close()
     conn.close()
@@ -1850,14 +1867,18 @@ def get_dashboard_summary() -> dict:
     и это было самой медленной страницей CRM)."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT
             (SELECT COUNT(*) FROM games) AS games,
             (SELECT COUNT(*) FROM bookings WHERE status != 'отменена') AS bookings,
             (SELECT COUNT(*) FROM payments p
              JOIN bookings b ON b.id = p.booking_id
              WHERE p.status = 'ожидает' AND b.status != 'отменена') AS pending_payments,
-            (SELECT COUNT(*) FROM bookings WHERE status = 'посещена') AS visits,
+            (SELECT COUNT(*) FROM bookings b
+             JOIN games g ON g.id = b.game_id
+             WHERE b.status != 'отменена'
+               AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+               AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}) AS visits,
             (SELECT COUNT(*) FROM clubs) AS clubs,
             (SELECT COUNT(*) FROM admin_logs) AS logs
     """)
@@ -2052,7 +2073,14 @@ def count_active_bookings() -> int:
 def count_visits() -> int:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS cnt FROM bookings WHERE status = 'посещена'")
+    cur.execute(
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM bookings b
+        JOIN games g ON g.id = b.game_id
+        WHERE {_VISITS_WHERE}
+        """
+    )
     total = cur.fetchone()["cnt"]
     cur.close()
     conn.close()
