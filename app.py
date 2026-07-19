@@ -67,7 +67,9 @@ if _IS_RENDER:
     os.environ.setdefault("RUN_BOT_IN_BACKGROUND", "1")
     # Дать gunicorn ответить на /health до тяжёлого старта aiogram+asyncpg —
     # иначе Render health check / cron висят на белом экране.
-    os.environ.setdefault("BOT_START_DELAY_SECONDS", "25")
+    # Короткий delay: длинный 25с после каждого recycle gunicorn давал
+    # окно «bot not ready» и «бот не реагирует» на кнопки.
+    os.environ.setdefault("BOT_START_DELAY_SECONDS", "5")
     if not (os.getenv("WEBHOOK_URL") or "").strip():
         _external = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
         if _external:
@@ -114,6 +116,9 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
     hours=int(os.getenv("SESSION_LIFETIME_HOURS", "12"))
 )
 app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+# CSRF живёт столько же, сколько сессия — иначе формы «ломаются» через 1ч.
+_csrf_hours = int(os.getenv("SESSION_LIFETIME_HOURS", "12"))
+app.config["WTF_CSRF_TIME_LIMIT"] = _csrf_hours * 3600
 # Debug только по явному флагу — иначе в HTML может утечь текст исключения.
 app.config["DEBUG"] = os.getenv("FLASK_DEBUG", "0").lower() in {"1", "true", "yes"}
 app.debug = app.config["DEBUG"]
@@ -132,6 +137,17 @@ Compress(app)
 # CSRF-защита всех форм (PIP: Flask-WTF). Токен подставляется в шаблонах
 # через {{ csrf_token() }} и автоматически проверяется на каждый POST.
 csrf = CSRFProtect(app)
+
+try:
+    from flask_wtf.csrf import CSRFError
+except ImportError:  # pragma: no cover
+    CSRFError = None  # type: ignore
+
+if CSRFError is not None:
+    @app.errorhandler(CSRFError)
+    def _csrf_error(e):
+        flash("Сессия формы устарела — обнови страницу и повтори действие.")
+        return redirect(request.referrer or url_for("index")), 400
 
 # Rate limiting: не более 10 запросов в секунду с одного IP. Отдельно более
 # строгий лимит применяется к /login, чтобы затруднить брутфорс пароля.
@@ -1711,7 +1727,13 @@ def webhook():
             )
             return {"status": "forbidden"}, 403
 
-    if bot_instance and dp_instance and bot_loop:
+    loop_ok = bool(
+        bot_instance
+        and dp_instance
+        and bot_loop
+        and getattr(bot_loop, "is_running", lambda: False)()
+    )
+    if loop_ok:
         try:
             update = Update.model_validate(
                 request.json,
@@ -1721,9 +1743,13 @@ def webhook():
             logger.error("Ошибка разбора webhook-обновления: %s", e)
             return {"status": "error"}, 400
 
-        future = asyncio.run_coroutine_threadsafe(
-            dp_instance.feed_update(bot_instance, update), bot_loop
-        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                dp_instance.feed_update(bot_instance, update), bot_loop
+            )
+        except RuntimeError as e:
+            logger.error("Webhook: event loop бота недоступен: %s", e)
+            return {"status": "bot not ready"}, 503
 
         def _log_webhook_failure(fut):
             exc = fut.exception() if fut.done() else None
@@ -1749,6 +1775,8 @@ def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     bot_loop = loop
+    bot_instance = None
+    dp_instance = None
 
     if not BOT_TOKEN:
         bot_start_error = "BOT_TOKEN не задан"
@@ -1759,22 +1787,39 @@ def run_bot():
     dp_instance.include_router(router)
 
     scheduler = BackgroundScheduler()
+    # Не ждём future.result() на bot_loop: иначе при таймауте корутина
+    # продолжает крутиться, а через минуту стартует ещё одна — event loop
+    # бота забивается, callback'и (запись на игру) «не реагируют».
+    _bg_jobs_running = {"reminders": False, "unpaid": False}
+
+    def _spawn_bot_job(name: str, coro_factory):
+        if _bg_jobs_running.get(name):
+            logger.warning("Пропуск фоновой задачи %s — предыдущая ещё выполняется", name)
+            return
+
+        async def _runner():
+            _bg_jobs_running[name] = True
+            try:
+                await coro_factory()
+            except Exception as e:
+                logger.error("Ошибка фоновой задачи %s: %s", name, e)
+            finally:
+                _bg_jobs_running[name] = False
+
+        try:
+            asyncio.run_coroutine_threadsafe(_runner(), loop)
+        except Exception as e:
+            _bg_jobs_running[name] = False
+            logger.error("Не удалось запустить фоновую задачу %s: %s", name, e)
 
     def _reminders_job():
-        future = asyncio.run_coroutine_threadsafe(send_reminders(bot_instance), loop)
-        try:
-            future.result(timeout=120)
-        except Exception as e:
-            logger.error("Ошибка задачи напоминаний: %s", e)
+        _spawn_bot_job("reminders", lambda: send_reminders(bot_instance))
 
     def _unpaid_timeout_job():
-        future = asyncio.run_coroutine_threadsafe(
-            process_unpaid_payment_timeouts(bot_instance), loop,
+        _spawn_bot_job(
+            "unpaid",
+            lambda: process_unpaid_payment_timeouts(bot_instance),
         )
-        try:
-            future.result(timeout=60)
-        except Exception as e:
-            logger.error("Ошибка автоотмены неоплаченных заказов: %s", e)
 
     async def _startup():
         await db_async.get_pool()
@@ -1846,6 +1891,10 @@ def run_bot():
                 loop.close()
         except Exception:
             pass
+        # Сбрасываем глобалы — иначе webhook видит «мёртвый» loop.
+        bot_instance = None
+        dp_instance = None
+        bot_loop = None
 
 
 _infra_started = False
@@ -1892,15 +1941,25 @@ def start_background_services():
 
     def _start():
         delay = float(os.getenv("BOT_START_DELAY_SECONDS", "0"))
-        if delay > 0:
-            logger.warning("Бот: ждём %.0fс перед стартом (чтобы /health был жив)", delay)
-            time.sleep(delay)
-        try:
-            run_bot()
-        except Exception as e:
-            global bot_start_error
-            bot_start_error = f"{type(e).__name__}: {e}"
-            logger.exception("Фоновый поток бота завершился с ошибкой")
+        backoff = 5.0
+        while True:
+            if delay > 0:
+                logger.warning(
+                    "Бот: ждём %.0fс перед стартом (чтобы /health был жив)", delay,
+                )
+                time.sleep(delay)
+                delay = 0
+            try:
+                run_bot()
+                bot_start_error = "bot event loop stopped"
+                logger.warning("Бот: event loop остановился — перезапуск через %.0fс", backoff)
+            except Exception as e:
+                bot_start_error = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    "Фоновый поток бота упал — перезапуск через %.0fс", backoff,
+                )
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 60.0)
 
     threading.Thread(target=_start, daemon=True, name="padel-bot").start()
     logger.warning("Бот: фоновый поток запланирован")

@@ -2,14 +2,14 @@
 {% block content %}
     <h1>Посещения</h1>
     <p class="muted-line" style="margin: 0 0 14px; color: var(--muted); font-size: 14px;">
-        Игроки, записавшиеся через бота на уже прошедшие (начавшиеся) игры.
+        Игроки, записавшиеся через бота на уже прошедшие (начавшиеся) игры и тренировки.
     </p>
     <div class="table-scroll">
         <table>
             <tr>
                 <th>Имя</th>
                 <th>Телефон</th>
-                <th>№ игры</th>
+                <th>Игра / тренировка</th>
                 <th>Дата</th>
             </tr>
             {% for v in visits %}
@@ -17,13 +17,19 @@
                 <td>{{ v.user_name }}</td>
                 <td>{{ v.user_phone }}</td>
                 <td>
-                    <span class="game-number-tag">№{{ v.game_id }}</span>
-                    {% if v.location %}<span class="muted-line">{{ v.location }}</span>{% endif %}
+                    {% if v.event_type == 'training' %}
+                        <span class="game-number-tag">Тренировка</span>
+                        {% if v.title %}<strong>{{ v.title }}</strong>{% endif %}
+                        {% if v.location %}<span class="muted-line">{{ v.location }}</span>{% endif %}
+                    {% else %}
+                        <span class="game-number-tag">№{{ v.game_id }}</span>
+                        {% if v.location %}<span class="muted-line">{{ v.location }}</span>{% endif %}
+                    {% endif %}
                 </td>
                 <td>{{ v.game_date.strftime('%d.%m.%Y') }} {{ v.game_time.strftime('%H:%M') }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="4">Пока нет сыгравших игроков — они появятся после начала игр, на которые были записи.</td></tr>
+            <tr><td colspan="4">Пока нет сыгравших игроков — они появятся после начала игр и тренировок, на которые были записи.</td></tr>
             {% endfor %}
         </table>
     </div>

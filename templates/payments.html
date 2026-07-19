@@ -31,7 +31,12 @@
         <tr>
             <td>{{ p.user_name }}</td>
             <td>
-                <span class="game-number-tag">№{{ p.game_id }}</span>
+                {% if p.event_type == 'training' %}
+                    <span class="game-number-tag">Тренировка</span>
+                    {% if p.title %}<strong>{{ p.title }}</strong>{% endif %}
+                {% else %}
+                    <span class="game-number-tag">№{{ p.game_id }}</span>
+                {% endif %}
                 {{ p.game_date.strftime('%d.%m.%Y') }} {{ p.game_time.strftime('%H:%M') }} — {{ p.location }}
             </td>
             <td>{{ p.amount }} ₽</td>

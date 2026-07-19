@@ -694,8 +694,10 @@ async def increase_booking_slots_safe(
             )
 
             # Только «открытый» неоплаченный счёт можно увеличить.
-            # Уже оплаченный через PayMaster (player_notified_at) или
-            # подтверждённый админом НЕ трогаем — для доплаты новый платёж.
+            # Уже оплаченный (player_notified_at) или подтверждённый админом
+            # НЕ трогаем — для доплаты новый платёж. Старые provider_id
+            # (ЮKassa) сбрасываем: эквайринг отключён, уникальный индекс
+            # на один open-pending иначе ломал докупку.
             open_pending = await conn.fetchrow(
                 """SELECT * FROM payments
                    WHERE booking_id = $1
@@ -705,24 +707,19 @@ async def increase_booking_slots_safe(
                    FOR UPDATE""",
                 booking_id,
             )
-            if open_pending is not None and not open_pending["provider_payment_id"]:
-                # Неоплаченный счёт без живой ссылки провайдера — можно
-                # просто увеличить сумму. Если уже есть provider_payment_id,
-                # не трогаем его (иначе старый счёт ЮKassa может пройти, а
-                # локальная сумма/ссылка уже другие) — создаём отдельную доплату.
+            if open_pending is not None:
                 payment = await conn.fetchrow(
                     """UPDATE payments
-                       SET amount = amount + $1
+                       SET amount = amount + $1,
+                           provider_payment_id = NULL,
+                           confirmation_url = NULL
                        WHERE id = $2
                          AND status = 'ожидает'
                          AND player_notified_at IS NULL
-                         AND provider_payment_id IS NULL
                        RETURNING *""",
                     extra_amount, open_pending["id"],
                 )
             else:
-                payment = None
-            if payment is None:
                 payment = await conn.fetchrow(
                     """INSERT INTO payments (booking_id, amount, status, method)
                        VALUES ($1, $2, 'ожидает', NULL) RETURNING *""",
@@ -830,9 +827,9 @@ async def cancel_underfilled_game(game_id: int) -> dict:
 
             cancelled = []
             for row in bookings:
-                payment = await conn.fetchrow(
-                    """SELECT id, amount, status FROM payments
-                       WHERE booking_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                payments = await conn.fetch(
+                    """SELECT id, amount, status, player_notified_at FROM payments
+                       WHERE booking_id = $1 FOR UPDATE""",
                     row["booking_id"],
                 )
                 await conn.execute(
@@ -840,28 +837,32 @@ async def cancel_underfilled_game(game_id: int) -> dict:
                     row["booking_id"],
                 )
                 refunded = False
-                amount = None
-                if payment is not None and payment["status"] == "подтверждена":
-                    await conn.execute(
-                        """UPDATE payments
-                              SET status = 'возврат',
-                                  admin_attention_at = NOW()
-                            WHERE id = $1""",
-                        payment["id"],
-                    )
-                    refunded = True
-                    amount = float(payment["amount"]) if payment["amount"] is not None else None
-                elif payment is not None and payment["status"] == "ожидает":
-                    await conn.execute(
-                        "DELETE FROM payments WHERE id = $1 AND status = 'ожидает'",
-                        payment["id"],
-                    )
+                amount_sum = 0.0
+                for payment in payments:
+                    status = payment["status"]
+                    notified = payment["player_notified_at"] is not None
+                    if status == "подтверждена" or (status == "ожидает" and notified):
+                        await conn.execute(
+                            """UPDATE payments
+                                  SET status = 'возврат',
+                                      admin_attention_at = NOW()
+                                WHERE id = $1""",
+                            payment["id"],
+                        )
+                        refunded = True
+                        if payment["amount"] is not None:
+                            amount_sum += float(payment["amount"])
+                    elif status == "ожидает":
+                        await conn.execute(
+                            "DELETE FROM payments WHERE id = $1 AND status = 'ожидает'",
+                            payment["id"],
+                        )
                 cancelled.append({
                     "telegram_id": row["telegram_id"],
                     "name": row["name"],
                     "booking_id": row["booking_id"],
                     "refunded": refunded,
-                    "amount": amount,
+                    "amount": amount_sum if refunded else None,
                 })
 
             await conn.execute(
@@ -1594,12 +1595,18 @@ async def mark_payment_notified_owned(payment_id: int, user_id: int) -> Optional
 
 
 async def confirm_payment(payment_id: int) -> Optional[dict]:
-    """Атомарно подтверждает только «ожидает». None — статус уже другой."""
+    """Атомарно подтверждает только «ожидает» у активной (не отменённой) заявки."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        """UPDATE payments SET status = 'подтверждена',
-               player_notified_at = COALESCE(player_notified_at, NOW())
-           WHERE id = $1 AND status = 'ожидает' RETURNING *""",
+        """UPDATE payments AS p
+           SET status = 'подтверждена',
+               player_notified_at = COALESCE(p.player_notified_at, NOW())
+           FROM bookings AS b
+           WHERE p.id = $1
+             AND p.booking_id = b.id
+             AND p.status = 'ожидает'
+             AND b.status != 'отменена'
+           RETURNING p.*""",
         payment_id,
     )
     return _to_dict(row) if row else None

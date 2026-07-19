@@ -14,8 +14,9 @@ worker_class = "gthread"
 threads = int(os.getenv("GUNICORN_THREADS", "4"))
 timeout = int(os.getenv("GUNICORN_TIMEOUT", "120"))
 graceful_timeout = 30
-max_requests = 150
-max_requests_jitter = 30
+# Реже recycle — каждый рестарт даёт окно «bot not ready» на кнопки Telegram.
+max_requests = int(os.getenv("GUNICORN_MAX_REQUESTS", "1000"))
+max_requests_jitter = int(os.getenv("GUNICORN_MAX_REQUESTS_JITTER", "100"))
 bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
 # Avoid false WORKER TIMEOUTs on slow disks (Render). Skip if /dev/shm missing.
 if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):

@@ -482,6 +482,7 @@ async def _save_profile(message: Message, state: FSMContext):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     existing_user = await db.get_user_by_telegram_id(message.from_user.id)
 
     if existing_user:
@@ -495,6 +496,43 @@ async def cmd_start(message: Message, state: FSMContext):
         return
 
     await _start_questionnaire(message, state, is_edit=False)
+
+
+async def _intercept_fsm_commands(message: Message, state: FSMContext) -> bool:
+    """FSM-хендлеры перехватывают /cancel раньше cmd_cancel — обрабатываем здесь.
+    True = команда обработана, вызывающий handler должен выйти."""
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return False
+    cmd = text.split()[0].split("@")[0].lower()
+    await state.clear()
+    if cmd == "/cancel":
+        user = await _require_registered(message.from_user.id)
+        if user:
+            await message.answer(
+                "Действие отменено.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await show_main_menu(message, user)
+        else:
+            await message.answer(
+                "Действие отменено. Отправь /start, чтобы начать заново."
+            )
+        return True
+    if cmd == "/start":
+        await cmd_start(message, state)
+        return True
+    if cmd == "/menu":
+        user = await _require_registered(message.from_user.id)
+        if user:
+            await show_main_menu(message, user)
+        else:
+            await message.answer("Сначала заполни анкету: отправь /start")
+        return True
+    await message.answer(
+        "Действие сброшено. Используй кнопки меню или /start."
+    )
+    return True
 
 
 @router.message(Command("myprofile"))
@@ -555,8 +593,10 @@ async def process_games_format(callback: CallbackQuery):
 
 @router.message(StateFilter(RegistrationForm.waiting_for_name), F.text)
 async def process_name(message: Message, state: FSMContext):
+    if await _intercept_fsm_commands(message, state):
+        return
     name = _safe_text(message)
-    if name in MENU_BUTTONS or name.startswith("/"):
+    if name in MENU_BUTTONS:
         await message.answer(
             "❌ Это не похоже на имя.\n"
             "Введи настоящее имя текстом (минимум 2 символа):"
@@ -582,6 +622,8 @@ async def process_name(message: Message, state: FSMContext):
 
 @router.message(StateFilter(RegistrationForm.waiting_for_age), F.text)
 async def process_age(message: Message, state: FSMContext):
+    if await _intercept_fsm_commands(message, state):
+        return
     text = _safe_text(message)
     if not text.isdigit():
         await message.answer(
@@ -610,6 +652,8 @@ async def process_age(message: Message, state: FSMContext):
 
 @router.message(StateFilter(RegistrationForm.waiting_for_level), F.text)
 async def process_level(message: Message, state: FSMContext):
+    if await _intercept_fsm_commands(message, state):
+        return
     level = _safe_text(message)
     valid_levels = await get_valid_levels()
     if level not in valid_levels:
@@ -632,6 +676,8 @@ async def process_level(message: Message, state: FSMContext):
 
 @router.message(StateFilter(RegistrationForm.waiting_for_inventory), F.text)
 async def process_inventory(message: Message, state: FSMContext):
+    if await _intercept_fsm_commands(message, state):
+        return
     answer = _safe_text(message).lower()
     if answer not in YES_ANSWERS | NO_ANSWERS:
         await message.answer(
@@ -661,6 +707,8 @@ async def process_inventory(message: Message, state: FSMContext):
 
 @router.message(StateFilter(RegistrationForm.waiting_for_rules), F.text)
 async def process_rules(message: Message, state: FSMContext):
+    if await _intercept_fsm_commands(message, state):
+        return
     answer = _safe_text(message).lower()
     if answer not in YES_ANSWERS | NO_ANSWERS:
         await message.answer(
@@ -688,6 +736,8 @@ async def process_rules(message: Message, state: FSMContext):
 
 @router.message(StateFilter(RegistrationForm.waiting_for_phone), F.text)
 async def process_phone(message: Message, state: FSMContext):
+    if await _intercept_fsm_commands(message, state):
+        return
     # Принимаем только цифры (без букв, пробелов и символов)
     phone = re.sub(r"\D", "", _safe_text(message))
 
@@ -1255,6 +1305,8 @@ async def menu_contact_admin(message: Message, state: FSMContext):
 
 @router.message(StateFilter(AdminContact.waiting_for_message), F.text)
 async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
+    if await _intercept_fsm_commands(message, state):
+        return
     # Кнопки меню не должны уходить админу как текст сообщения.
     if message.text in MENU_BUTTONS:
         await state.clear()
@@ -1341,6 +1393,8 @@ async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(StateFilter(AdminReply.waiting_for_reply), F.text)
 async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
+    if await _intercept_fsm_commands(message, state):
+        return
     if not await _is_admin_user(message.from_user.id):
         await state.clear()
         await message.answer("❌ Недостаточно прав.")
@@ -1433,13 +1487,13 @@ async def _notify_admin_new_booking(
 
 
 async def _delete_admin_booking_notify(bot: Bot, message_id: Optional[int]) -> None:
-    """Удаляет у админа сообщение о записи/докупке, если заказ отменён до оплаты."""
+    """Удаляет у админа сообщение о записи/докупке, если заказ отменён до оплаты.
+    Пробуем все admin chat_id — message_id мог уйти не в первый из списка."""
     if not message_id:
         return
     for chat_id in await _resolve_admin_chat_ids():
         try:
             await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
-            return
         except Exception as e:
             logger.debug("Не удалось удалить уведомление админу %s msg=%s: %s", chat_id, message_id, e)
 
@@ -1582,12 +1636,62 @@ async def process_book_back(callback: CallbackQuery):
     await _ask_game_format(callback.message, telegram_id=callback.from_user.id)
 
 
+def _fire_and_forget(coro, name: str) -> None:
+    """Фоновая задача: ошибки только в лог, не роняют обработчик игрока."""
+    task = asyncio.create_task(coro)
+
+    def _done(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.error("Фоновая задача %s упала: %s", name, exc, exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
+def _format_game_when(game: dict) -> str:
+    """Дата/время игры безопасно для текста (date/time/str из asyncpg)."""
+    gd = game.get("game_date")
+    gt = game.get("game_time")
+    if hasattr(gd, "strftime"):
+        date_s = gd.strftime("%d.%m.%Y")
+    else:
+        date_s = str(gd or "")[:10]
+    time_s = str(gt or "")[:5]
+    return f"{date_s} в {time_s}".strip()
+
+
 @router.callback_query(F.data.startswith("book_slots:"))
 async def process_booking_confirm(callback: CallbackQuery):
     """Второй шаг записи: пользователь выбрал количество мест — создаём
     заявку, считаем итоговую цену и предлагаем способ оплаты."""
     # Мгновенный toast вместо крутящихся часиков на время create_booking_safe.
-    await callback.answer("Записываю…")
+    try:
+        await callback.answer("Записываю…")
+    except Exception:
+        pass
+
+    try:
+        await _do_booking_confirm(callback)
+    except asyncio.TimeoutError:
+        logger.error("Таймаут записи book_slots data=%s", callback.data)
+        await callback.message.answer(
+            "❌ База данных отвечает слишком долго.\n"
+            "Попробуй ещё раз через несколько секунд.",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        logger.exception("Ошибка записи book_slots data=%s: %s", callback.data, e)
+        await callback.message.answer(
+            "❌ Не удалось записаться из‑за временной ошибки.\n"
+            "Попробуй ещё раз или открой «📋 Мои записи».",
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+async def _do_booking_confirm(callback: CallbackQuery) -> None:
     user = await _require_registered(callback.from_user.id)
     if not user:
         await callback.message.answer(
@@ -1596,7 +1700,7 @@ async def process_booking_confirm(callback: CallbackQuery):
         )
         return
 
-    parts = callback.data.split(":")
+    parts = (callback.data or "").split(":")
     if len(parts) != 3:
         await callback.message.answer("Некорректные данные записи.")
         return
@@ -1610,13 +1714,14 @@ async def process_booking_confirm(callback: CallbackQuery):
         await callback.message.answer("Некорректное количество мест.")
         return
 
-    # Проверка мест и вставка заявки выполняются атомарно в одной транзакции
-    # с блокировкой строки игры — это исключает race condition, когда два
-    # игрока одновременно проходят проверку на последнее свободное место.
-    # Игру отдельно заранее не запрашиваем: create_booking_safe уже читает
-    # её внутри транзакции и возвращает нам эти же данные — раньше здесь был
-    # лишний round-trip к БД на каждую попытку записи.
-    result = await db.create_booking_safe(user_id=user["id"], game_id=game_id, slots_count=slots_count)
+    # Проверка мест и вставка заявки — атомарно; таймаут чтобы Neon/лок
+    # не оставляли игрока с одним toast «Записываю…» без ответа.
+    result = await asyncio.wait_for(
+        db.create_booking_safe(
+            user_id=user["id"], game_id=game_id, slots_count=slots_count,
+        ),
+        timeout=15,
+    )
 
     if result["status"] == "not_found":
         await callback.message.answer("Эта игра больше не доступна.")
@@ -1665,7 +1770,13 @@ async def process_booking_confirm(callback: CallbackQuery):
 
     # Платёж в той же транзакции, что бронь; при resume без «ожидает» — создаём.
     if not payment or payment.get("status") != "ожидает":
-        payment = await db.get_or_create_pending_payment(booking_id, total_price)
+        payment = await asyncio.wait_for(
+            db.get_or_create_pending_payment(booking_id, total_price),
+            timeout=10,
+        )
+    # Resume / доплата: на экране оплаты — сумма открытого счёта, не price*все места.
+    if payment and payment.get("status") == "ожидает":
+        total_price = float(payment["amount"])
     if not payment:
         await callback.message.answer(
             "❌ Не удалось открыть оплату. Открой «📋 Мои записи» или попробуй ещё раз.",
@@ -1673,23 +1784,17 @@ async def process_booking_confirm(callback: CallbackQuery):
         )
         return
 
+    is_training = (game.get("event_type") or "game") == "training"
+    event_word = "тренировку" if is_training else "игру"
+    when = _format_game_when(game)
+
     if not is_resume:
-        # Не блокируем игрока: если DM админу зависнет, экран оплаты всё равно
-        # откроется. message_id для удаления при отмене сохранится в фоне.
-        asyncio.create_task(
-            _notify_admin_new_booking(
-                callback.bot, user, game, booking_id, slots_count, total_price,
-            )
-        )
-        is_training = (game.get("event_type") or "game") == "training"
-        event_word = "тренировку" if is_training else "игру"
+        # Сначала ответ игроку — уведомление админу не должно влиять на UX.
         title_bit = ""
         if is_training and game.get("title"):
             title_bit = f" «{_html(game['title'])}»"
         await callback.message.answer(
-            f"✅ Ты записан на {event_word}{title_bit} "
-            f"{game['game_date'].strftime('%d.%m.%Y')} "
-            f"в {str(game['game_time'])[:5]}!\n\n"
+            f"✅ Ты записан на {event_word}{title_bit} {when}!\n\n"
             f"👥 Мест: <b>{slots_count}</b>\n"
             f"💰 К оплате: <b>{total_price:.0f} ₽</b>\n"
             "📌 Статус заявки: <b>новая</b>\n\n"
@@ -1704,12 +1809,13 @@ async def process_booking_confirm(callback: CallbackQuery):
                 _underfill_booking_notice(taken, total_slots),
                 parse_mode="HTML",
             )
-    else:
-        event_word = (
-            "тренировку"
-            if (game.get("event_type") or "game") == "training"
-            else "игру"
+        _fire_and_forget(
+            _notify_admin_new_booking(
+                callback.bot, user, game, booking_id, slots_count, total_price,
+            ),
+            name=f"admin_new_booking:{booking_id}",
         )
+    else:
         await callback.message.answer(
             f"Ты уже записан на эту {event_word} — продолжаем оплату.\n"
             "Отменить можно кнопкой ниже или в «📋 Мои записи».",
@@ -1786,7 +1892,29 @@ async def process_buy_more_back(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("buy_more_slots:"))
 async def process_buy_more_confirm(callback: CallbackQuery):
     """Подтверждение докупки мест → увеличиваем бронь и открываем оплату доплаты."""
-    await callback.answer("Добавляю места…")
+    try:
+        await callback.answer("Добавляю места…")
+    except Exception:
+        pass
+    try:
+        await _do_buy_more_confirm(callback)
+    except asyncio.TimeoutError:
+        logger.error("Таймаут докупки buy_more_slots data=%s", callback.data)
+        await callback.message.answer(
+            "❌ База данных отвечает слишком долго.\n"
+            "Попробуй ещё раз через несколько секунд.",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        logger.exception("Ошибка докупки buy_more_slots data=%s: %s", callback.data, e)
+        await callback.message.answer(
+            "❌ Не удалось докупить места из‑за временной ошибки.\n"
+            "Попробуй ещё раз или открой «📋 Мои записи».",
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+async def _do_buy_more_confirm(callback: CallbackQuery) -> None:
     user = await _require_registered(callback.from_user.id)
     if not user:
         await callback.message.answer(
@@ -1795,7 +1923,7 @@ async def process_buy_more_confirm(callback: CallbackQuery):
         )
         return
 
-    parts = callback.data.split(":")
+    parts = (callback.data or "").split(":")
     if len(parts) != 3:
         await callback.message.answer("Некорректные данные.")
         return
@@ -1809,10 +1937,19 @@ async def process_buy_more_confirm(callback: CallbackQuery):
         await callback.message.answer("Некорректное количество мест.")
         return
 
-    result = await db.increase_booking_slots_safe(
-        user_id=user["id"],
-        booking_id=booking_id,
-        extra_slots=extra_slots,
+    # Снимаем inline-клавиатуру, чтобы двойной тап не добавил места дважды.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    result = await asyncio.wait_for(
+        db.increase_booking_slots_safe(
+            user_id=user["id"],
+            booking_id=booking_id,
+            extra_slots=extra_slots,
+        ),
+        timeout=15,
     )
 
     if result["status"] == "not_found":
@@ -1850,11 +1987,12 @@ async def process_buy_more_confirm(callback: CallbackQuery):
     total_price = float(payment["amount"])
     _invalidate_games_cache()
 
-    asyncio.create_task(
+    _fire_and_forget(
         _notify_admin_extra_slots(
             callback.bot, user, game, booking_id, added, total_price,
             int(booking.get("slots_count") or added),
-        )
+        ),
+        name=f"admin_extra_slots:{booking_id}",
     )
 
     await callback.message.answer(
@@ -1940,9 +2078,6 @@ def _underfill_booking_notice(taken: int, total_slots: int) -> str:
 
 
 def _payment_header(game: dict, amount: float) -> str:
-    game_dt = (
-        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
-    )
     is_training = (game.get("event_type") or "game") == "training"
     title_line = ""
     if is_training and game.get("title"):
@@ -1951,8 +2086,8 @@ def _payment_header(game: dict, amount: float) -> str:
         "💳 <b>Оплата</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{title_line}"
-        f"📅 {_html(game_dt)}\n"
-        f"📍 {_html(game['location'])}\n"
+        f"📅 {_html(_format_game_when(game))}\n"
+        f"📍 {_html(game.get('location'))}\n"
         f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
     )
 
@@ -2090,6 +2225,10 @@ async def process_pay_legacy_online(callback: CallbackQuery):
     await callback.answer()
     user = await _require_registered(callback.from_user.id)
     if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
     payment_id = int(callback.data.split(":")[1])
     payment = await db.get_payment_for_user(payment_id, user["id"])
@@ -2732,13 +2871,23 @@ async def _send_reminder_batch(
             for p in participants
         ]
         results = await asyncio.gather(*sends, return_exceptions=True)
+        sent_ok = 0
         for p, result in zip(participants, results):
             if isinstance(result, Exception):
                 logger.error(
                     "Не удалось отправить напоминание пользователю %s: %s",
                     p["telegram_id"], result,
                 )
-        await mark_sent(game["id"])
+            else:
+                sent_ok += 1
+        # Не помечаем «отправлено», если никто не получил — иначе окно потеряно.
+        if sent_ok > 0:
+            await mark_sent(game["id"])
+        else:
+            logger.warning(
+                "Напоминание по игре #%s не доставлено никому — флаг не ставим",
+                game["id"],
+            )
 
 
 async def _process_underfill_warnings(bot: Bot) -> None:
@@ -2974,22 +3123,32 @@ async def send_reminders(bot: Bot):
     await _process_underfill_cancels(bot)
 
 
-def _make_reminder_job(bot: Bot, loop: asyncio.AbstractEventLoop):
-    """APScheduler (BackgroundScheduler) работает в СВОЁМ отдельном потоке
-    и не умеет напрямую вызывать async-функции — job должен быть обычной
-    (синхронной) функцией. Передаём корутину в event loop бота через
-    run_coroutine_threadsafe и ждём результат с таймаутом: так планировщик
-    не блокирует ни свой поток, ни event loop бота, а БД/сеть по-прежнему
-    работают через тот же asyncpg-пул, что и остальные обработчики."""
+def _make_bot_scheduler_spawner(loop: asyncio.AbstractEventLoop):
+    """Запуск фоновых корутин бота без future.result(): иначе при таймауте
+    задача продолжает крутиться, а через минуту стартует ещё одна."""
+    running = {"reminders": False, "unpaid": False}
 
-    def _job() -> None:
-        future = asyncio.run_coroutine_threadsafe(send_reminders(bot), loop)
+    def spawn(name: str, coro_factory):
+        if running.get(name):
+            logger.warning("Пропуск фоновой задачи %s — предыдущая ещё выполняется", name)
+            return
+
+        async def _runner():
+            running[name] = True
+            try:
+                await coro_factory()
+            except Exception as e:
+                logger.error("Ошибка фоновой задачи %s: %s", name, e)
+            finally:
+                running[name] = False
+
         try:
-            future.result(timeout=60)
+            asyncio.run_coroutine_threadsafe(_runner(), loop)
         except Exception as e:
-            logger.error("Ошибка задачи напоминаний: %s", e)
+            running[name] = False
+            logger.error("Не удалось запустить фоновую задачу %s: %s", name, e)
 
-    return _job
+    return spawn
 
 
 async def main():
@@ -3016,20 +3175,19 @@ async def main():
     # как было для 24ч-напоминания) — чтобы надёжно попадать в более узкое
     # окно 2-часового напоминания (1ч45м-2ч15м).
     loop = asyncio.get_running_loop()
+    spawn_job = _make_bot_scheduler_spawner(loop)
     # Часовой пояс планировщика — Москва (как и вся логика игр/возвратов).
     scheduler = BackgroundScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(_make_reminder_job(bot, loop), "interval", minutes=15)
-
-    def _unpaid_timeout_job():
-        future = asyncio.run_coroutine_threadsafe(
-            process_unpaid_payment_timeouts(bot), loop,
-        )
-        try:
-            future.result(timeout=60)
-        except Exception as e:
-            logger.error("Ошибка автоотмены неоплаченных заказов: %s", e)
-
-    scheduler.add_job(_unpaid_timeout_job, "interval", minutes=1)
+    scheduler.add_job(
+        lambda: spawn_job("reminders", lambda: send_reminders(bot)),
+        "interval",
+        minutes=15,
+    )
+    scheduler.add_job(
+        lambda: spawn_job("unpaid", lambda: process_unpaid_payment_timeouts(bot)),
+        "interval",
+        minutes=1,
+    )
     scheduler.start()
 
     try:

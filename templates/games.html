@@ -411,13 +411,23 @@
                 const participants = data.participants || [];
                 const effectiveTaken = (Number(g.taken) || 0) + (Number(g.booked_places) || 0);
                 const isFull = g.total_slots ? effectiveTaken >= g.total_slots : false;
+                const isTraining = (g.event_type || 'game') === 'training';
+                const heading = isTraining
+                    ? ('Тренировка' + (g.title ? ': ' + esc(g.title) : '') + ' №' + esc(g.id))
+                    : ('Игра №' + esc(g.id));
 
-                let html = '<h2 style="margin-top:0;">Игра №' + esc(g.id) +
+                let html = '<h2 style="margin-top:0;">' + heading +
                     (g.is_live ? ' <span class="badge badge-live" style="font-size:12px; vertical-align:middle;">🟢 Идёт сейчас</span>' : '') +
                     (isFull ?
                     ' <span class="badge badge-full" style="font-size:12px; vertical-align:middle;">🚫 Мест нет</span>' : '') +
                     '</h2>';
                 html += '<div class="details-grid">';
+                if (isTraining && g.title) {
+                    html += detailRow('Название', g.title);
+                }
+                if (isTraining && g.coach_name) {
+                    html += detailRow('Тренер', (g.coach_emoji ? g.coach_emoji + ' ' : '') + g.coach_name);
+                }
                 html += detailRow('Дата и время', g.game_date + ' в ' + g.game_time);
                 html += detailRow('Город', g.city);
                 html += detailRow('Клуб', g.club_name);

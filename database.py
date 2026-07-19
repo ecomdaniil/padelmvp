@@ -1370,11 +1370,13 @@ def get_game_details(game_id: int):
     cur.execute(
         f"""
         SELECT g.*, c.name AS club_name,
+               coach.name AS coach_name, coach.emoji AS coach_emoji,
                COALESCE(bk.taken, 0) AS taken,
                COALESCE(pm.collected, 0) AS collected,
                ({_LOCAL_NOW_EXPR} >= (g.game_date + g.game_time) AND {_LOCAL_NOW_EXPR} < {_GAME_END_EXPR}) AS is_live
         FROM games g
         LEFT JOIN clubs c ON c.id = g.club_id
+        LEFT JOIN coaches coach ON coach.id = g.coach_id
         LEFT JOIN (
             SELECT game_id, SUM(slots_count) AS taken
             FROM bookings
@@ -1407,7 +1409,13 @@ def get_game_details(game_id: int):
                p.status AS payment_status, p.amount AS payment_amount, p.method AS payment_method
         FROM bookings b
         JOIN users u ON u.id = b.user_id
-        LEFT JOIN payments p ON p.booking_id = b.id
+        LEFT JOIN LATERAL (
+            SELECT status, amount, method
+            FROM payments
+            WHERE booking_id = b.id
+            ORDER BY id DESC
+            LIMIT 1
+        ) p ON TRUE
         WHERE b.game_id = %s
         ORDER BY b.created_at
         """,
@@ -1595,8 +1603,8 @@ def get_payments_filtered(search: str = "", status: str = ""):
 
 def delete_pending_payments_for_booking(booking_id: int) -> int:
     """Удаляет неоплаченные платежи «ожидает» по заявке.
-    Строки, где игрок уже сообщил об оплате (player_notified_at) или есть
-    provider_payment_id, не трогаем — иначе теряется след денег."""
+    Строки, где игрок уже сообщил об оплате (player_notified_at), не трогаем —
+    их переводит в «возврат» mark_confirmed_payments_refund_for_booking."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1605,7 +1613,6 @@ def delete_pending_payments_for_booking(booking_id: int) -> int:
         WHERE booking_id = %s
           AND status = 'ожидает'
           AND player_notified_at IS NULL
-          AND (provider_payment_id IS NULL OR provider_payment_id = '')
         """,
         (booking_id,),
     )
@@ -1617,8 +1624,8 @@ def delete_pending_payments_for_booking(booking_id: int) -> int:
 
 
 def mark_confirmed_payments_refund_for_booking(booking_id: int) -> int:
-    """При отмене заявки админом — все подтверждённые оплаты → «возврат».
-    Обновляет admin_attention_at, чтобы в шапке CRM загорелся бейдж «+N»."""
+    """При отмене заявки админом — подтверждённые и уже заявленные игроком
+    оплаты («Я оплатил») → «возврат». Бейдж «+N» через admin_attention_at."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1626,7 +1633,11 @@ def mark_confirmed_payments_refund_for_booking(booking_id: int) -> int:
         UPDATE payments
            SET status = 'возврат',
                admin_attention_at = NOW()
-         WHERE booking_id = %s AND status = 'подтверждена'
+         WHERE booking_id = %s
+           AND (
+               status = 'подтверждена'
+               OR (status = 'ожидает' AND player_notified_at IS NOT NULL)
+           )
         """,
         (booking_id,),
     )
@@ -1685,6 +1696,7 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
     cur.execute(
         f"""
         SELECT p.*, u.name AS user_name, b.game_id, g.game_date, g.game_time, g.location,
+               COALESCE(g.event_type, 'game') AS event_type, g.title,
                COUNT(*) OVER() AS total_count
         FROM payments p
         JOIN bookings b ON b.id = p.booking_id
@@ -2043,9 +2055,9 @@ def mark_booking_visited_and_get(booking_id: int):
     return row
 
 
-# Игроки «сыгравших» игр: бронь не отменена и время старта игры уже прошло
-# (по Москве). Раньше вкладка «Посещения» смотрела только status='посещена',
-# который почти никто не ставил вручную — список был пустым.
+# Игроки прошедших/начавшихся игр и тренировок: бронь не отменена и время
+# старта уже прошло (по Москве). Раньше вкладка «Посещения» смотрела только
+# status='посещена', который почти никто не ставил вручную — список был пустым.
 _VISITS_WHERE = f"""
     b.status != 'отменена'
     AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
@@ -2054,12 +2066,13 @@ _VISITS_WHERE = f"""
 
 
 def get_all_visits():
-    """Все сыгравшие игроки с данными об играх (для отчётов)."""
+    """Все сыгравшие игроки с данными об играх и тренировках (для отчётов)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(f"""
         SELECT b.*, u.name AS user_name, u.phone AS user_phone,
-               g.id AS game_id, g.game_date, g.game_time, g.location
+               g.id AS game_id, g.game_date, g.game_time, g.location,
+               COALESCE(g.event_type, 'game') AS event_type, g.title
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         JOIN games g ON g.id = b.game_id
@@ -2074,8 +2087,8 @@ def get_all_visits():
 
 def get_visits_paginated(page: int = 1, per_page: int = 20):
     """Сыгравшие игроки с пагинацией — вкладка CRM «Посещения».
-    Показывает имя, телефон, № игры и дату для броней на уже начавшиеся
-    / прошедшие игры (не отменённые)."""
+    Показывает имя, телефон, игру/тренировку и дату для броней на уже
+    начавшиеся / прошедшие события (не отменённые)."""
     page = max(1, page)
     offset = (page - 1) * per_page
 
@@ -2086,6 +2099,7 @@ def get_visits_paginated(page: int = 1, per_page: int = 20):
         f"""
         SELECT b.*, u.name AS user_name, u.phone AS user_phone,
                g.id AS game_id, g.game_date, g.game_time, g.location,
+               COALESCE(g.event_type, 'game') AS event_type, g.title,
                COUNT(*) OVER() AS total_count
         FROM bookings b
         JOIN users u ON u.id = b.user_id
