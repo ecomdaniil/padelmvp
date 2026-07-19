@@ -532,6 +532,7 @@
         <div class="nav-links">
             <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint == 'index' }}">Главная</a>
             <a href="{{ url_for('games_list') }}" class="{{ 'active' if request.endpoint in ['games_list', 'game_new', 'game_edit'] }}">Игры</a>
+            <a href="{{ url_for('trainings_list') }}" class="{{ 'active' if request.endpoint in ['trainings_list', 'training_new', 'training_edit'] }}">Тренировки</a>
             <a href="{{ url_for('bookings_list') }}" class="{{ 'active' if request.endpoint == 'bookings_list' }}">
                 Заявки<span class="nav-badge" id="nav-badge-bookings" {% if not nav_badges or not nav_badges.bookings %}style="display:none;"{% endif %}>+{{ nav_badges.bookings if nav_badges else 0 }}</span>
             </a>
@@ -541,9 +542,7 @@
             <a href="{{ url_for('visits_list') }}" class="{{ 'active' if request.endpoint == 'visits_list' }}">Посещения</a>
             <a href="{{ url_for('clubs_list') }}" class="{{ 'active' if request.endpoint in ['clubs_list', 'club_new', 'club_edit'] }}">Клубы</a>
             <a href="{{ url_for('logs_list') }}" class="{{ 'active' if request.endpoint == 'logs_list' }}">Журнал</a>
-            <a href="{{ url_for('reviews_list') }}" class="{{ 'active' if request.endpoint == 'reviews_list' }}">
-                Отзывы<span class="nav-badge" id="nav-badge-reviews" {% if not nav_badges or not nav_badges.reviews %}style="display:none;"{% endif %}>+{{ nav_badges.reviews if nav_badges else 0 }}</span>
-            </a>
+            <a href="{{ url_for('coaches_list') }}" class="{{ 'active' if request.endpoint in ['coaches_list', 'coach_new', 'coach_edit'] }}">Тренеры</a>
         </div>
         <div class="nav-actions">
             <form method="post" action="{{ url_for('logout') }}" style="margin:0;">
@@ -628,9 +627,8 @@
             const badges = {
                 bookings: document.getElementById('nav-badge-bookings'),
                 payments: document.getElementById('nav-badge-payments'),
-                reviews: document.getElementById('nav-badge-reviews'),
             };
-            if (!badges.bookings && !badges.payments && !badges.reviews) return;
+            if (!badges.bookings && !badges.payments) return;
 
             function updateBadge(el, count) {
                 if (!el) return;
@@ -649,7 +647,6 @@
                         if (!data) return;
                         updateBadge(badges.bookings, data.new_bookings || 0);
                         updateBadge(badges.payments, data.new_payments || 0);
-                        updateBadge(badges.reviews, data.new_reviews || 0);
                     })
                     .catch(function () { /* сеть недоступна — просто пропускаем цикл */ });
             }

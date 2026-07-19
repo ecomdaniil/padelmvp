@@ -224,10 +224,14 @@ async def get_upcoming_games_with_slots() -> list:
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
-        SELECT g.*, LEAST(
-            COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0), g.total_slots
-        ) AS taken
+        SELECT g.*,
+               co.name AS coach_name,
+               co.emoji AS coach_emoji,
+               LEAST(
+                   COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0), g.total_slots
+               ) AS taken
         FROM games g
+        LEFT JOIN coaches co ON co.id = g.coach_id
         LEFT JOIN (
             SELECT game_id, SUM(slots_count) AS taken
             FROM bookings
@@ -241,6 +245,23 @@ async def get_upcoming_games_with_slots() -> list:
         """
     )
     return _to_dict_list(rows)
+
+
+async def get_active_coaches() -> list:
+    """Активные тренеры для бота (раздел «Тренеры»)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """SELECT * FROM coaches
+           WHERE is_active = TRUE
+           ORDER BY sort_order, name"""
+    )
+    return _to_dict_list(rows)
+
+
+async def get_coach_by_id(coach_id: int) -> Optional[dict]:
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM coaches WHERE id = $1", coach_id)
+    return _to_dict(row)
 
 
 async def get_game_by_id(game_id: int) -> Optional[dict]:

@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>{% if coach %}Редактировать тренера{% else %}Новый тренер{% endif %}</h1>
+    <form method="post" class="card" style="max-width:560px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <div class="form-row">
+            <label for="name">Имя *</label>
+            <input type="text" id="name" name="name" required maxlength="120"
+                   value="{{ values.name }}">
+        </div>
+
+        <div class="form-row">
+            <label for="phone">Номер телефона</label>
+            <input type="text" id="phone" name="phone" maxlength="40"
+                   placeholder="+7 …"
+                   value="{{ values.phone }}">
+        </div>
+
+        <div class="form-row">
+            <label for="telegram_username">Юзер в Telegram</label>
+            <input type="text" id="telegram_username" name="telegram_username" maxlength="64"
+                   placeholder="username без @"
+                   value="{{ values.telegram_username }}">
+        </div>
+
+        <div class="form-row">
+            <label for="experience">Стаж</label>
+            <input type="text" id="experience" name="experience" maxlength="120"
+                   placeholder="например: 8 лет"
+                   value="{{ values.experience }}">
+        </div>
+
+        <div class="form-row">
+            <label for="specialization">Специализация</label>
+            <textarea id="specialization" name="specialization" rows="3"
+                      maxlength="2000"
+                      placeholder="Чем занимается тренер">{{ values.specialization }}</textarea>
+        </div>
+
+        <div class="form-row">
+            <label for="achievements">Достижения</label>
+            <textarea id="achievements" name="achievements" rows="4"
+                      maxlength="4000"
+                      placeholder="Список достижений">{{ values.achievements }}</textarea>
+        </div>
+
+        <div class="form-row">
+            <label for="emoji">Эмодзи</label>
+            <input type="text" id="emoji" name="emoji" maxlength="8"
+                   value="{{ values.emoji }}">
+        </div>
+
+        <div class="form-row">
+            <label for="sort_order">Порядок в списке</label>
+            <input type="number" id="sort_order" name="sort_order" step="1"
+                   value="{{ values.sort_order }}">
+        </div>
+
+        <div class="form-row">
+            <label>
+                <input type="checkbox" name="is_active" value="1"
+                       {% if values.is_active %}checked{% endif %}>
+                Показывать в боте
+            </label>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="btn">Сохранить</button>
+            <a href="{{ url_for('coaches_list') }}" class="btn btn-secondary">Отмена</a>
+        </div>
+    </form>
+
+    {% if coach and coach.is_active %}
+    <form method="post" action="{{ url_for('coach_hide', coach_id=coach.id) }}"
+          style="margin-top:16px;max-width:560px;"
+          onsubmit="return confirm('Скрыть тренера из бота?');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-secondary">Скрыть из бота</button>
+    </form>
+    {% endif %}
+{% endblock %}

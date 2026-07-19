@@ -383,6 +383,88 @@ def _migrate_games_table(cur):
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS underfill_cancelled "
         "BOOLEAN NOT NULL DEFAULT FALSE;"
     )
+    # event_type: 'game' (обычная игра) | 'training' (тренировка с тренером).
+    # title — название тренировки («Отработка ударов»); coach_id — тренер.
+    cur.execute(
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT 'game';"
+    )
+    cur.execute("ALTER TABLE games ADD COLUMN IF NOT EXISTS title TEXT;")
+    cur.execute("ALTER TABLE games ADD COLUMN IF NOT EXISTS coach_id INTEGER;")
+
+
+def _migrate_coaches_table(cur):
+    """Тренеры клуба — карточки для CRM и раздела «Тренеры» в боте."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coaches (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL DEFAULT '',
+            telegram_username TEXT NOT NULL DEFAULT '',
+            experience TEXT NOT NULL DEFAULT '',
+            specialization TEXT NOT NULL DEFAULT '',
+            achievements TEXT NOT NULL DEFAULT '',
+            emoji TEXT NOT NULL DEFAULT '🧑‍🏫',
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    # Сиды — те же три тренера, что раньше были захардкожены в bot_content.
+    cur.execute("SELECT COUNT(*) AS cnt FROM coaches")
+    if int(cur.fetchone()["cnt"] or 0) == 0:
+        seeds = [
+            (
+                "Алексей Иванов",
+                "",
+                "",
+                "8 лет",
+                "Сертифицированный тренер FIP. Специализируется на обучении новичков "
+                "и отработке базовой техники ударов.",
+                "• Тренерский стаж — 8 лет\n"
+                "• Победитель регионального турнира 2023\n"
+                "• 200+ учеников прошли обучение",
+                "🧑‍🏫",
+                1,
+            ),
+            (
+                "Мария Петрова",
+                "",
+                "",
+                "5 лет",
+                "Мастер спорта по теннису, перешла в падел 5 лет назад. "
+                "Ведёт групповые и индивидуальные тренировки для любителей и продвинутых.",
+                "• Участница Кубка России по падел 2024\n"
+                "• Автор курса «Падел с нуля за 4 недели»\n"
+                "• Рейтинг FIP — 4.5",
+                "👩‍🏫",
+                2,
+            ),
+            (
+                "Дмитрий Соколов",
+                "",
+                "",
+                "Стажировка в Испании",
+                "Тренер по тактике и игре у сетки. Помогает парам выстроить "
+                "командную стратегию и улучшить результаты на турнирах.",
+                "• 3-кратный чемпион городской лиги\n"
+                "• Тренер команды-финалиста Кубка клубов\n"
+                "• Стажировка в академии падел, Испания",
+                "🧑‍🏫",
+                3,
+            ),
+        ]
+        for row in seeds:
+            cur.execute(
+                """
+                INSERT INTO coaches (
+                    name, phone, telegram_username, experience,
+                    specialization, achievements, emoji, sort_order
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                row,
+            )
 
 
 def _migrate_admin_logs_table(cur):
@@ -564,6 +646,7 @@ def migrate_db():
     conn = get_connection()
     cur = conn.cursor()
     _migrate_users_table(cur)
+    _migrate_coaches_table(cur)
     _migrate_games_table(cur)
     _migrate_bookings_table(cur)
     _migrate_payments_table(cur)
@@ -683,6 +766,7 @@ def get_games_paginated(
     page: int = 1, per_page: int = 20, level: str = "",
     date_from=None, date_to=None, time_from=None, time_to=None, city: str = "",
     sort_order: str = "asc", fullness: str = "", show_past: bool = False,
+    event_type: str = "game",
 ):
     """Список игр с пагинацией + количество занятых мест/собранных оплат
     одним запросом (без N+1), с опциональными фильтрами по уровню, дате
@@ -705,6 +789,9 @@ def get_games_paginated(
 
     where_clause = "WHERE 1=1"
     params: list = []
+    if event_type:
+        where_clause += " AND COALESCE(g.event_type, 'game') = %s"
+        params.append(event_type)
     if level:
         where_clause += " AND g.level = %s"
         params.append(level)
@@ -773,6 +860,7 @@ def get_games_paginated(
         f"""
         SELECT g.*,
                c.name AS club_name,
+               co.name AS coach_name,
                COALESCE(bk.taken, 0) AS taken,
                COALESCE(pm.collected, 0) AS collected,
                (
@@ -783,6 +871,7 @@ def get_games_paginated(
                COUNT(*) OVER() AS total_count
         FROM games g
         LEFT JOIN clubs c ON c.id = g.club_id
+        LEFT JOIN coaches co ON co.id = g.coach_id
         LEFT JOIN (
             -- SUM(slots_count), а не COUNT(*): одна заявка теперь может
             -- занимать сразу несколько мест (фича «Сколько мест? (1-4)»
@@ -898,18 +987,21 @@ def get_game_by_id(game_id: int):
 def create_game(
     game_date, game_time, location, price, total_slots,
     city=None, club_id=None, address=None, duration_minutes=90, level=None,
-    booked_places=0,
+    booked_places=0, event_type="game", title=None, coach_id=None,
 ):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO games (
                game_date, game_time, location, price, total_slots,
-               city, club_id, address, duration_minutes, level, booked_places
+               city, club_id, address, duration_minutes, level, booked_places,
+               event_type, title, coach_id
            )
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+           RETURNING *""",
         (game_date, game_time, location, price, total_slots,
-         city, club_id, address, duration_minutes, level, booked_places),
+         city, club_id, address, duration_minutes, level, booked_places,
+         event_type or "game", title, coach_id),
     )
     game = cur.fetchone()
     conn.commit()
@@ -921,7 +1013,7 @@ def create_game(
 def update_game(
     game_id, game_date, game_time, location, price, total_slots,
     city=None, club_id=None, address=None, duration_minutes=90, level=None,
-    booked_places=None,
+    booked_places=None, event_type=None, title=None, coach_id=None,
 ):
     """booked_places=None означает "не менять" — используется на случай,
     если update_game когда-нибудь вызовут без этого параметра (обратная
@@ -934,11 +1026,15 @@ def update_game(
                price = %s, total_slots = %s,
                city = %s, club_id = %s, address = %s,
                duration_minutes = %s, level = %s,
-               booked_places = COALESCE(%s, booked_places)
+               booked_places = COALESCE(%s, booked_places),
+               event_type = COALESCE(%s, event_type),
+               title = %s,
+               coach_id = %s
            WHERE id = %s
            RETURNING *""",
         (game_date, game_time, location, price, total_slots,
-         city, club_id, address, duration_minutes, level, booked_places, game_id),
+         city, club_id, address, duration_minutes, level, booked_places,
+         event_type, title, coach_id, game_id),
     )
     game = cur.fetchone()
     conn.commit()
@@ -1990,6 +2086,136 @@ def update_club(
 
 
 # ---------------------------------------------------------------------------
+# COACHES — тренеры
+# ---------------------------------------------------------------------------
+
+def get_all_coaches(active_only: bool = False):
+    conn = get_connection()
+    cur = conn.cursor()
+    if active_only:
+        cur.execute(
+            "SELECT * FROM coaches WHERE is_active = TRUE "
+            "ORDER BY sort_order, name"
+        )
+    else:
+        cur.execute("SELECT * FROM coaches ORDER BY sort_order, name")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def get_coaches_paginated(page: int = 1, per_page: int = 20):
+    page = max(1, page)
+    offset = (page - 1) * per_page
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT *, COUNT(*) OVER() AS total_count
+           FROM coaches
+           ORDER BY sort_order, name
+           LIMIT %s OFFSET %s""",
+        (per_page, offset),
+    )
+    rows = cur.fetchall()
+    result = _paginated_from_window(
+        cur, rows, page, per_page, "SELECT COUNT(*) AS cnt FROM coaches",
+    )
+    cur.close()
+    conn.close()
+    return result
+
+
+def get_coach_by_id(coach_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM coaches WHERE id = %s", (coach_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def create_coach(
+    name: str,
+    phone: str = "",
+    telegram_username: str = "",
+    experience: str = "",
+    specialization: str = "",
+    achievements: str = "",
+    emoji: str = "🧑‍🏫",
+    is_active: bool = True,
+    sort_order: int = 0,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO coaches (
+               name, phone, telegram_username, experience,
+               specialization, achievements, emoji, is_active, sort_order
+           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+        (
+            name, phone or "", (telegram_username or "").lstrip("@"),
+            experience or "", specialization or "", achievements or "",
+            emoji or "🧑‍🏫", bool(is_active), int(sort_order or 0),
+        ),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
+def update_coach(
+    coach_id: int,
+    name: str,
+    phone: str = "",
+    telegram_username: str = "",
+    experience: str = "",
+    specialization: str = "",
+    achievements: str = "",
+    emoji: str = "🧑‍🏫",
+    is_active: bool = True,
+    sort_order: int = 0,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """UPDATE coaches SET
+               name = %s, phone = %s, telegram_username = %s,
+               experience = %s, specialization = %s, achievements = %s,
+               emoji = %s, is_active = %s, sort_order = %s
+           WHERE id = %s RETURNING *""",
+        (
+            name, phone or "", (telegram_username or "").lstrip("@"),
+            experience or "", specialization or "", achievements or "",
+            emoji or "🧑‍🏫", bool(is_active), int(sort_order or 0), coach_id,
+        ),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
+def delete_coach(coach_id: int):
+    """Мягкое удаление — скрываем тренера; тренировки с ним остаются в истории."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE coaches SET is_active = FALSE WHERE id = %s RETURNING *",
+        (coach_id,),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
+# ---------------------------------------------------------------------------
 # ADMIN LOGS — журнал действий администратора
 # ---------------------------------------------------------------------------
 
@@ -2086,6 +2312,7 @@ def get_dashboard_summary() -> dict:
         SELECT
             (SELECT COUNT(*) FROM games
              WHERE COALESCE(underfill_cancelled, FALSE) = FALSE
+               AND COALESCE(event_type, 'game') = 'game'
                AND (game_date + game_time) >= {_LOCAL_NOW_EXPR}) AS games,
             (SELECT COUNT(*) FROM bookings WHERE status != 'отменена') AS bookings,
             (SELECT COUNT(*) FROM payments p

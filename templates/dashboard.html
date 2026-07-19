@@ -191,6 +191,16 @@
             </div>
             <div class="quick-arrow">→</div>
         </a>
+        <a href="{{ url_for('trainings_list') }}" class="card quick-card">
+            <div class="quick-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 19h16M7 16V8l5-3 5 3v8"/><path d="M9 11h6M12 8v6"/></svg>
+            </div>
+            <div class="quick-body">
+                <div class="quick-title">Тренировки</div>
+                <div class="quick-desc">Занятия с тренером: название, состав и расписание</div>
+            </div>
+            <div class="quick-arrow">→</div>
+        </a>
         <a href="{{ url_for('bookings_list') }}" class="card quick-card">
             <div class="quick-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M9 3.5h6v2.5H9z"/><path d="M9 11h6M9 15h4"/></svg>
@@ -227,16 +237,13 @@
             </div>
             <div class="quick-arrow">→</div>
         </a>
-        <a href="{{ url_for('reviews_list') }}" class="card quick-card">
+        <a href="{{ url_for('coaches_list') }}" class="card quick-card">
             <div class="quick-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.3 5.9.9-4.25 4.1 1 5.8L12 16.8 6.75 19.6l1-5.8L3.5 9.7l5.9-.9z"/></svg>
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 19c1.5-3 4-4.5 7-4.5S17.5 16 19 19"/><path d="M16 7h4M18 5v4"/></svg>
             </div>
             <div class="quick-body">
-                <div class="quick-title">
-                    Отзывы
-                    {% if nav_badges and nav_badges.reviews %}<span class="quick-badge">+{{ nav_badges.reviews }}</span>{% endif %}
-                </div>
-                <div class="quick-desc">Отзывы игроков после игр</div>
+                <div class="quick-title">Тренеры</div>
+                <div class="quick-desc">Карточки тренеров для бота и тренировок</div>
             </div>
             <div class="quick-arrow">→</div>
         </a>

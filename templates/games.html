@@ -1,9 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
-    <h1>Игры</h1>
+    {% set is_training = event_type == 'training' %}
+    <h1>{% if is_training %}Тренировки{% else %}Игры{% endif %}</h1>
     <div class="top-actions">
-        <a class="btn" href="{{ url_for('game_new') }}">+ Создать игру</a>
+        <a class="btn" href="{{ url_for('training_new' if is_training else 'game_new') }}">
+            {% if is_training %}+ Создать тренировку{% else %}+ Создать игру{% endif %}
+        </a>
+        {% if not is_training %}
         <a class="btn btn-secondary" href="{{ url_for('report_excel') }}">📊 Выгрузить отчёт в Excel</a>
+        {% endif %}
     </div>
 
     <div class="card games-filters-card">
@@ -66,7 +71,7 @@
             </div>
             <div class="filter-actions">
                 <button type="submit" class="btn">Фильтровать</button>
-                <a href="{{ url_for('games_list') }}" class="btn btn-secondary">Сбросить</a>
+                <a href="{{ url_for('trainings_list' if is_training else 'games_list') }}" class="btn btn-secondary">Сбросить</a>
             </div>
         </form>
     </div>
@@ -78,10 +83,13 @@
         <div class="card game-card{{ ' game-card-full' if is_full else '' }}">
             <div class="game-card-head">
                 <button type="button" class="game-icon-btn" data-game-id="{{ g.id }}"
-                        title="Подробнее об игре №{{ g.id }}">🎾</button>
+                        title="Подробнее {% if is_training %}о тренировке{% else %}об игре{% endif %} №{{ g.id }}">{% if is_training %}🏋️{% else %}🎾{% endif %}</button>
                 <div class="game-card-head-main">
+                    {% if is_training and g.title %}
+                    <div class="game-card-date">{{ g.title }}</div>
+                    {% endif %}
                     <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
-                    <div class="game-card-number">№{{ g.id }}</div>
+                    <div class="game-card-number">№{{ g.id }}{% if is_training and g.coach_name %} · {{ g.coach_name }}{% endif %}</div>
                 </div>
                 {% if g.is_live and effective_taken > 0 %}
                 <span class="badge badge-live" title="Игра уже началась и ещё не закончилась">🟢 Идёт сейчас</span>
@@ -131,16 +139,16 @@
             </div>
 
             <div class="game-card-actions">
-                <a class="btn btn-secondary" href="{{ url_for('game_edit', game_id=g.id) }}">Изменить</a>
-                <form method="post" action="{{ url_for('game_delete', game_id=g.id) }}"
-                      onsubmit="return confirm('Удалить эту игру? Все заявки и оплаты по ней тоже будут удалены.');">
+                <a class="btn btn-secondary" href="{{ url_for('training_edit' if is_training else 'game_edit', game_id=g.id) }}">Изменить</a>
+                <form method="post" action="{{ url_for('training_delete' if is_training else 'game_delete', game_id=g.id) }}"
+                      onsubmit="return confirm('Удалить {% if is_training %}эту тренировку{% else %}эту игру{% endif %}? Все заявки и оплаты по ней тоже будут удалены.');">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn" style="background:#dc2626; box-shadow:none;">Удалить</button>
                 </form>
             </div>
         </div>
         {% else %}
-        <div class="card">Игр пока нет. Создайте первую!</div>
+        <div class="card">{% if is_training %}Тренировок пока нет. Создайте первую!{% else %}Игр пока нет. Создайте первую!{% endif %}</div>
         {% endfor %}
     </div>
 

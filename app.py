@@ -529,11 +529,10 @@ def inject_nav_badges():
         logger.error("Не удалось прочитать бейджи меню: %s", e)
         counts = None
     if not counts:
-        return {"nav_badges": {"bookings": 0, "payments": 0, "reviews": 0}}
+        return {"nav_badges": {"bookings": 0, "payments": 0}}
     return {"nav_badges": {
         "bookings": counts["new_bookings"],
         "payments": counts["new_payments"],
-        "reviews": counts["new_reviews"],
     }}
 
 
@@ -713,16 +712,20 @@ def _game_values_from_form(form):
         "duration_minutes": form.get("duration_minutes", "").strip(),
         "level": form.get("level", "").strip(),
         "booked_places": form.get("booked_places", "").strip(),
+        "event_type": (form.get("event_type") or "game").strip() or "game",
+        "title": form.get("title", "").strip(),
+        "coach_id": form.get("coach_id", "").strip(),
     }
 
 
-def _game_values_from_row(game):
+def _game_values_from_row(game, event_type: str = "game"):
     """Тот же формат значений, но из строки БД (для GET /games/new и .../edit)."""
     if not game:
         return {
             "game_date": "", "game_time": "", "city": "", "club_id": "",
             "address": "", "price": "", "total_slots": "",
             "duration_minutes": "90", "level": "", "booked_places": "0",
+            "event_type": event_type, "title": "", "coach_id": "",
         }
     return {
         "game_date": game["game_date"].isoformat(),
@@ -735,6 +738,9 @@ def _game_values_from_row(game):
         "duration_minutes": str(game.get("duration_minutes") or 90),
         "level": game.get("level") or "",
         "booked_places": str(game.get("booked_places") or 0),
+        "event_type": game.get("event_type") or event_type,
+        "title": game.get("title") or "",
+        "coach_id": str(game["coach_id"]) if game.get("coach_id") else "",
     }
 
 
@@ -832,6 +838,29 @@ def _validate_game_values(values, clubs_by_id, actual_taken: int = 0):
         errors.append("Некорректно выбран уровень.")
     parsed["level"] = values["level"] if values["level"] in GAME_LEVELS else None
 
+    event_type = values.get("event_type") or "game"
+    if event_type not in ("game", "training"):
+        event_type = "game"
+    parsed["event_type"] = event_type
+    parsed["title"] = (values.get("title") or "")[:120] or None
+    parsed["coach_id"] = None
+    if event_type == "training":
+        if not parsed["title"]:
+            errors.append("Укажите название тренировки.")
+        raw_coach = (values.get("coach_id") or "").strip()
+        if not raw_coach:
+            errors.append("Выберите тренера.")
+        else:
+            try:
+                coach_id = int(raw_coach)
+            except ValueError:
+                errors.append("Некорректно выбран тренер.")
+            else:
+                if not db.get_coach_by_id(coach_id):
+                    errors.append("Выбранный тренер не найден.")
+                else:
+                    parsed["coach_id"] = coach_id
+
     return errors, parsed
 
 
@@ -865,9 +894,7 @@ def _safe_time(value: str):
         return None
 
 
-@app.route("/games")
-@login_required
-def games_list():
+def _render_events_list(event_type: str):
     page = request.args.get("page", 1, type=int)
     level = request.args.get("level", "")
     city = request.args.get("city", "")
@@ -888,6 +915,7 @@ def games_list():
         date_from=_safe_date(date_from_raw), date_to=_safe_date(date_to_raw),
         time_from=_safe_time(time_from_raw), time_to=_safe_time(time_to_raw),
         sort_order=sort_order, fullness=fullness, show_past=show_past,
+        event_type=event_type,
     )
     cities = db.get_distinct_game_cities()
     return render_template(
@@ -897,24 +925,64 @@ def games_list():
         date_from=date_from_raw, date_to=date_to_raw,
         time_from=time_from_raw, time_to=time_to_raw,
         sort_order=sort_order, fullness=fullness, show_past=show_past,
+        event_type=event_type,
     )
+
+
+def _event_form_context(event_type: str, game=None, values=None, actual_taken=None):
+    clubs = db.get_all_clubs()
+    coaches = db.get_all_coaches(active_only=True)
+    ctx = {
+        "game": game,
+        "values": values if values is not None else _game_values_from_row(game, event_type),
+        "clubs": clubs,
+        "coaches": coaches,
+        "levels": GAME_LEVELS,
+        "event_type": event_type,
+    }
+    if actual_taken is not None:
+        ctx["actual_taken"] = actual_taken
+    return ctx
+
+
+@app.route("/games")
+@login_required
+def games_list():
+    return _render_events_list("game")
+
+
+@app.route("/trainings")
+@login_required
+def trainings_list():
+    return _render_events_list("training")
 
 
 @app.route("/games/new", methods=["GET", "POST"])
 @login_required
 def game_new():
+    return _event_new("game")
+
+
+@app.route("/trainings/new", methods=["GET", "POST"])
+@login_required
+def training_new():
+    return _event_new("training")
+
+
+def _event_new(event_type: str):
     clubs = db.get_all_clubs()
     clubs_by_id = {c["id"]: c for c in clubs}
+    list_endpoint = "trainings_list" if event_type == "training" else "games_list"
+    label = "Тренировка" if event_type == "training" else "Игра"
 
     if request.method == "POST":
         values = _game_values_from_form(request.form)
+        values["event_type"] = event_type
         errors, parsed = _validate_game_values(values, clubs_by_id)
         if errors:
             for e in errors:
                 flash(e)
-            return render_template(
-                "game_form.html", game=None, values=values, clubs=clubs, levels=GAME_LEVELS
-            )
+            return render_template("game_form.html", **_event_form_context(event_type, values=values))
 
         location = _build_game_location(parsed, clubs_by_id)
         game = db.create_game(
@@ -929,51 +997,59 @@ def game_new():
             duration_minutes=parsed["duration_minutes"],
             level=parsed["level"],
             booked_places=parsed["booked_places"],
+            event_type=parsed["event_type"],
+            title=parsed.get("title"),
+            coach_id=parsed.get("coach_id"),
         )
-        # Бот кэширует список ближайших игр (см. cache.py/bot.py) — без
-        # явного сброса здесь новая игра была видна в боте только после
-        # истечения TTL кэша или перезапуска процесса бота.
         cache.invalidate_games_cache()
+        title_part = f" «{game.get('title')}»" if game.get("title") else ""
         description = (
-            f"Игра №{game['id']} создана: {game['location']}, "
+            f"{label} №{game['id']}{title_part} создана: {game['location']}, "
             f"{_fmt_date(game['game_date'])} {_fmt_time(game['game_time'])}, "
             f"{game['total_slots']} {_ru_plural(game['total_slots'], 'место', 'места', 'мест')}, "
             f"{_fmt_money(game['price'])} руб."
         )
         log_admin_action("create", "game", game["id"], description=description)
-        flash("Игра создана")
-        return redirect(url_for("games_list"))
+        flash(f"{label} создана")
+        return redirect(url_for(list_endpoint))
 
-    return render_template(
-        "game_form.html", game=None, values=_game_values_from_row(None),
-        clubs=clubs, levels=GAME_LEVELS,
-    )
+    return render_template("game_form.html", **_event_form_context(event_type))
 
 
 @app.route("/games/<int:game_id>/edit", methods=["GET", "POST"])
 @login_required
 def game_edit(game_id):
+    return _event_edit(game_id, "game")
+
+
+@app.route("/trainings/<int:game_id>/edit", methods=["GET", "POST"])
+@login_required
+def training_edit(game_id):
+    return _event_edit(game_id, "training")
+
+
+def _event_edit(game_id: int, event_type: str):
     game = db.get_game_by_id(game_id)
-    if not game:
-        flash("Игра не найдена")
-        return redirect(url_for("games_list"))
+    list_endpoint = "trainings_list" if event_type == "training" else "games_list"
+    label = "Тренировка" if event_type == "training" else "Игра"
+    if not game or (game.get("event_type") or "game") != event_type:
+        flash(f"{label} не найдена")
+        return redirect(url_for(list_endpoint))
 
     clubs = db.get_all_clubs()
     clubs_by_id = {c["id"]: c for c in clubs}
 
     if request.method == "POST":
         values = _game_values_from_form(request.form)
-        # actual_taken нужен ДО валидации: booked_places — это ДОПОЛНИТЕЛЬНЫЕ
-        # места сверх реальных бронирований, поэтому лимит для него зависит
-        # от того, сколько мест уже занято через бота.
+        values["event_type"] = event_type
         actual_taken = db.count_bookings_for_game(game_id)
         errors, parsed = _validate_game_values(values, clubs_by_id, actual_taken=actual_taken)
         if errors:
             for e in errors:
                 flash(e)
             return render_template(
-                "game_form.html", game=game, values=values, clubs=clubs, levels=GAME_LEVELS,
-                actual_taken=actual_taken,
+                "game_form.html",
+                **_event_form_context(event_type, game=game, values=values, actual_taken=actual_taken),
             )
 
         location = _build_game_location(parsed, clubs_by_id)
@@ -991,55 +1067,208 @@ def game_edit(game_id):
             duration_minutes=parsed["duration_minutes"],
             level=parsed["level"],
             booked_places=parsed["booked_places"],
+            event_type=parsed["event_type"],
+            title=parsed.get("title"),
+            coach_id=parsed.get("coach_id"),
         )
 
         cache.invalidate_games_cache()
-        description = f"Игра №{game_id} отредактирована: {_describe_game_diff(old_snapshot, dict(updated))}"
+        description = f"{label} №{game_id} отредактирована: {_describe_game_diff(old_snapshot, dict(updated))}"
         log_admin_action("update", "game", game_id, description=description)
-        flash("Игра обновлена")
-        return redirect(url_for("games_list"))
+        flash(f"{label} обновлена")
+        return redirect(url_for(list_endpoint))
 
     actual_taken = db.count_bookings_for_game(game_id)
     return render_template(
-        "game_form.html", game=game, values=_game_values_from_row(game),
-        clubs=clubs, levels=GAME_LEVELS, actual_taken=actual_taken,
+        "game_form.html",
+        **_event_form_context(event_type, game=game, actual_taken=actual_taken),
     )
 
 
 @app.route("/games/<int:game_id>/delete", methods=["POST"])
 @login_required
 def game_delete(game_id):
+    return _event_delete(game_id, "game")
+
+
+@app.route("/trainings/<int:game_id>/delete", methods=["POST"])
+@login_required
+def training_delete(game_id):
+    return _event_delete(game_id, "training")
+
+
+def _event_delete(game_id: int, event_type: str):
     game = db.get_game_by_id(game_id)
-    if not game:
-        flash("Игра не найдена")
-        return redirect(url_for("games_list"))
+    list_endpoint = "trainings_list" if event_type == "training" else "games_list"
+    label = "Тренировка" if event_type == "training" else "Игра"
+    if not game or (game.get("event_type") or "game") != event_type:
+        flash(f"{label} не найдена")
+        return redirect(url_for(list_endpoint))
 
     # CASCADE стёр бы заявки и оплаты — нельзя удалять игру с живыми записями
     # или подтверждёнными платежами (история/возвраты пропадут).
     active_taken = db.count_bookings_for_game(game_id)
     if active_taken > 0:
         flash(
-            "Нельзя удалить игру с активными записями. "
+            f"Нельзя удалить {label.lower()} с активными записями. "
             "Сначала отмените заявки в разделе «Заявки» или дождитесь автоотмены."
         )
-        return redirect(url_for("games_list"))
+        return redirect(url_for(list_endpoint))
     confirmed_sum = db.get_confirmed_payments_sum_for_game(game_id) or 0
     if float(confirmed_sum) > 0:
         flash(
-            "Нельзя удалить игру с подтверждёнными оплатами. "
+            f"Нельзя удалить {label.lower()} с подтверждёнными оплатами. "
             "Оформите возвраты в разделе «Оплаты»."
         )
-        return redirect(url_for("games_list"))
+        return redirect(url_for(list_endpoint))
 
     db.delete_game(game_id)
     cache.invalidate_games_cache()
     description = (
-        f"Игра №{game_id} удалена: {game['location']}, "
+        f"{label} №{game_id} удалена: {game['location']}, "
         f"{_fmt_date(game['game_date'])} {_fmt_time(game['game_time'])}"
     )
     log_admin_action("delete", "game", game_id, description=description)
-    flash("Игра удалена")
-    return redirect(url_for("games_list"))
+    flash(f"{label} удалена")
+    return redirect(url_for(list_endpoint))
+
+
+# ---------------------------------------------------------------------------
+# Тренеры
+# ---------------------------------------------------------------------------
+
+def _coach_values_from_form(form):
+    return {
+        "name": (form.get("name") or "").strip(),
+        "phone": (form.get("phone") or "").strip(),
+        "telegram_username": (form.get("telegram_username") or "").strip().lstrip("@"),
+        "experience": (form.get("experience") or "").strip(),
+        "specialization": (form.get("specialization") or "").strip(),
+        "achievements": (form.get("achievements") or "").strip(),
+        "emoji": (form.get("emoji") or "🧑‍🏫").strip() or "🧑‍🏫",
+        "sort_order": (form.get("sort_order") or "0").strip(),
+        "is_active": bool(form.get("is_active")),
+    }
+
+
+def _coach_values_from_row(coach):
+    if not coach:
+        return {
+            "name": "", "phone": "", "telegram_username": "",
+            "experience": "", "specialization": "", "achievements": "",
+            "emoji": "🧑‍🏫", "sort_order": "0", "is_active": True,
+        }
+    return {
+        "name": coach.get("name") or "",
+        "phone": coach.get("phone") or "",
+        "telegram_username": coach.get("telegram_username") or "",
+        "experience": coach.get("experience") or "",
+        "specialization": coach.get("specialization") or "",
+        "achievements": coach.get("achievements") or "",
+        "emoji": coach.get("emoji") or "🧑‍🏫",
+        "sort_order": str(coach.get("sort_order") or 0),
+        "is_active": bool(coach.get("is_active", True)),
+    }
+
+
+@app.route("/coaches")
+@login_required
+def coaches_list():
+    page = request.args.get("page", 1, type=int)
+    result = db.get_coaches_paginated(page=page, per_page=DEFAULT_PAGE_SIZE)
+    return render_template(
+        "coaches.html", coaches=result["items"], pagination=result,
+    )
+
+
+@app.route("/coaches/new", methods=["GET", "POST"])
+@login_required
+def coach_new():
+    if request.method == "POST":
+        values = _coach_values_from_form(request.form)
+        if len(values["name"]) < 2:
+            flash("Укажите имя тренера.")
+            return render_template("coach_form.html", coach=None, values=values)
+        try:
+            sort_order = int(values["sort_order"] or 0)
+        except ValueError:
+            flash("Порядок должен быть целым числом.")
+            return render_template("coach_form.html", coach=None, values=values)
+        coach = db.create_coach(
+            name=values["name"][:120],
+            phone=values["phone"][:40],
+            telegram_username=values["telegram_username"][:64],
+            experience=values["experience"][:120],
+            specialization=values["specialization"][:2000],
+            achievements=values["achievements"][:4000],
+            emoji=values["emoji"][:8],
+            is_active=values["is_active"],
+            sort_order=sort_order,
+        )
+        log_admin_action(
+            "create", "coach", coach["id"],
+            description=f"Тренер «{coach['name']}» добавлен",
+        )
+        flash("Тренер добавлен")
+        return redirect(url_for("coaches_list"))
+    return render_template(
+        "coach_form.html", coach=None, values=_coach_values_from_row(None),
+    )
+
+
+@app.route("/coaches/<int:coach_id>/edit", methods=["GET", "POST"])
+@login_required
+def coach_edit(coach_id):
+    coach = db.get_coach_by_id(coach_id)
+    if not coach:
+        flash("Тренер не найден")
+        return redirect(url_for("coaches_list"))
+    if request.method == "POST":
+        values = _coach_values_from_form(request.form)
+        if len(values["name"]) < 2:
+            flash("Укажите имя тренера.")
+            return render_template("coach_form.html", coach=coach, values=values)
+        try:
+            sort_order = int(values["sort_order"] or 0)
+        except ValueError:
+            flash("Порядок должен быть целым числом.")
+            return render_template("coach_form.html", coach=coach, values=values)
+        updated = db.update_coach(
+            coach_id,
+            name=values["name"][:120],
+            phone=values["phone"][:40],
+            telegram_username=values["telegram_username"][:64],
+            experience=values["experience"][:120],
+            specialization=values["specialization"][:2000],
+            achievements=values["achievements"][:4000],
+            emoji=values["emoji"][:8],
+            is_active=values["is_active"],
+            sort_order=sort_order,
+        )
+        log_admin_action(
+            "update", "coach", coach_id,
+            description=f"Тренер «{updated['name']}» обновлён",
+        )
+        flash("Тренер обновлён")
+        return redirect(url_for("coaches_list"))
+    return render_template(
+        "coach_form.html", coach=coach, values=_coach_values_from_row(coach),
+    )
+
+
+@app.route("/coaches/<int:coach_id>/hide", methods=["POST"])
+@login_required
+def coach_hide(coach_id):
+    coach = db.delete_coach(coach_id)
+    if not coach:
+        flash("Тренер не найден")
+    else:
+        log_admin_action(
+            "update", "coach", coach_id,
+            description=f"Тренер «{coach['name']}» скрыт из бота",
+        )
+        flash("Тренер скрыт из бота")
+    return redirect(url_for("coaches_list"))
 
 
 # ---------------------------------------------------------------------------

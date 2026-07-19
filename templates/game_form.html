@@ -1,8 +1,37 @@
 {% extends "base.html" %}
 {% block content %}
-    <h1>{% if game %}Редактировать игру{% else %}Новая игра{% endif %}</h1>
+    {% set is_training = event_type == 'training' %}
+    <h1>
+        {% if is_training %}
+            {% if game %}Редактировать тренировку{% else %}Новая тренировка{% endif %}
+        {% else %}
+            {% if game %}Редактировать игру{% else %}Новая игра{% endif %}
+        {% endif %}
+    </h1>
     <form method="post" class="card" style="max-width:520px;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="event_type" value="{{ event_type or 'game' }}">
+
+        {% if is_training %}
+        <div class="form-row">
+            <label for="title">Название тренировки *</label>
+            <input type="text" id="title" name="title" required maxlength="120"
+                   placeholder="например: Отработка ударов"
+                   value="{{ values.title }}">
+        </div>
+        <div class="form-row">
+            <label for="coach_id">Тренер *</label>
+            <select id="coach_id" name="coach_id" required>
+                <option value="">— выберите тренера —</option>
+                {% for co in coaches %}
+                <option value="{{ co.id }}"
+                        {% if values.coach_id == co.id|string %}selected{% endif %}>
+                    {{ co.emoji or '' }} {{ co.name }}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+        {% endif %}
 
         <div class="form-row">
             <label for="game_date">Дата *</label>
@@ -104,7 +133,7 @@
 
         <div class="form-actions">
             <button class="btn" type="submit">Сохранить</button>
-            <a class="btn btn-secondary" href="{{ url_for('games_list') }}">Отмена</a>
+            <a class="btn btn-secondary" href="{{ url_for('trainings_list' if is_training else 'games_list') }}">Отмена</a>
         </div>
     </form>
 

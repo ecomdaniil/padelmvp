@@ -64,7 +64,6 @@ from bot_content import (
     BTN_MY_BOOKINGS,
     BTN_PAST_GAMES,
     BTN_STATS,
-    COACHES,
     MENU_BUTTONS,
     PADEL_INFO_TEXT,
 )
@@ -530,19 +529,20 @@ async def show_games_from_profile(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("games_format:"))
 async def process_games_format(callback: CallbackQuery):
-    """Игрок выбрал Сингл (2) или Классику (4) — показываем только игры
-    с соответствующим total_slots, ближайшие сверху."""
+    """Сингл / Классика / Тренировки."""
+    kind = (callback.data.split(":")[1] if ":" in callback.data else "").strip()
+    await callback.answer()
+    if kind == "training":
+        await _show_trainings(callback.message, telegram_id=callback.from_user.id)
+        return
     try:
-        total_slots = int(callback.data.split(":")[1])
-    except (IndexError, ValueError):
-        await callback.answer("Некорректный выбор формата.", show_alert=True)
+        total_slots = int(kind)
+    except ValueError:
+        await callback.message.answer("Некорректный выбор формата.")
         return
     if total_slots not in (2, 4):
-        await callback.answer("Некорректный выбор формата.", show_alert=True)
+        await callback.message.answer("Некорректный выбор формата.")
         return
-
-    await callback.answer()
-    # См. show_games_from_profile: id игрока берём из callback, не из message.
     await _show_games(
         callback.message,
         total_slots=total_slots,
@@ -733,28 +733,6 @@ def _invalidate_games_cache() -> None:
     cache.invalidate_games_cache()
 
 
-def _game_card(game: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
-    taken = game["taken"]
-    free_slots = game["total_slots"] - taken
-
-    text = (
-        f"📅 <b>{game['game_date'].strftime('%d.%m.%Y')}</b> в {str(game['game_time'])[:5]}\n"
-        f"📍 {_html(game['location'])}\n"
-        f"💰 {_html(game['price'])} ₽\n"
-        f"👥 Свободно мест: <b>{free_slots}</b> из {game['total_slots']}"
-    )
-
-    if free_slots > 0:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Записаться", callback_data=f"book:{game['id']}")]
-        ])
-    else:
-        text += "\n\n❌ <b>Мест нет</b>"
-        keyboard = None
-
-    return text, keyboard
-
-
 async def _send_answer(message: Message, text: str, keyboard: Optional[InlineKeyboardMarkup]) -> None:
     """Обёртка вокруг message.answer(), приведённая к настоящей корутине.
 
@@ -770,15 +748,16 @@ async def _send_answer(message: Message, text: str, keyboard: Optional[InlineKey
 
 
 def _game_format_keyboard() -> InlineKeyboardMarkup:
-    """Выбор формата игры перед показом списка: Сингл (2) / Классика (4)."""
+    """Выбор: Сингл / Классика / Тренировки."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сингл (2 игрока)", callback_data="games_format:2")],
         [InlineKeyboardButton(text="Классика (4 игрока)", callback_data="games_format:4")],
+        [InlineKeyboardButton(text="🏋️ Тренировки", callback_data="games_format:training")],
     ])
 
 
 async def _ask_game_format(message: Message, telegram_id: Optional[int] = None) -> None:
-    """Первый шаг раздела «Игры»: спрашиваем формат, а не сразу шлём список.
+    """Первый шаг раздела «Игры»: спрашиваем формат или тренировки.
 
     telegram_id — id игрока в Telegram. Нужен явно при вызове из callback:
     у callback.message.from_user стоит бот, а не человек, нажавший кнопку."""
@@ -792,12 +771,42 @@ async def _ask_game_format(message: Message, telegram_id: Optional[int] = None) 
         return
 
     await message.answer(
-        "🎾 <b>Какую игру вы ищете?</b>\n"
+        "🎾 <b>Что вы ищете?</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Выбери формат:",
+        "Выбери формат игры или тренировку с тренером:",
         reply_markup=_game_format_keyboard(),
         parse_mode="HTML",
     )
+
+
+def _game_card(game: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    taken = game["taken"]
+    free_slots = game["total_slots"] - taken
+    is_training = (game.get("event_type") or "game") == "training"
+
+    lines = []
+    if is_training and game.get("title"):
+        lines.append(f"🏋️ <b>{_html(game['title'])}</b>")
+    lines.append(
+        f"📅 <b>{game['game_date'].strftime('%d.%m.%Y')}</b> в {str(game['game_time'])[:5]}"
+    )
+    if is_training and game.get("coach_name"):
+        emoji = game.get("coach_emoji") or "🧑‍🏫"
+        lines.append(f"{emoji} Тренер: {_html(game['coach_name'])}")
+    lines.append(f"📍 {_html(game['location'])}")
+    lines.append(f"💰 {_html(game['price'])} ₽")
+    lines.append(f"👥 Свободно мест: <b>{free_slots}</b> из {game['total_slots']}")
+    text = "\n".join(lines)
+
+    if free_slots > 0:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Записаться", callback_data=f"book:{game['id']}")]
+        ])
+    else:
+        text += "\n\n❌ <b>Мест нет</b>"
+        keyboard = None
+
+    return text, keyboard
 
 
 async def _show_games(
@@ -805,13 +814,7 @@ async def _show_games(
     total_slots: int,
     telegram_id: Optional[int] = None,
 ):
-    """Показывает ближайшие игры выбранного формата (total_slots = 2 или 4),
-    отсортированные от ближайшей к дальнейшей. Список уже упорядочен в БД
-    (ORDER BY game_date, game_time); карточки отправляем по одной, чтобы
-    Telegram не перемешал порядок при конкурентной отправке.
-
-    telegram_id — см. _ask_game_format: при вызове из callback нельзя
-    брать message.from_user.id (там id бота)."""
+    """Показывает ближайшие обычные игры выбранного формата (2 или 4)."""
     t_start = time.monotonic()
     user = await _require_registered(telegram_id or message.from_user.id)
     if not user:
@@ -825,7 +828,8 @@ async def _show_games(
     format_label = "Сингл (2 игрока)" if total_slots == 2 else "Классика (4 игрока)"
     games = [
         g for g in await _get_upcoming_games_cached()
-        if int(g.get("total_slots") or 0) == total_slots
+        if (g.get("event_type") or "game") == "game"
+        and int(g.get("total_slots") or 0) == total_slots
     ]
     if not games:
         await message.answer(
@@ -853,6 +857,43 @@ async def _show_games(
         "_show_games: всего %.3f с, %d игр (формат %s)",
         time.monotonic() - t_start, len(games), total_slots,
     )
+
+
+async def _show_trainings(message: Message, telegram_id: Optional[int] = None):
+    """Ближайшие тренировки с тренером."""
+    user = await _require_registered(telegram_id or message.from_user.id)
+    if not user:
+        await message.answer(
+            "❌ Сначала заполни анкету.\n"
+            "Отправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    games = [
+        g for g in await _get_upcoming_games_cached()
+        if (g.get("event_type") or "game") == "training"
+    ]
+    if not games:
+        await message.answer(
+            "😔 Пока нет доступных тренировок.\n\n"
+            "Загляни позже — мы добавляем новые занятия регулярно!",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "🏋️ <b>Ближайшие тренировки</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Выбери занятие и нажми «Записаться»:",
+        parse_mode="HTML",
+    )
+    for game in games:
+        text, keyboard = _game_card(game)
+        try:
+            await _send_answer(message, text, keyboard)
+        except Exception as e:
+            logger.error("Не удалось отправить карточку тренировки #%s: %s", game.get("id"), e)
 
 
 async def _show_my_bookings(message: Message):
@@ -979,13 +1020,13 @@ def _format_statistics(stats: dict) -> str:
     )
 
 
-def _coaches_list_keyboard() -> InlineKeyboardMarkup:
+def _coaches_list_keyboard(coaches: list) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(
-            text=f"{c['emoji']} {c['name']}",
+            text=f"{c.get('emoji') or '🧑‍🏫'} {c['name']}",
             callback_data=f"coach:{c['id']}",
         )]
-        for c in COACHES
+        for c in coaches
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1067,12 +1108,19 @@ async def menu_coaches(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove(),
         )
         return
+    coaches = await db.get_active_coaches()
+    if not coaches:
+        await message.answer(
+            "👨‍🏫 Пока нет активных тренеров.\n"
+            "Загляни позже!",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
     await message.answer(
         "👨‍🏫 <b>Наши тренеры</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Выбери тренера, чтобы узнать подробнее:\n\n"
-        "<i>Скоро тренеров можно будет добавлять через CRM.</i>",
-        reply_markup=_coaches_list_keyboard(),
+        "Выбери тренера, чтобы узнать подробнее:",
+        reply_markup=_coaches_list_keyboard(coaches),
         parse_mode="HTML",
     )
 
@@ -1080,18 +1128,34 @@ async def menu_coaches(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("coach:"))
 async def show_coach_detail(callback: CallbackQuery):
     coach_id = int(callback.data.split(":")[1])
-    coach = next((c for c in COACHES if c["id"] == coach_id), None)
-    if not coach:
+    coach = await db.get_coach_by_id(coach_id)
+    if not coach or not coach.get("is_active"):
         await callback.answer("Тренер не найден", show_alert=True)
         return
 
     await callback.answer()
+    emoji = coach.get("emoji") or "🧑‍🏫"
+    lines = [
+        f"{emoji} <b>{_html(coach['name'])}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+    if coach.get("specialization"):
+        lines.append(f"📝 {_html(coach['specialization'])}")
+        lines.append("")
+    if coach.get("experience"):
+        lines.append(f"⏱ Стаж: {_html(coach['experience'])}")
+    if coach.get("phone"):
+        lines.append(f"📞 {_html(coach['phone'])}")
+    if coach.get("telegram_username"):
+        lines.append(f"✈️ @{_html(coach['telegram_username'])}")
+    if coach.get("achievements"):
+        lines.append("")
+        lines.append(f"🏆 <b>Достижения:</b>\n{_html(coach['achievements'])}")
+    lines.append("")
+    lines.append("<i>Запись на тренировку — в разделе «🎾 Игры» → «Тренировки».</i>")
     await callback.message.answer(
-        f"{coach['emoji']} <b>{coach['name']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📝 {coach['description']}\n\n"
-        f"🏆 <b>Достижения:</b>\n{coach['achievements']}\n\n"
-        "<i>Запись на тренировку — через администратора 💬</i>",
+        "\n".join(lines),
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
     )
