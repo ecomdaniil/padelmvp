@@ -53,11 +53,11 @@
                        value="{{ values.sort_order }}">
             </div>
 
-            <div class="form-row coach-form-check">
+            <div class="form-row coach-form-span coach-form-check">
                 <label class="coach-check-label">
                     <input type="checkbox" name="is_active" value="1"
                            {% if values.is_active %}checked{% endif %}>
-                    Показывать в боте
+                    <span>Показывать в боте</span>
                 </label>
             </div>
         </div>
@@ -115,18 +115,30 @@
             min-height: 84px;
         }
         .coach-form-check {
-            justify-content: flex-end;
+            justify-content: flex-start;
+            align-items: flex-start;
         }
         .coach-check-label {
             display: inline-flex;
             align-items: center;
-            gap: 8px;
-            margin-top: auto;
-            padding: 10px 0;
+            gap: 10px;
+            margin: 0;
+            padding: 4px 0;
             font-weight: 600;
             font-size: 14px;
             color: var(--text, #0f172a);
             cursor: pointer;
+            width: auto;
+        }
+        .coach-form .coach-check-label input[type="checkbox"] {
+            width: auto;
+            min-width: 18px;
+            padding: 0;
+            margin: 0;
+            flex: 0 0 auto;
+            border: none;
+            border-radius: 0;
+            background: transparent;
         }
         .coach-form .form-actions {
             display: flex;
@@ -139,8 +151,6 @@
         }
         @media (max-width: 640px) {
             .coach-form-grid { grid-template-columns: 1fr; }
-            .coach-form-check { justify-content: flex-start; }
-            .coach-check-label { padding-top: 0; }
         }
     </style>
 {% endblock %}

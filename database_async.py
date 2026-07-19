@@ -843,7 +843,10 @@ async def cancel_underfilled_game(game_id: int) -> dict:
                 amount = None
                 if payment is not None and payment["status"] == "подтверждена":
                     await conn.execute(
-                        "UPDATE payments SET status = 'возврат' WHERE id = $1",
+                        """UPDATE payments
+                              SET status = 'возврат',
+                                  admin_attention_at = NOW()
+                            WHERE id = $1""",
                         payment["id"],
                     )
                     refunded = True
@@ -869,6 +872,12 @@ async def cancel_underfilled_game(game_id: int) -> dict:
             )
             game_dict = _to_dict(game)
             game_dict["underfill_cancelled"] = True
+            if any(item.get("refunded") for item in cancelled):
+                try:
+                    import database as db_sync
+                    db_sync.clear_badge_cache()
+                except Exception:
+                    pass
             return {"status": "ok", "game": game_dict, "cancelled": cancelled, "taken": effective}
 
 
@@ -1052,6 +1061,153 @@ async def cancel_payment_or_booking_owned(
     return await cancel_booking_owned(booking_id, user_id)
 
 
+async def list_expired_unpaid_payment_ids(older_than_minutes: int = 5) -> list:
+    """Открытые неоплаченные счета старше N минут (для автоотмены)."""
+    minutes = max(1, int(older_than_minutes))
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT p.id
+        FROM payments p
+        JOIN bookings b ON b.id = p.booking_id
+        WHERE p.status = 'ожидает'
+          AND p.player_notified_at IS NULL
+          AND b.status != 'отменена'
+          AND p.created_at <= NOW() - ($1 * INTERVAL '1 minute')
+        ORDER BY p.created_at
+        LIMIT 100
+        """,
+        minutes,
+    )
+    return [int(r["id"]) for r in rows]
+
+
+async def expire_unpaid_payment(
+    payment_id: int, *, older_than_minutes: int = 5,
+) -> Optional[dict]:
+    """Автоотмена неоплаченного счёта по таймауту.
+
+    Если по брони есть защищённые оплаты — снимаем только доплату и лишние
+    места. Иначе отменяем всю заявку. Не трогает платежи с player_notified_at
+    (игрок уже оплатил / сообщил об оплате).
+
+    Возвращает dict для уведомления игрока или None, если отменять нечего.
+    """
+    minutes = max(1, int(older_than_minutes))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            payment = await conn.fetchrow(
+                """SELECT * FROM payments WHERE id = $1 FOR UPDATE""",
+                payment_id,
+            )
+            if payment is None:
+                return None
+            if payment["status"] != "ожидает" or payment["player_notified_at"] is not None:
+                return None
+            aged = await conn.fetchval(
+                """SELECT created_at <= NOW() - ($1 * INTERVAL '1 minute')
+                   FROM payments WHERE id = $2""",
+                minutes, payment_id,
+            )
+            if not aged:
+                return None
+
+            booking = await conn.fetchrow(
+                "SELECT * FROM bookings WHERE id = $1 FOR UPDATE",
+                payment["booking_id"],
+            )
+            if booking is None or booking["status"] == "отменена":
+                return None
+
+            game = await conn.fetchrow(
+                "SELECT * FROM games WHERE id = $1",
+                booking["game_id"],
+            )
+            if game is None:
+                return None
+
+            user = await conn.fetchrow(
+                "SELECT id, telegram_id, name FROM users WHERE id = $1",
+                booking["user_id"],
+            )
+            if user is None or not user["telegram_id"]:
+                return None
+
+            provider_payment_id = payment["provider_payment_id"]
+            admin_notify_message_id = booking["admin_notify_message_id"]
+            admin_extra_notify_message_id = booking["admin_extra_notify_message_id"]
+
+            protected = await conn.fetch(
+                """SELECT * FROM payments
+                   WHERE booking_id = $1
+                     AND id != $2
+                     AND (
+                         status = 'подтверждена'
+                         OR (status = 'ожидает' AND player_notified_at IS NOT NULL)
+                     )
+                   FOR UPDATE""",
+                booking["id"], payment_id,
+            )
+
+            if protected:
+                price = float(game["price"] or 0)
+                pending_amount = float(payment["amount"] or 0)
+                if price > 0.009:
+                    slots_to_remove = int(round(pending_amount / price))
+                    protected_amount = sum(float(p["amount"] or 0) for p in protected)
+                    protected_slots = max(1, int(round(protected_amount / price)))
+                else:
+                    slots_to_remove = 0
+                    protected_slots = max(1, int(booking["slots_count"] or 1))
+                current_slots = int(booking["slots_count"] or 1)
+                new_slots = max(protected_slots, current_slots - max(0, slots_to_remove))
+                if new_slots < 1:
+                    new_slots = protected_slots
+
+                await conn.execute(
+                    "DELETE FROM payments WHERE id = $1 AND status = 'ожидает'",
+                    payment_id,
+                )
+                await conn.execute(
+                    """UPDATE bookings
+                       SET slots_count = $1,
+                           admin_extra_notify_message_id = NULL
+                     WHERE id = $2""",
+                    new_slots, booking["id"],
+                )
+                mode = "extra"
+            else:
+                await conn.execute(
+                    """UPDATE bookings
+                       SET status = 'отменена',
+                           admin_notify_message_id = NULL,
+                           admin_extra_notify_message_id = NULL
+                     WHERE id = $1""",
+                    booking["id"],
+                )
+                await conn.execute(
+                    """DELETE FROM payments
+                       WHERE booking_id = $1
+                         AND status = 'ожидает'
+                         AND player_notified_at IS NULL""",
+                    booking["id"],
+                )
+                mode = "full"
+
+            return {
+                "mode": mode,
+                "payment_id": int(payment_id),
+                "booking_id": int(booking["id"]),
+                "telegram_id": int(user["telegram_id"]),
+                "user_name": user["name"],
+                "provider_payment_id": provider_payment_id,
+                "admin_notify_message_id": admin_notify_message_id if mode == "full" else None,
+                "admin_extra_notify_message_id": admin_extra_notify_message_id,
+                "game": _to_dict(game),
+            }
+
+
 async def booking_has_protected_payment(
     booking_id: int, exclude_payment_id: Optional[int] = None,
 ) -> bool:
@@ -1179,7 +1335,11 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
             if refund_eligible:
                 for p in confirmed_payments:
                     payment_result = await conn.fetchrow(
-                        "UPDATE payments SET status = 'возврат' WHERE id = $1 RETURNING *",
+                        """UPDATE payments
+                              SET status = 'возврат',
+                                  admin_attention_at = NOW()
+                            WHERE id = $1
+                            RETURNING *""",
                         p["id"],
                     )
 
@@ -1197,6 +1357,13 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                 payment_deleted = int(str(deleted).split()[-1]) > 0
             except (ValueError, IndexError):
                 payment_deleted = True
+
+            if refund_eligible:
+                try:
+                    import database as db_sync
+                    db_sync.clear_badge_cache()
+                except Exception:
+                    pass
 
             return {
                 "status": "ok",
@@ -1390,9 +1557,11 @@ async def mark_payment_notified(payment_id: int) -> Optional[dict]:
     Именно с этого момента в CRM загорается бейдж «+N» у «Оплаты»."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        """UPDATE payments SET player_notified_at = NOW()
-           WHERE id = $1 AND status = 'ожидает' AND player_notified_at IS NULL
-           RETURNING *""",
+        """UPDATE payments
+              SET player_notified_at = NOW(),
+                  admin_attention_at = NOW()
+            WHERE id = $1 AND status = 'ожидает' AND player_notified_at IS NULL
+            RETURNING *""",
         payment_id,
     )
     result = _to_dict(row) if row else None

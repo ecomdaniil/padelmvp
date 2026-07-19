@@ -3256,6 +3256,134 @@ async def _process_underfill_cancels(bot: Bot) -> None:
             logger.error("Не удалось записать admin_log автоотмены #%s: %s", game["id"], e)
 
 
+def _unpaid_timeout_minutes() -> int:
+    try:
+        return max(1, int(os.getenv("UNPAID_PAYMENT_TIMEOUT_MINUTES", "5")))
+    except ValueError:
+        return 5
+
+
+def _format_auto_cancel_order_text(game: dict) -> str:
+    """Текст игроку при автоотмене неоплаченного заказа."""
+    game_dt = (
+        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+    )
+    is_training = (game.get("event_type") or "game") == "training"
+    if is_training and game.get("title"):
+        target = f"тренировку «{_html(game['title'])}» ({_html(game_dt)})"
+    elif is_training:
+        target = f"тренировку {_html(game_dt)}"
+    else:
+        target = f"игру {_html(game_dt)}"
+    return (
+        f"Ваш заказ на {target} был отменён автоматически.\n\n"
+        "Ждём вас снова!"
+    )
+
+
+async def process_unpaid_payment_timeouts(bot: Bot) -> None:
+    """Отменяет неоплаченные счета старше UNPAID_PAYMENT_TIMEOUT_MINUTES
+    и пишет игроку. Запускается каждую минуту."""
+    minutes = _unpaid_timeout_minutes()
+    try:
+        payment_ids = await db.list_expired_unpaid_payment_ids(minutes)
+    except Exception as e:
+        logger.error("Не удалось получить просроченные оплаты: %s", e)
+        return
+
+    for payment_id in payment_ids:
+        # Перед отменой — если у счёта уже есть ЮKassa id, сверим статус:
+        # успевшая оплата не должна пропасть из‑за гонки с webhook.
+        try:
+            pending = await db.get_payment_by_id(payment_id)
+        except Exception:
+            pending = None
+        provider_id = (pending or {}).get("provider_payment_id")
+        if provider_id and payment_provider.is_yookassa_configured():
+            try:
+                verified = await payment_provider.get_yookassa_payment(str(provider_id))
+                if verified.get("status") == "succeeded" or verified.get("paid"):
+                    await db.register_provider_payment_awaiting_admin(
+                        str(verified["id"]),
+                        expected_amount=(
+                            float(verified["amount"])
+                            if verified.get("amount") is not None
+                            else None
+                        ),
+                        payment_method="yookassa",
+                    )
+                    continue
+            except Exception as e:
+                logger.warning(
+                    "Не удалось сверить ЮKassa #%s перед таймаутом: %s",
+                    provider_id, e,
+                )
+
+        try:
+            result = await db.expire_unpaid_payment(
+                payment_id, older_than_minutes=minutes,
+            )
+        except Exception as e:
+            logger.error("expire_unpaid_payment #%s failed: %s", payment_id, e)
+            continue
+        if not result:
+            continue
+
+        _invalidate_games_cache()
+        provider_id = result.get("provider_payment_id")
+        if provider_id:
+            try:
+                await payment_provider.cancel_yookassa_payment(provider_id)
+            except Exception as e:
+                logger.warning(
+                    "Не удалось отменить ЮKassa #%s при таймауте оплаты: %s",
+                    provider_id, e,
+                )
+
+        await _cleanup_admin_notifies_after_cancel(bot, {
+            "status": "extra_cancelled" if result.get("mode") == "extra" else "ok",
+            "payment_deleted": True,
+            "had_payment": False,
+            "admin_notify_message_id": result.get("admin_notify_message_id"),
+            "admin_extra_notify_message_id": result.get("admin_extra_notify_message_id"),
+        })
+
+        try:
+            await bot.send_message(
+                result["telegram_id"],
+                _format_auto_cancel_order_text(result["game"]),
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить игрока %s об автоотмене оплаты #%s: %s",
+                result.get("telegram_id"), payment_id, e,
+            )
+
+        try:
+            game = result["game"]
+            game_dt = (
+                f"{game['game_date'].strftime('%d.%m.%Y')} "
+                f"в {str(game['game_time'])[:5]}"
+            )
+            mode = "доплата" if result.get("mode") == "extra" else "заказ"
+            await db.log_action(
+                action="cleanup",
+                entity_type="payment",
+                entity_id=payment_id,
+                description=(
+                    f"Автоотмена неоплаченного {mode} #{payment_id} "
+                    f"(бронь #{result['booking_id']}, {game_dt}) "
+                    f"по таймауту {minutes} мин."
+                ),
+                old_value="ожидает",
+                new_value="отменён (таймаут оплаты)",
+            )
+        except Exception as e:
+            logger.error("Не удалось записать лог автоотмены оплаты #%s: %s", payment_id, e)
+
+
 async def send_reminders(bot: Bot):
     """Запускается планировщиком (см. main()/app.py:run_bot) каждые 15
     минут: напоминания за 24/2 часа + предупреждение/автоотмена при недоборе."""
@@ -3317,6 +3445,17 @@ async def main():
     # Часовой пояс планировщика — Москва (как и вся логика игр/возвратов).
     scheduler = BackgroundScheduler(timezone="Europe/Moscow")
     scheduler.add_job(_make_reminder_job(bot, loop), "interval", minutes=15)
+
+    def _unpaid_timeout_job():
+        future = asyncio.run_coroutine_threadsafe(
+            process_unpaid_payment_timeouts(bot), loop,
+        )
+        try:
+            future.result(timeout=60)
+        except Exception as e:
+            logger.error("Ошибка автоотмены неоплаченных заказов: %s", e)
+
+    scheduler.add_job(_unpaid_timeout_job, "interval", minutes=1)
     scheduler.start()
 
     try:

@@ -477,11 +477,10 @@ def login_required(view_func):
 # ---------------------------------------------------------------------------
 # Идея: в сессии админа храним id последней увиденной заявки/отзыва
 # (seen_booking_id/seen_review_id) — бейдж = сколько строк имеют id больше
-# сохранённого. Для оплат — не id, а seen_payment_notified_at (timestamp),
-# так как "новизна" оплаты для бейджа определяется моментом, когда игрок
-# нажал "✅ Я оплатил" (может произойти позже создания более новых платежей),
-# а не порядком id. Как только админ открывает раздел, seen_* подтягивается
-# до текущего максимума, и бейдж пропадает.
+# сохранённого. Для оплат — не id, а seen_payment_notified_at (timestamp по
+# admin_attention_at): бейдж загорается, когда игрок сообщил об оплате или
+# когда оплата ушла в «возврат». Как только админ открывает раздел, seen_*
+# подтягивается до текущего максимума, и бейдж пропадает.
 
 _UNSET = object()
 
@@ -507,9 +506,7 @@ def _mark_all_sections_seen() -> None:
         return
     _mark_section_seen(
         booking_id=marker["max_booking_id"],
-        # seen_payment_notified_at хранит момент, когда игрок в последний раз
-        # (до этого визита) нажимал "✅ Я оплатил", а не id последнего
-        # созданного платежа — см. count_new_since в database.py.
+        # watermark по admin_attention_at (оплата игроком или возврат).
         payment_notified_at=marker["last_payment_notified_at"],
         review_id=marker["max_review_id"],
     )
@@ -1419,6 +1416,7 @@ def payment_confirm(payment_id):
     if not updated:
         flash("Не удалось подтвердить оплату — статус уже изменился или заявка отменена")
         return redirect(url_for("payments_list"))
+    db.clear_badge_cache()
     description = (
         f"Статус оплаты для брони №{context['booking_id']} изменён с «ожидает» "
         f"на «подтверждена» (игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
@@ -1461,6 +1459,7 @@ def payment_confirm_refund(payment_id):
     if not updated:
         flash("Не удалось оформить возврат — статус платежа уже изменился")
         return redirect(url_for("payments_list"))
+    db.clear_badge_cache()
 
     description = (
         f"Возврат оплаты для брони №{context['booking_id']} оформлен администратором "
@@ -1971,7 +1970,7 @@ def run_bot():
     global bot_instance, dp_instance, bot_loop, bot_start_error
 
     from apscheduler.schedulers.background import BackgroundScheduler
-    from bot import router, send_reminders, setup_bot_commands
+    from bot import router, send_reminders, process_unpaid_payment_timeouts, setup_bot_commands
     import database_async as db_async
 
     bot_start_error = None
@@ -1998,12 +1997,23 @@ def run_bot():
         except Exception as e:
             logger.error("Ошибка задачи напоминаний: %s", e)
 
+    def _unpaid_timeout_job():
+        future = asyncio.run_coroutine_threadsafe(
+            process_unpaid_payment_timeouts(bot_instance), loop,
+        )
+        try:
+            future.result(timeout=60)
+        except Exception as e:
+            logger.error("Ошибка автоотмены неоплаченных заказов: %s", e)
+
     async def _startup():
         await db_async.get_pool()
         asyncio.create_task(db_async.keepalive_loop())
         await setup_bot_commands(bot_instance)
 
         scheduler.add_job(_reminders_job, "interval", minutes=15)
+        # Таймаут оплаты 5 мин — проверяем каждую минуту.
+        scheduler.add_job(_unpaid_timeout_job, "interval", minutes=1)
         scheduler.start()
 
         if WEBHOOK_URL:

@@ -540,6 +540,29 @@ def _migrate_payments_table(cur):
     оплаты."""
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT;")
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS player_notified_at TIMESTAMP;")
+    # admin_attention_at — момент, когда оплата снова требует внимания админа
+    # в CRM (игрок сообщил об оплате ИЛИ статус стал «возврат»). Бейдж «+N»
+    # у «Оплаты» смотрит на это поле, а не только на player_notified_at —
+    # иначе отмена оплаченной записи не подсвечивала возврат.
+    cur.execute(
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS admin_attention_at TIMESTAMP;"
+    )
+    cur.execute(
+        """
+        UPDATE payments
+           SET admin_attention_at = player_notified_at
+         WHERE admin_attention_at IS NULL
+           AND player_notified_at IS NOT NULL
+        """
+    )
+    cur.execute(
+        """
+        UPDATE payments
+           SET admin_attention_at = COALESCE(admin_attention_at, NOW())
+         WHERE status = 'возврат'
+           AND admin_attention_at IS NULL
+        """
+    )
     # ЮKassa: id платежа у провайдера и ссылка на оплату (confirmation_url).
     cur.execute(
         "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider_payment_id TEXT;"
@@ -587,6 +610,10 @@ def _create_indexes(cur):
         "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments (status);",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_id "
         "ON payments (provider_payment_id) WHERE provider_payment_id IS NOT NULL;",
+        # Автоотмена неоплаченных счетов (см. expire_unpaid_payment в database_async)
+        "CREATE INDEX IF NOT EXISTS idx_payments_unpaid_timeout "
+        "ON payments (created_at) "
+        "WHERE status = 'ожидает' AND player_notified_at IS NULL;",
 
         # admin_logs: журнал всегда читается с ORDER BY created_at DESC
         "CREATE INDEX IF NOT EXISTS idx_admin_logs_created_at ON admin_logs (created_at DESC);",
@@ -1590,13 +1617,16 @@ def delete_pending_payments_for_booking(booking_id: int) -> int:
 
 
 def mark_confirmed_payments_refund_for_booking(booking_id: int) -> int:
-    """При отмене заявки админом — все подтверждённые оплаты → «возврат»."""
+    """При отмене заявки админом — все подтверждённые оплаты → «возврат».
+    Обновляет admin_attention_at, чтобы в шапке CRM загорелся бейдж «+N»."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        UPDATE payments SET status = 'возврат'
-        WHERE booking_id = %s AND status = 'подтверждена'
+        UPDATE payments
+           SET status = 'возврат',
+               admin_attention_at = NOW()
+         WHERE booking_id = %s AND status = 'подтверждена'
         """,
         (booking_id,),
     )
@@ -1604,6 +1634,8 @@ def mark_confirmed_payments_refund_for_booking(booking_id: int) -> int:
     conn.commit()
     cur.close()
     conn.close()
+    if updated:
+        clear_badge_cache()
     return updated
 
 
@@ -1771,13 +1803,15 @@ def set_payment_method_sync(payment_id: int, method: str):
 
 def mark_payment_notified_sync(payment_id: int):
     """Игрок оплатил / сообщил об оплате — ждём подтверждения админа в CRM.
-    Заполняет player_notified_at → бейдж «+N» у «Оплаты» в шапке CRM."""
+    Заполняет player_notified_at и admin_attention_at → бейдж «+N»."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """UPDATE payments SET player_notified_at = NOW()
-           WHERE id = %s AND status = 'ожидает' AND player_notified_at IS NULL
-           RETURNING *""",
+        """UPDATE payments
+              SET player_notified_at = NOW(),
+                  admin_attention_at = NOW()
+            WHERE id = %s AND status = 'ожидает' AND player_notified_at IS NULL
+            RETURNING *""",
         (payment_id,),
     )
     row = cur.fetchone()
@@ -2418,7 +2452,7 @@ def get_latest_activity_marker() -> dict:
         SELECT
             (SELECT COALESCE(MAX(id), 0) FROM bookings) AS max_booking_id,
             (SELECT COALESCE(MAX(id), 0) FROM payments) AS max_payment_id,
-            (SELECT MAX(player_notified_at) FROM payments) AS last_payment_notified_at,
+            (SELECT MAX(admin_attention_at) FROM payments) AS last_payment_notified_at,
             (SELECT COALESCE(MAX(id), 0) FROM reviews) AS max_review_id,
             (SELECT COUNT(*) FROM bookings) AS bookings_count,
             (SELECT COUNT(*) FROM payments) AS payments_count,
@@ -2430,6 +2464,18 @@ def get_latest_activity_marker() -> dict:
     return dict(row)
 
 
+# Платежи, которые должны подсвечивать бейдж «Оплаты»: ждут подтверждения
+# оплаты или ждут оформления возврата.
+_PAYMENT_BADGE_WHERE = """
+    admin_attention_at IS NOT NULL
+    AND admin_attention_at > COALESCE(%s::timestamp, 'epoch'::timestamp)
+    AND (
+        (status = 'ожидает' AND player_notified_at IS NOT NULL)
+        OR status = 'возврат'
+    )
+"""
+
+
 def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_id: int) -> dict:
     """Сколько новых заявок/оплат/отзывов появилось после last_* — основа
     бейджей-счётчиков "+N" рядом с «Заявки»/«Оплаты»/«Отзывы» в шапке CRM.
@@ -2438,24 +2484,17 @@ def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_
     см. app.py) — бейдж показывает то, что появилось НОВОГО с того момента,
     и пропадает, как только раздел открыт снова.
 
-    last_payment_notified_at — НЕ id, а timestamp (строка ISO или None):
-    платёж создаётся автоматически сразу при записи на игру (статус
-    «ожидает»), задолго до того, как игрок реально попытается оплатить,
-    поэтому бейдж "+N" у «Оплаты» должен появляться только когда игрок
-    нажал «✅ Я оплатил» в боте (player_notified_at заполняется в
-    process_paid_notify, bot.py) — а этот момент никак не привязан к
-    порядку id платежей (можно нажать кнопку у платежа, созданного давно,
-    уже после того как появились более новые платежи), поэтому сравнение
-    по id здесь не подходит, нужен именно временной водораздел."""
+    last_payment_notified_at — watermark по admin_attention_at (ISO или None):
+    бейдж у «Оплаты» загорается, когда игрок сообщил об оплате или когда
+    подтверждённый платёж перешёл в «возврат» (отмена записи)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT
             (SELECT COUNT(*) FROM bookings WHERE id > %s) AS new_bookings,
             (SELECT COUNT(*) FROM payments
-                WHERE player_notified_at IS NOT NULL
-                  AND player_notified_at > COALESCE(%s::timestamp, 'epoch'::timestamp)) AS new_payments,
+                WHERE {_PAYMENT_BADGE_WHERE}) AS new_payments,
             (SELECT COUNT(*) FROM reviews WHERE id > %s) AS new_reviews
         """,
         (last_booking_id, last_payment_notified_at, last_review_id),
@@ -2464,7 +2503,6 @@ def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_
     cur.close()
     conn.close()
     return dict(row)
-
 
 _badge_cache_lock = threading.Lock()
 _badge_cache = {}  # key -> (monotonic_ts, counts_dict)
@@ -2533,19 +2571,18 @@ def get_activity_snapshot(last_booking_id: int, last_payment_notified_at, last_r
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT
             (SELECT COALESCE(MAX(id), 0) FROM bookings) AS max_booking_id,
             (SELECT COALESCE(MAX(id), 0) FROM payments) AS max_payment_id,
-            (SELECT MAX(player_notified_at) FROM payments) AS last_payment_notified_at,
+            (SELECT MAX(admin_attention_at) FROM payments) AS last_payment_notified_at,
             (SELECT COALESCE(MAX(id), 0) FROM reviews) AS max_review_id,
             (SELECT COUNT(*) FROM bookings) AS bookings_count,
             (SELECT COUNT(*) FROM payments) AS payments_count,
             (SELECT COUNT(*) FROM reviews) AS reviews_count,
             (SELECT COUNT(*) FROM bookings WHERE id > %s) AS new_bookings,
             (SELECT COUNT(*) FROM payments
-                WHERE player_notified_at IS NOT NULL
-                  AND player_notified_at > COALESCE(%s::timestamp, 'epoch'::timestamp)) AS new_payments,
+                WHERE {_PAYMENT_BADGE_WHERE}) AS new_payments,
             (SELECT COUNT(*) FROM reviews WHERE id > %s) AS new_reviews
         """,
         (last_booking_id, last_payment_notified_at, last_review_id),
