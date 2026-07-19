@@ -109,8 +109,8 @@
 </head>
 <body>
     <div class="box">
-        <span class="brand">🎾 Padel Club XXX</span>
-        <h1>Вход в Padel CRM</h1>
+        <span class="brand">{{ club_brand }}</span>
+        <h1>Вход в CRM</h1>
         {% with messages = get_flashed_messages() %}
             {% if messages %}
                 {% for m in messages %}

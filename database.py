@@ -659,7 +659,7 @@ def _migrate_clubs_table(cur):
 def _migrate_club_info_table(cur):
     """admin_telegram_id — куда бот шлёт сообщения «Связаться с админом»
     и уведомления о записях, если ADMIN_CHAT_ID в env не задан (часто на Render).
-    admin_telegram_username — отображаемый @username (например ecom_daniil)."""
+    admin_telegram_username — отображаемый @username администратора."""
     cur.execute(
         "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS admin_telegram_id BIGINT;"
     )

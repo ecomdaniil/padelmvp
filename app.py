@@ -319,9 +319,7 @@ def _dashboard_greeting() -> dict:
 # константой. Если список уровней поменяется — обновите его в обоих местах.
 GAME_LEVELS = ["Новичок", "Любитель", "Продвинутый", "Профессионал"]
 
-# Глобальные переменные для бота: единственные Bot/Dispatcher на процесс
-# (раньше bot.py создавал свою отдельную пару внутри main(), что приводило
-# к путанице — теперь webhook всегда обслуживается вот этими инстансами).
+# Единственные Bot/Dispatcher на процесс — webhook обслуживается ими.
 bot_instance = None
 dp_instance = None
 bot_loop = None
@@ -528,13 +526,23 @@ def _mark_all_sections_seen() -> None:
     )
 
 
+def _club_brand_name() -> str:
+    try:
+        info = db.get_club_info()
+        name = (info or {}).get("name") if info else None
+        if name and str(name).strip():
+            return str(name).strip()
+    except Exception:
+        pass
+    return "Padel Club"
+
+
 @app.context_processor
-def inject_nav_badges():
-    """Бейджи "+N" в шапке. На рендере страницы НЕ ходим в БД — только
-    in-memory кэш (его наполняет /api/activity). Иначе каждый клик по меню
-    = лишний ~1с round-trip к Neon сверх запроса самой страницы."""
+def inject_globals():
+    """Название клуба в шапке/логине и бейджи меню (без лишних запросов к БД)."""
+    extras = {"club_brand": _club_brand_name()}
     if not session.get("logged_in"):
-        return {}
+        return extras
     try:
         counts = db.peek_badge_counts(
             session.get("seen_booking_id", 0),
@@ -545,11 +553,13 @@ def inject_nav_badges():
         logger.error("Не удалось прочитать бейджи меню: %s", e)
         counts = None
     if not counts:
-        return {"nav_badges": {"bookings": 0, "payments": 0}}
-    return {"nav_badges": {
+        extras["nav_badges"] = {"bookings": 0, "payments": 0}
+        return extras
+    extras["nav_badges"] = {
         "bookings": counts["new_bookings"],
         "payments": counts["new_payments"],
-    }}
+    }
+    return extras
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -2043,8 +2053,8 @@ def start_cleanup_scheduler():
     Сами DELETE-запросы идемпотентны (повторное удаление уже удалённых
     строк безвредно и просто отработает на 0 строк), но в журнале появится
     по одной записи "Автоочистка..." от каждого воркера. Чтобы не плодить
-    дублирующиеся записи в журнале — используйте --workers 1 (см.
-    deploy.md/docker-compose.yml), как и рекомендовано для бота."""
+    дублирующиеся записи в журнале — используйте --workers 1
+    (см. README / docker-compose.yml), как и для бота."""
     from apscheduler.schedulers.background import BackgroundScheduler
 
     scheduler = BackgroundScheduler(timezone=APP_TIMEZONE)
