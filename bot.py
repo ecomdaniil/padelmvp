@@ -1545,7 +1545,7 @@ async def process_booking_confirm(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Оплата (ЮKassa: СБП + карта; без ключей — честный fallback)
+# Оплата: выбор способа → ссылка / счёт Telegram → отмена
 # ---------------------------------------------------------------------------
 
 def _underfill_booking_notice(taken: int, total_slots: int) -> str:
@@ -1561,32 +1561,66 @@ def _underfill_booking_notice(taken: int, total_slots: int) -> str:
     )
 
 
-def _yookassa_pay_keyboard(payment_id: int, confirmation_url: str) -> InlineKeyboardMarkup:
+def _payment_header(game: dict, amount: float) -> str:
+    game_dt = (
+        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+    )
+    return (
+        "💳 <b>Оплата</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📅 {_html(game_dt)}\n"
+        f"📍 {_html(game['location'])}\n"
+        f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
+    )
+
+
+def _payment_method_choice_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить (СБП / карта)", url=confirmation_url)],
-        [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"pay_cancel_ask:{payment_id}")],
+        [InlineKeyboardButton(
+            text="СБП (Банк, Карта)",
+            callback_data=f"pay_method_sbp:{payment_id}",
+        )],
+        [InlineKeyboardButton(
+            text="🗑 Отменить заказ",
+            callback_data=f"pay_cancel_ask:{payment_id}",
+        )],
     ])
 
 
-def _telegram_pay_keyboard(payment_id: int) -> InlineKeyboardMarkup:
-    """Оплата через Telegram Payments (токен из BotFather)."""
+def _payment_link_keyboard(payment_id: int, pay_url: Optional[str] = None) -> InlineKeyboardMarkup:
+    """Кнопка оплаты: url (ЮKassa) или callback → настоящий счёт Telegram."""
+    if pay_url:
+        pay_btn = InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)
+    else:
+        pay_btn = InlineKeyboardButton(
+            text="💳 Перейти к оплате",
+            callback_data=f"pay_open:{payment_id}",
+        )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить", callback_data=f"pay_card:{payment_id}")],
-        [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"pay_cancel_ask:{payment_id}")],
+        [pay_btn],
+        [InlineKeyboardButton(
+            text="🗑 Отменить заказ",
+            callback_data=f"pay_cancel_ask:{payment_id}",
+        )],
     ])
 
 
 def _manual_pay_keyboard(payment_id: int) -> InlineKeyboardMarkup:
-    """Fallback без провайдера: перевод/наличные + отмена."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил (перевод / на месте)", callback_data=f"paid_notify:{payment_id}")],
-        [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"pay_cancel_ask:{payment_id}")],
+        [InlineKeyboardButton(
+            text="✅ Я оплатил (перевод / на месте)",
+            callback_data=f"paid_notify:{payment_id}",
+        )],
+        [InlineKeyboardButton(
+            text="🗑 Отменить заказ",
+            callback_data=f"pay_cancel_ask:{payment_id}",
+        )],
     ])
 
 
 def _pay_cancel_confirm_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Да, отменить запись", callback_data=f"pay_cancel_yes:{payment_id}")],
+        [InlineKeyboardButton(text="Да, отменить заказ", callback_data=f"pay_cancel_yes:{payment_id}")],
         [InlineKeyboardButton(text="Нет, оставить", callback_data=f"pay_cancel_no:{payment_id}")],
     ])
 
@@ -1604,6 +1638,72 @@ async def _payment_return_url(bot: Bot) -> str:
     return "https://t.me/"
 
 
+async def _replace_payment_message(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> Message:
+    """Быстро заменить экран оплаты (edit) или отправить новое, если edit нельзя."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        return message
+    except Exception:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return await message.answer(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def _send_telegram_invoice(message: Message, payment: dict) -> None:
+    """Настоящий счёт Telegram Payments (PayMaster / ЮKassa через BotFather)."""
+    provider_token = os.getenv("PAYMENT_PROVIDER_TOKEN") or ""
+    if not provider_token:
+        raise RuntimeError("PAYMENT_PROVIDER_TOKEN не задан")
+    amount = float(payment["amount"])
+    await message.answer_invoice(
+        title="Оплата игры в падел",
+        description=f"Бронирование #{payment['booking_id']} на {amount:.0f} ₽",
+        payload=f"payment:{payment['id']}",
+        provider_token=provider_token,
+        currency="RUB",
+        prices=[LabeledPrice(label="Игра в падел", amount=int(round(amount * 100)))],
+    )
+
+
+async def _ensure_yookassa_pay_url(
+    bot: Bot,
+    user: dict,
+    payment: dict,
+    game: dict,
+) -> tuple[dict, Optional[str]]:
+    """Создаёт/возвращает confirmation_url ЮKassa. (payment, url|None)."""
+    if payment.get("confirmation_url") and payment.get("provider_payment_id"):
+        return payment, payment["confirmation_url"]
+    if not payment_provider.is_yookassa_configured():
+        return payment, None
+    game_dt = (
+        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+    )
+    yk = await payment_provider.create_yookassa_payment(
+        amount=float(payment["amount"]),
+        payment_id=int(payment["id"]),
+        booking_id=int(payment["booking_id"]),
+        description=f"Падел: бронь #{payment['booking_id']} ({game_dt})",
+        return_url=await _payment_return_url(bot),
+        customer_phone=user.get("phone"),
+    )
+    if not yk.get("confirmation_url") or not yk.get("id"):
+        return payment, None
+    payment = await db.attach_provider_payment(
+        int(payment["id"]),
+        yk["id"],
+        yk["confirmation_url"],
+        method="yookassa",
+    ) or payment
+    return payment, yk["confirmation_url"]
+
+
 async def _offer_payment(
     message: Message,
     bot: Bot,
@@ -1613,106 +1713,129 @@ async def _offer_payment(
     game: dict,
     total_price: float,
 ) -> None:
-    """Показывает экран оплаты: ссылка ЮKassa или честный fallback."""
+    """Шаг 1: выбор способа оплаты (СБП / отмена)."""
     amount = float(total_price)
-    game_dt = (
-        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+    text = (
+        _payment_header(game, amount)
+        + "Выберите способ оплаты:"
     )
-
-    if payment_provider.is_yookassa_configured():
-        # Уже есть живая ссылка — не плодим платежи в ЮKassa.
-        if payment.get("confirmation_url") and payment.get("provider_payment_id"):
-            await message.answer(
-                "💳 <b>Оплата</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📅 {_html(game_dt)}\n"
-                f"📍 {_html(game['location'])}\n"
-                f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
-                "Нажми «Оплатить» — откроется страница ЮKassa (СБП или карта).\n"
-                "После успешной оплаты статус обновится автоматически.\n\n"
-                "<i>Если передумал — «Отменить запись» ниже.</i>",
-                reply_markup=_yookassa_pay_keyboard(payment["id"], payment["confirmation_url"]),
-                parse_mode="HTML",
-            )
-            return
-
-        try:
-            yk = await payment_provider.create_yookassa_payment(
-                amount=amount,
-                payment_id=int(payment["id"]),
-                booking_id=int(payment["booking_id"]),
-                description=f"Падел: бронь #{payment['booking_id']} ({game_dt})",
-                return_url=await _payment_return_url(bot),
-                customer_phone=user.get("phone"),
-            )
-        except Exception as e:
-            logger.error("Не удалось создать платёж ЮKassa #%s: %s", payment["id"], e)
-            await message.answer(
-                "❌ Не удалось открыть оплату. Попробуй позже или напиши администратору.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        if not yk.get("confirmation_url") or not yk.get("id"):
-            await message.answer(
-                "❌ Платёжная ссылка не получена. Напиши администратору.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        payment = await db.attach_provider_payment(
-            int(payment["id"]),
-            yk["id"],
-            yk["confirmation_url"],
-            method="yookassa",
-        ) or payment
-
+    # Без онлайн-провайдера — сразу честный fallback.
+    if (
+        not payment_provider.is_yookassa_configured()
+        and not payment_provider.is_card_provider_configured()
+    ):
         await message.answer(
-            "💳 <b>Оплата</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📅 {_html(game_dt)}\n"
-            f"📍 {_html(game['location'])}\n"
-            f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
-            "Нажми «Оплатить» — откроется страница ЮKassa (СБП или карта).\n"
-            "После успешной оплаты статус обновится автоматически.\n\n"
-            "<i>Если передумал — «Отменить запись» ниже.</i>",
-            reply_markup=_yookassa_pay_keyboard(
-                int(payment["id"]), yk["confirmation_url"]
-            ),
+            _payment_header(game, amount)
+            + "Онлайн-оплата пока не подключена.\n"
+            "Оплати переводом администратору или на месте, затем нажми «Я оплатил».",
+            reply_markup=_manual_pay_keyboard(int(payment["id"])),
             parse_mode="HTML",
         )
         return
 
-    # Telegram Payments (токен из @BotFather → Payments → ЮKassa).
-    if payment_provider.is_card_provider_configured():
-        await message.answer(
-            "💳 <b>Оплата</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📅 {_html(game_dt)}\n"
-            f"📍 {_html(game['location'])}\n"
-            f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
-            "Нажми «Оплатить» — откроется счёт Telegram "
-            "(карта / ЮMoney / SberPay — что доступно у провайдера).\n"
-            "После успешной оплаты статус обновится автоматически.\n\n"
-            "<i>Если передумал — «Отменить запись» ниже.</i>",
-            reply_markup=_telegram_pay_keyboard(int(payment["id"])),
-            parse_mode="HTML",
-        )
-        return
-
-    # Без провайдера — честный fallback, без фейкового QR.
     await message.answer(
-        "💳 <b>Оплата</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📅 {_html(game_dt)}\n"
-        f"📍 {_html(game['location'])}\n"
-        f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
-        "Онлайн-оплата пока не подключена.\n"
-        "Оплати переводом администратору или на месте, затем нажми «Я оплатил».\n\n"
-        "<i>Если передумал — «Отменить запись» ниже.</i>",
-        reply_markup=_manual_pay_keyboard(int(payment["id"])),
+        text,
+        reply_markup=_payment_method_choice_keyboard(int(payment["id"])),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("pay_method_sbp:"))
+async def process_pay_method_sbp(callback: CallbackQuery):
+    """Шаг 2: сообщение со ссылкой/кнопкой оплаты + отмена; сразу открываем оплату."""
+    await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.get_payment_for_user(payment_id, user["id"])
+    if not payment or payment.get("status") != "ожидает":
+        await callback.message.answer("Платёж не найден или уже обработан.")
+        return
+
+    booking = await db.get_booking_by_id(payment["booking_id"])
+    game = await db.get_game_by_id(booking["game_id"]) if booking else None
+    if not game:
+        await callback.message.answer("Игра не найдена.")
+        return
+
+    amount = float(payment["amount"])
+    pay_url: Optional[str] = None
+
+    if payment_provider.is_yookassa_configured():
+        try:
+            payment, pay_url = await _ensure_yookassa_pay_url(
+                callback.bot, user, payment, game
+            )
+        except Exception as e:
+            logger.error("ЮKassa create failed payment #%s: %s", payment_id, e)
+            pay_url = None
+
+    # Текст второго экрана — ссылка в теле сообщения, если есть.
+    link_block = ""
+    if pay_url:
+        link_block = f"\n{_html(pay_url)}"
+    text = (
+        _payment_header(game, amount)
+        + "Пожалуйста, кликните по ссылке для оплаты:"
+        + link_block
+    )
+    await _replace_payment_message(
+        callback.message,
+        text,
+        _payment_link_keyboard(payment_id, pay_url),
+    )
+
+    # Настоящая оплата через Telegram Payments (PayMaster и т.п.) — счёт invoice.
+    if not pay_url and payment_provider.is_card_provider_configured():
+        try:
+            await db.set_payment_method_owned(payment_id, user["id"], "sbp")
+            await _send_telegram_invoice(callback.message, payment)
+        except Exception as e:
+            logger.error("Не удалось отправить invoice #%s: %s", payment_id, e)
+            await callback.message.answer(
+                "❌ Не удалось открыть оплату. Попробуй кнопку «Перейти к оплате» ниже "
+                "или напиши администратору.",
+            )
+
+
+@router.callback_query(F.data.startswith("pay_open:"))
+async def process_pay_open(callback: CallbackQuery):
+    """Кнопка «Перейти к оплате» без url — открывает настоящий Telegram-счёт."""
+    await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        return
+    payment_id = int(callback.data.split(":")[1])
+    payment = await db.get_payment_for_user(payment_id, user["id"])
+    if not payment or payment.get("status") != "ожидает":
+        await callback.message.answer("Платёж не найден или уже обработан.")
+        return
+
+    if payment.get("confirmation_url"):
+        # На всякий случай — если url уже есть, просто подсказка.
+        await callback.message.answer(
+            f"Ссылка на оплату:\n{payment['confirmation_url']}"
+        )
+        return
+
+    if not payment_provider.is_card_provider_configured():
+        await callback.message.answer(
+            "Онлайн-оплата недоступна. Напиши администратору или оплати на месте.",
+        )
+        return
+
+    try:
+        await db.set_payment_method_owned(payment_id, user["id"], "sbp")
+        await _send_telegram_invoice(callback.message, payment)
+    except Exception as e:
+        logger.error("pay_open invoice failed #%s: %s", payment_id, e)
+        await callback.message.answer("❌ Не удалось открыть счёт. Попробуй позже.")
 
 
 async def _sync_pending_yookassa_status(payment: dict) -> dict:
@@ -1897,91 +2020,10 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("pay_card:"))
-async def process_pay_card(callback: CallbackQuery):
-    await callback.answer()
-    user = await _require_registered(callback.from_user.id)
-    if not user:
-        await callback.message.answer(
-            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-    payment_id = int(callback.data.split(":")[1])
-    payment = await db.get_payment_for_user(payment_id, user["id"])
-    if not payment:
-        await callback.message.answer("Платёж не найден или это не твоя запись.")
-        return
-
-    # ЮKassa — единый экран (СБП/карта).
-    if payment_provider.is_yookassa_configured():
-        booking = await db.get_booking_by_id(payment["booking_id"])
-        game = await db.get_game_by_id(booking["game_id"]) if booking else None
-        if not game:
-            await callback.message.answer("Игра не найдена.")
-            return
-        await _offer_payment(
-            callback.message, callback.bot,
-            user=user, payment=payment, game=game,
-            total_price=float(payment["amount"]),
-        )
-        return
-
-    payment = await db.set_payment_method_owned(payment_id, user["id"], "card")
-    if not payment:
-        await callback.message.answer("Платёж не найден или это не твоя запись.")
-        return
-
-    if payment_provider.is_card_provider_configured():
-        await callback.message.answer_invoice(
-            title="Оплата игры в падел",
-            description=f"Бронирование #{payment['booking_id']} на {float(payment['amount']):.0f} ₽",
-            payload=f"payment:{payment_id}",
-            provider_token=os.getenv("PAYMENT_PROVIDER_TOKEN"),
-            currency="RUB",
-            prices=[LabeledPrice(label="Игра в падел", amount=int(round(float(payment["amount"]) * 100)))],
-        )
-        return
-
-    await callback.message.answer(
-        "💳 <b>Оплата</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Сумма: <b>{float(payment['amount']):.0f} ₽</b>\n\n"
-        "Онлайн-оплата картой не подключена. Оплати переводом или на месте "
-        "и нажми «Я оплатил».",
-        reply_markup=_manual_pay_keyboard(payment_id),
-        parse_mode="HTML",
-    )
-
-
 @router.callback_query(F.data.startswith("pay_sbp:"))
-async def process_pay_sbp(callback: CallbackQuery):
-    """Обратная совместимость со старыми кнопками → тот же экран оплаты."""
-    await callback.answer()
-    user = await _require_registered(callback.from_user.id)
-    if not user:
-        await callback.message.answer(
-            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-    payment_id = int(callback.data.split(":")[1])
-    payment = await db.get_payment_for_user(payment_id, user["id"])
-    if not payment:
-        await callback.message.answer("Платёж не найден или это не твоя запись.")
-        return
-    booking = await db.get_booking_by_id(payment["booking_id"])
-    game = await db.get_game_by_id(booking["game_id"]) if booking else None
-    if not game:
-        await callback.message.answer("Игра не найдена.")
-        return
-    await _offer_payment(
-        callback.message,
-        callback.bot,
-        user=user,
-        payment=payment,
-        game=game,
-        total_price=float(payment["amount"]),
-    )
+async def process_pay_legacy_methods(callback: CallbackQuery):
+    """Старые кнопки → тот же поток, что «СБП (Банк, Карта)»."""
+    await process_pay_method_sbp(callback)
 
 
 @router.callback_query(F.data.startswith("paid_notify:"))
