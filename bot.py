@@ -966,11 +966,8 @@ async def _show_my_bookings(message: Message):
         status_emoji = "✅" if b['status'] == 'подтверждена' else "⏳"
         free_slots = int(b.get("free_slots") or 0)
         total_slots = int(b.get("total_slots") or 0)
-        is_training = (b.get("event_type") or "game") == "training"
-        text = ""
-        if is_training and b.get("title"):
-            text += f"<b>{_html(b['title'])}</b>\n"
-        text += (
+        text = (
+            f"{_event_card_header(b)}\n"
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
             f"👥 Твоих мест: {b.get('slots_count', 1)}\n"
@@ -1028,15 +1025,13 @@ async def _show_past_bookings(message: Message):
 
     def _past_card(b: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
         # Список уже отфильтрован как CRM «Посещения» — это прошедшие записи.
-        status_line = "✅ Посещение"
         text = (
+            f"{_event_card_header(b)}\n"
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
             f"👥 Мест: {b.get('slots_count', 1)}\n"
-            f"{status_line}"
+            "✅ Посещение"
         )
-        if (b.get("event_type") or "game") == "training" and b.get("title"):
-            text = f"<b>{_html(b['title'])}</b>\n" + text
         return text, None
 
     sends = [_send_answer(message, *_past_card(b)) for b in bookings]
@@ -1044,6 +1039,22 @@ async def _show_past_bookings(message: Message):
     for b, result in zip(bookings, results):
         if isinstance(result, Exception):
             logger.error("Не удалось отправить карточку сыгранной игры #%s: %s", b.get("id"), result)
+
+
+def _event_card_header(event: dict) -> str:
+    """Шапка карточки в «Мои записи» / «Сыгранные»: Тренировка: … или Игра: Сингл/Классика."""
+    is_training = (event.get("event_type") or "game") == "training"
+    if is_training:
+        title = (event.get("title") or "").strip()
+        if title:
+            return f"<b>Тренировка: {_html(title)}</b>"
+        return "<b>Тренировка</b>"
+    slots = int(event.get("total_slots") or 0)
+    if slots == 2:
+        return "<b>Игра: Сингл</b>"
+    if slots == 4:
+        return "<b>Игра: Классика</b>"
+    return "<b>Игра</b>"
 
 
 def _format_statistics(stats: dict) -> str:
@@ -1056,9 +1067,7 @@ def _format_statistics(stats: dict) -> str:
         f"❌ Отменено: <b>{stats['cancelled']}</b>\n\n"
         f"📈 Посещаемость: <b>{stats['attendance_rate']}%</b>\n"
         f"⏱ Сыграно часов: <b>{stats['hours_played']}</b>\n\n"
-        "<i>Посещение — прошедшая (уже начавшаяся) игра или тренировка, "
-        "на которую ты был записан и которую не отменял. "
-        "То же самое, что раздел «Посещения» в CRM.</i>"
+        "Так держать 👏"
     )
 
 
