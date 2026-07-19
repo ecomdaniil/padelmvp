@@ -2055,10 +2055,7 @@ async def process_paid_notify(callback: CallbackQuery):
         )
         return
 
-    await callback.message.answer(
-        "⏳ Мы получили твоё уведомление об оплате.\n"
-        "Администратор подтвердит её в ближайшее время."
-    )
+    await callback.message.answer(_payment_awaiting_admin_text())
 
     try:
         display_name = user.get("name") or callback.from_user.full_name or "Игрок"
@@ -2109,11 +2106,16 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
     await pre_checkout_query.answer(ok=True)
 
 
+def _payment_awaiting_admin_text() -> str:
+    return (
+        "Спасибо! Оплата будет подтверждена администратором в ближайшее время."
+    )
+
+
 @router.message(F.successful_payment)
 async def process_successful_payment(message: Message):
-    """Срабатывает только при настоящей интеграции Telegram Payments
-    (PAYMENT_PROVIDER_TOKEN задан) — Telegram сам подтверждает, что деньги
-    списаны; дополнительно сверяем владельца и сумму."""
+    """Деньги списаны через Telegram Payments — статус «подтверждена»
+    ставит администратор в CRM. Игроку — благодарность и ожидание."""
     payload = message.successful_payment.invoice_payload
     try:
         payment_id = int(payload.split(":", 1)[1])
@@ -2126,31 +2128,57 @@ async def process_successful_payment(message: Message):
         logger.error("successful_payment без зарегистрированного пользователя")
         return
 
-    result = await db.confirm_payment_owned(
-        payment_id,
-        user["id"],
-        int(message.successful_payment.total_amount),
-    )
-    if result["status"] not in {"ok", "already"}:
-        logger.error(
-            "Отклонено автоподтверждение оплаты #%s: %s (user=%s)",
-            payment_id, result["status"], user["id"],
-        )
+    payment = await db.get_payment_for_user(payment_id, user["id"])
+    if not payment:
         await message.answer(
-            "❌ Не удалось подтвердить оплату автоматически. "
-            "Напиши администратору через «Связаться с администратором»."
+            "❌ Платёж не найден. Напиши администратору через «Связаться с администратором»."
         )
         return
 
-    await message.answer("✅ Оплата картой прошла успешно! Спасибо 🎾")
+    expected = int(round(float(payment["amount"]) * 100))
+    if int(message.successful_payment.total_amount) != expected:
+        logger.error(
+            "successful_payment сумма не совпала #%s: got=%s expected=%s",
+            payment_id, message.successful_payment.total_amount, expected,
+        )
+        await message.answer(
+            "❌ Сумма оплаты не совпала. Напиши администратору."
+        )
+        return
+
+    if payment.get("status") == "подтверждена":
+        await message.answer("✅ Оплата уже подтверждена. Ждём тебя на корте! 🎾")
+        return
+
+    # Помечаем для бейджа CRM «+N», без автоподтверждения статуса.
+    notified = await db.mark_payment_notified_owned(payment_id, user["id"])
+    if notified is None and payment.get("status") != "ожидает":
+        await message.answer(
+            "❌ Не удалось зафиксировать оплату. Напиши администратору."
+        )
+        return
+
+    await message.answer(_payment_awaiting_admin_text())
 
     try:
+        display_name = user.get("name") or message.from_user.full_name or "Игрок"
+        username = message.from_user.username
+        username_part = f" (@{_html(username)})" if username else ""
         await _send_admin_message(
             message.bot,
-            f"💳 Оплата #{payment_id} подтверждена автоматически (Telegram Payments).",
+            "💳 <b>Оплата через Telegram получена</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Пользователь {_html(display_name)}{username_part} оплатил "
+            f"бронь №{payment['booking_id']}\n\n"
+            f"🆔 Платёж #{payment_id}\n"
+            f"💰 Сумма: {_html(payment['amount'])} ₽\n"
+            f"🔖 Provider charge: "
+            f"{_html(message.successful_payment.provider_payment_charge_id)}\n\n"
+            "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
+            parse_mode="HTML",
         )
     except Exception as e:
-        logger.error("Не удалось уведомить админа об автооплате #%s: %s", payment_id, e)
+        logger.error("Не удалось уведомить админа об оплате #%s: %s", payment_id, e)
 
 
 # ---------------------------------------------------------------------------

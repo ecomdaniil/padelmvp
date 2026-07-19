@@ -1471,7 +1471,7 @@ def yookassa_webhook():
     if not provider_id:
         return {"status": "missing_provider_id"}, 400
 
-    result = db.confirm_payment_from_yookassa(
+    result = db.register_provider_payment_awaiting_admin(
         provider_payment_id=provider_id,
         local_payment_id=parsed.get("payment_id"),
         expected_amount=parsed.get("amount"),
@@ -1482,21 +1482,21 @@ def yookassa_webhook():
 
     if status == "ok" and payment:
         description = (
-            f"Оплата #{payment['id']} подтверждена автоматически (ЮKassa "
-            f"{provider_id}, метод: {parsed.get('payment_method') or '—'})"
+            f"Оплата #{payment['id']} получена через ЮKassa ({provider_id}, "
+            f"метод: {parsed.get('payment_method') or '—'}) — ждёт подтверждения админа"
         )
         try:
             log_admin_action(
-                "confirm", "payment", int(payment["id"]),
-                description=description, old="ожидает", new="подтверждена",
+                "update", "payment", int(payment["id"]),
+                description=description, old="ожидает", new="ожидает (оплачено)",
             )
         except Exception as e:
-            logger.warning("Не удалось записать лог автоподтверждения: %s", e)
-        _notify_player_payment_confirmed(int(payment["id"]))
+            logger.warning("Не удалось записать лог оплаты ЮKassa: %s", e)
+        _notify_player_payment_awaiting_admin(int(payment["id"]))
         return {"status": "ok"}, 200
 
-    if status == "already":
-        return {"status": "already"}, 200
+    if status in {"already", "already_notified"}:
+        return {"status": status}, 200
 
     if status == "mismatch":
         logger.error(
@@ -1512,14 +1512,26 @@ def yookassa_webhook():
     return {"status": status or "unchanged"}, 200
 
 
+def _notify_player_payment_awaiting_admin(payment_id: int) -> None:
+    """После оплаты провайдером — спасибо, ждём подтверждения админа."""
+    context = db.get_payment_notification_context(payment_id)
+    if not context or not context.get("telegram_id"):
+        return
+    send_telegram_message(
+        context["telegram_id"],
+        "Спасибо! Оплата будет подтверждена администратором в ближайшее время.",
+    )
+
+
 def _notify_player_payment_confirmed(payment_id: int) -> None:
+    """После подтверждения админом в CRM."""
     context = db.get_payment_notification_context(payment_id)
     if not context or not context.get("telegram_id"):
         return
     game_dt = f"{context['game_date'].strftime('%d.%m.%Y')} в {str(context['game_time'])[:5]}"
     loc = html.escape(str(context.get("location") or ""), quote=False)
     text = (
-        "✅ <b>Оплата прошла успешно!</b>\n"
+        "✅ <b>Оплата подтверждена!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"💰 Сумма: {float(context['amount']):.0f} ₽\n"
         f"📅 {html.escape(game_dt, quote=False)}\n"

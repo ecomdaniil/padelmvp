@@ -1605,16 +1605,34 @@ def set_payment_method_sync(payment_id: int, method: str):
     conn.close()
 
 
-def confirm_payment_from_yookassa(
+def mark_payment_notified_sync(payment_id: int):
+    """Игрок оплатил / сообщил об оплате — ждём подтверждения админа в CRM."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """UPDATE payments SET player_notified_at = NOW()
+           WHERE id = %s AND status = 'ожидает' AND player_notified_at IS NULL
+           RETURNING *""",
+        (payment_id,),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
+def register_provider_payment_awaiting_admin(
     provider_payment_id: str,
     local_payment_id: int = None,
     expected_amount=None,
     payment_method: str = None,
 ):
-    """Идемпотентное подтверждение из webhook ЮKassa.
+    """Webhook провайдера: деньги пришли, статус остаётся «ожидает»,
+    выставляем player_notified_at — админ подтвердит в CRM.
 
-    Возвращает {"status": "ok"|"already"|"not_found"|"mismatch"|"forbidden",
-                "payment": row|None}.
+    Возвращает {"status": "ok"|"already"|"already_notified"|"not_found"|
+                "mismatch"|"forbidden", "payment": row|None}.
     """
     payment = get_payment_by_provider_id(provider_payment_id)
     if payment is None and local_payment_id:
@@ -1642,16 +1660,34 @@ def confirm_payment_from_yookassa(
         if abs(float(payment["amount"]) - float(expected_amount)) > 0.009:
             return {"status": "mismatch", "payment": payment}
 
-    updated = confirm_payment(int(payment["id"]))
-    if not updated:
-        again = get_payment_by_id(int(payment["id"]))
-        if again and again.get("status") == "подтверждена":
-            return {"status": "already", "payment": again}
-        return {"status": "forbidden", "payment": payment}
     if payment_method:
         set_payment_method_sync(int(payment["id"]), payment_method)
-        updated = get_payment_by_id(int(payment["id"])) or updated
+
+    if payment.get("player_notified_at") is not None:
+        return {"status": "already_notified", "payment": get_payment_by_id(int(payment["id"]))}
+
+    updated = mark_payment_notified_sync(int(payment["id"]))
+    if not updated:
+        again = get_payment_by_id(int(payment["id"]))
+        if again and again.get("player_notified_at") is not None:
+            return {"status": "already_notified", "payment": again}
+        return {"status": "forbidden", "payment": payment}
     return {"status": "ok", "payment": updated}
+
+
+def confirm_payment_from_yookassa(
+    provider_payment_id: str,
+    local_payment_id: int = None,
+    expected_amount=None,
+    payment_method: str = None,
+):
+    """Обратная совместимость: теперь только регистрирует оплату для админа."""
+    return register_provider_payment_awaiting_admin(
+        provider_payment_id=provider_payment_id,
+        local_payment_id=local_payment_id,
+        expected_amount=expected_amount,
+        payment_method=payment_method,
+    )
 
 
 def confirm_refund(payment_id: int):
