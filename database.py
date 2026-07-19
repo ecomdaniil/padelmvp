@@ -429,12 +429,18 @@ def _migrate_bookings_table(cur):
 
     admin_notify_message_id — message_id уведомления «Новая запись на корт»
     в чате админа (Telegram). Нужен, чтобы при отмене ДО оплаты бот мог
-    удалить это сообщение (см. _notify_admin_new_booking / cancel в bot.py)."""
+    удалить это сообщение (см. _notify_admin_new_booking / cancel в bot.py).
+
+    admin_extra_notify_message_id — то же для «Докупка мест»: при отмене
+    только доплаты удаляем это сообщение, исходную запись оставляем."""
     cur.execute(
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS slots_count INTEGER NOT NULL DEFAULT 1;"
     )
     cur.execute(
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS admin_notify_message_id BIGINT;"
+    )
+    cur.execute(
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS admin_extra_notify_message_id BIGINT;"
     )
 
 
@@ -1613,7 +1619,8 @@ def set_payment_method_sync(payment_id: int, method: str):
 
 
 def mark_payment_notified_sync(payment_id: int):
-    """Игрок оплатил / сообщил об оплате — ждём подтверждения админа в CRM."""
+    """Игрок оплатил / сообщил об оплате — ждём подтверждения админа в CRM.
+    Заполняет player_notified_at → бейдж «+N» у «Оплаты» в шапке CRM."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1626,6 +1633,8 @@ def mark_payment_notified_sync(payment_id: int):
     conn.commit()
     cur.close()
     conn.close()
+    if row is not None:
+        clear_badge_cache()
     return row
 
 
@@ -2163,6 +2172,13 @@ def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_
 _badge_cache_lock = threading.Lock()
 _badge_cache = {}  # key -> (monotonic_ts, counts_dict)
 _BADGE_CACHE_TTL = 10.0
+
+
+def clear_badge_cache() -> None:
+    """Сброс in-memory кэша бейджей — вызывается после player_notified_at,
+    чтобы "+N" у «Оплаты» появился на следующем /api/activity без ожидания TTL."""
+    with _badge_cache_lock:
+        _badge_cache.clear()
 
 _dashboard_cache_lock = threading.Lock()
 _dashboard_cache = None  # (monotonic_ts, summary_dict)

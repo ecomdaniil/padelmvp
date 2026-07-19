@@ -1325,15 +1325,27 @@ async def _notify_admin_new_booking(
 
 
 async def _delete_admin_booking_notify(bot: Bot, message_id: Optional[int]) -> None:
-    """Удаляет у админа сообщение о записи, если бронь отменена до оплаты."""
+    """Удаляет у админа сообщение о записи/докупке, если заказ отменён до оплаты."""
     if not message_id:
         return
     for chat_id in await _resolve_admin_chat_ids():
         try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
             return
         except Exception as e:
             logger.debug("Не удалось удалить уведомление админу %s msg=%s: %s", chat_id, message_id, e)
+
+
+async def _cleanup_admin_notifies_after_cancel(bot: Bot, result: dict) -> None:
+    """После отмены покупки/докупки убрать соответствующие сообщения у админа."""
+    if result.get("status") == "extra_cancelled":
+        # Снята только доплата — исходное «Новая запись» оставляем.
+        await _delete_admin_booking_notify(bot, result.get("admin_extra_notify_message_id"))
+        return
+    # Полная отмена до оплаты (или с удалением pending) — чистим оба уведомления.
+    if result.get("payment_deleted") or not result.get("had_payment"):
+        await _delete_admin_booking_notify(bot, result.get("admin_notify_message_id"))
+        await _delete_admin_booking_notify(bot, result.get("admin_extra_notify_message_id"))
 
 
 @router.message(Command("games"))
@@ -1554,9 +1566,10 @@ async def process_booking_confirm(callback: CallbackQuery):
         return
 
     if not is_resume:
-        # Уведомление админу только при первой записи, не при повторном клике.
-        asyncio.create_task(
-            _notify_admin_new_booking(callback.bot, user, game, booking_id, slots_count, total_price)
+        # Ждём отправки админу — иначе при быстрой отмене message_id ещё не
+        # сохранён и уведомление «Новая запись» останется в чате админа.
+        await _notify_admin_new_booking(
+            callback.bot, user, game, booking_id, slots_count, total_price,
         )
         await callback.message.answer(
             f"✅ Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
@@ -1716,11 +1729,9 @@ async def process_buy_more_confirm(callback: CallbackQuery):
     total_price = float(payment["amount"])
     _invalidate_games_cache()
 
-    asyncio.create_task(
-        _notify_admin_extra_slots(
-            callback.bot, user, game, booking_id, added, total_price,
-            int(booking.get("slots_count") or added),
-        )
+    await _notify_admin_extra_slots(
+        callback.bot, user, game, booking_id, added, total_price,
+        int(booking.get("slots_count") or added),
     )
 
     await callback.message.answer(
@@ -1774,7 +1785,15 @@ async def _notify_admin_extra_slots(
         f"🆔 ID заявки: {booking_id}"
     )
     try:
-        await _send_admin_message(bot, text, parse_mode="HTML")
+        sent = await _send_admin_message(bot, text, parse_mode="HTML")
+        if sent is not None:
+            try:
+                await db.set_booking_admin_extra_notify_message(booking_id, sent.message_id)
+            except Exception as e:
+                logger.error(
+                    "Не удалось сохранить message_id докупки для брони #%s: %s",
+                    booking_id, e,
+                )
     except Exception as e:
         logger.error("Не удалось уведомить админа о докупке #%s: %s", booking_id, e)
 
@@ -2300,6 +2319,7 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
         return
     if result["status"] == "extra_cancelled":
         _invalidate_games_cache()
+        await _cleanup_admin_notifies_after_cancel(callback.bot, result)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -2321,10 +2341,7 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
         return
 
     _invalidate_games_cache()
-    if result.get("payment_deleted") or (
-        not result.get("had_payment") and result.get("admin_notify_message_id")
-    ):
-        await _delete_admin_booking_notify(callback.bot, result.get("admin_notify_message_id"))
+    await _cleanup_admin_notifies_after_cancel(callback.bot, result)
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -2781,11 +2798,7 @@ async def process_cancel_yes(callback: CallbackQuery):
         return
 
     _invalidate_games_cache()
-    # Если отмена до оплаты — платёж удалён из CRM, уведомление админу тоже.
-    if result.get("payment_deleted") or (
-        not result.get("had_payment") and result.get("admin_notify_message_id")
-    ):
-        await _delete_admin_booking_notify(callback.bot, result.get("admin_notify_message_id"))
+    await _cleanup_admin_notifies_after_cancel(callback.bot, result)
 
     try:
         await callback.message.edit_text(

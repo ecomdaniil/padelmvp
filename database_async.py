@@ -986,12 +986,15 @@ async def cancel_payment_or_booking_owned(
                     if new_slots < 1:
                         new_slots = protected_slots
 
+                    extra_notify_id = booking.get("admin_extra_notify_message_id")
                     await conn.execute(
                         "DELETE FROM payments WHERE id = $1 AND status = 'ожидает'",
                         payment_id,
                     )
                     updated = await conn.fetchrow(
-                        """UPDATE bookings SET slots_count = $1
+                        """UPDATE bookings
+                           SET slots_count = $1,
+                               admin_extra_notify_message_id = NULL
                            WHERE id = $2 RETURNING *""",
                         new_slots, booking_id,
                     )
@@ -1006,6 +1009,7 @@ async def cancel_payment_or_booking_owned(
                         "refund_eligible": False,
                         "refund_window": False,
                         "admin_notify_message_id": booking["admin_notify_message_id"],
+                        "admin_extra_notify_message_id": extra_notify_id,
                         "payment": None,
                     }
 
@@ -1133,10 +1137,16 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
 
             refund_eligible = refund_window and confirmed_payment is not None
             admin_notify_message_id = booking["admin_notify_message_id"]
+            admin_extra_notify_message_id = booking.get("admin_extra_notify_message_id")
             payment_deleted = False
 
             await conn.execute(
-                "UPDATE bookings SET status = 'отменена' WHERE id = $1", booking_id
+                """UPDATE bookings
+                   SET status = 'отменена',
+                       admin_notify_message_id = NULL,
+                       admin_extra_notify_message_id = NULL
+                   WHERE id = $1""",
+                booking_id,
             )
 
             payment_result = None
@@ -1165,6 +1175,7 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                 "had_payment": bool(had_payment),
                 "payment_deleted": payment_deleted,
                 "admin_notify_message_id": admin_notify_message_id,
+                "admin_extra_notify_message_id": admin_extra_notify_message_id,
                 "game": _to_dict(game),
                 "payment": _to_dict(payment_result) if payment_result else None,
             }
@@ -1177,6 +1188,23 @@ async def set_booking_admin_notify_message(booking_id: int, message_id: int) -> 
     await pool.execute(
         "UPDATE bookings SET admin_notify_message_id = $1 WHERE id = $2",
         message_id, booking_id,
+    )
+
+
+async def set_booking_admin_extra_notify_message(booking_id: int, message_id: int) -> None:
+    """message_id уведомления «Докупка мест» — удаляется при отмене доплаты."""
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE bookings SET admin_extra_notify_message_id = $1 WHERE id = $2",
+        message_id, booking_id,
+    )
+
+
+async def clear_booking_admin_extra_notify_message(booking_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE bookings SET admin_extra_notify_message_id = NULL WHERE id = $1",
+        booking_id,
     )
 
 
@@ -1327,9 +1355,9 @@ async def set_payment_method_owned(payment_id: int, user_id: int, method: str) -
 
 
 async def mark_payment_notified(payment_id: int) -> Optional[dict]:
-    """Игрок нажал «✅ Я оплатил» — атомарно и идемпотентно: только статус
-    «ожидает» и только если ещё не уведомлял. Возвращает обновлённую
-    строку или None (уже уведомлён / другой статус)."""
+    """Игрок нажал «✅ Я оплатил» / оплатил через PayMaster — атомарно и
+    идемпотентно: только статус «ожидает» и только если ещё не уведомлял.
+    Именно с этого момента в CRM загорается бейдж «+N» у «Оплаты»."""
     pool = await get_pool()
     row = await pool.fetchrow(
         """UPDATE payments SET player_notified_at = NOW()
@@ -1337,7 +1365,15 @@ async def mark_payment_notified(payment_id: int) -> Optional[dict]:
            RETURNING *""",
         payment_id,
     )
-    return _to_dict(row) if row else None
+    result = _to_dict(row) if row else None
+    if result is not None:
+        # CRM крутится в том же процессе (Render) — сбросить кэш бейджей.
+        try:
+            import database as db_sync
+            db_sync.clear_badge_cache()
+        except Exception:
+            pass
+    return result
 
 
 async def mark_payment_notified_owned(payment_id: int, user_id: int) -> Optional[dict]:
