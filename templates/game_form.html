@@ -26,7 +26,7 @@
                 {% for co in coaches %}
                 <option value="{{ co.id }}"
                         {% if values.coach_id == co.id|string %}selected{% endif %}>
-                    {{ co.emoji or '' }} {{ co.name }}
+                    {{ co.name }}
                 </option>
                 {% endfor %}
             </select>

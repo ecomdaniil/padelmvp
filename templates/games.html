@@ -83,7 +83,7 @@
         <div class="card game-card{{ ' game-card-full' if is_full else '' }}">
             <div class="game-card-head">
                 <button type="button" class="game-icon-btn" data-game-id="{{ g.id }}"
-                        title="Подробнее {% if is_training %}о тренировке{% else %}об игре{% endif %} №{{ g.id }}">{% if is_training %}🏋️{% else %}🎾{% endif %}</button>
+                        title="Подробнее {% if is_training %}о тренировке{% else %}об игре{% endif %} №{{ g.id }}">{% if is_training %}💪{% else %}🎾{% endif %}</button>
                 <div class="game-card-head-main">
                     {% if is_training and g.title %}
                     <div class="game-card-date">{{ g.title }}</div>

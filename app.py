@@ -1145,7 +1145,6 @@ def _coach_values_from_form(form):
         "experience": (form.get("experience") or "").strip(),
         "specialization": (form.get("specialization") or "").strip(),
         "achievements": (form.get("achievements") or "").strip(),
-        "emoji": (form.get("emoji") or "🧑‍🏫").strip() or "🧑‍🏫",
         "sort_order": (form.get("sort_order") or "0").strip(),
         "is_active": bool(form.get("is_active")),
     }
@@ -1156,7 +1155,7 @@ def _coach_values_from_row(coach):
         return {
             "name": "", "phone": "", "telegram_username": "",
             "experience": "", "specialization": "", "achievements": "",
-            "emoji": "🧑‍🏫", "sort_order": "0", "is_active": True,
+            "sort_order": "0", "is_active": True,
         }
     return {
         "name": coach.get("name") or "",
@@ -1165,7 +1164,6 @@ def _coach_values_from_row(coach):
         "experience": coach.get("experience") or "",
         "specialization": coach.get("specialization") or "",
         "achievements": coach.get("achievements") or "",
-        "emoji": coach.get("emoji") or "🧑‍🏫",
         "sort_order": str(coach.get("sort_order") or 0),
         "is_active": bool(coach.get("is_active", True)),
     }
@@ -1201,7 +1199,6 @@ def coach_new():
             experience=values["experience"][:120],
             specialization=values["specialization"][:2000],
             achievements=values["achievements"][:4000],
-            emoji=values["emoji"][:8],
             is_active=values["is_active"],
             sort_order=sort_order,
         )
@@ -1241,7 +1238,7 @@ def coach_edit(coach_id):
             experience=values["experience"][:120],
             specialization=values["specialization"][:2000],
             achievements=values["achievements"][:4000],
-            emoji=values["emoji"][:8],
+            emoji=coach.get("emoji") or "🧑‍🏫",
             is_active=values["is_active"],
             sort_order=sort_order,
         )

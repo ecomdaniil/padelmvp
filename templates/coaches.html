@@ -6,7 +6,6 @@
     </div>
     <table>
         <tr>
-            <th></th>
             <th>Имя</th>
             <th>Телефон</th>
             <th>Telegram</th>
@@ -17,7 +16,6 @@
         </tr>
         {% for c in coaches %}
         <tr>
-            <td>{{ c.emoji or '🧑‍🏫' }}</td>
             <td>{{ c.name }}</td>
             <td>{{ c.phone or '—' }}</td>
             <td>{% if c.telegram_username %}@{{ c.telegram_username }}{% else %}—{% endif %}</td>
@@ -29,7 +27,7 @@
             </td>
         </tr>
         {% else %}
-        <tr><td colspan="8">Тренеров пока нет. Добавьте первого!</td></tr>
+        <tr><td colspan="7">Тренеров пока нет. Добавьте первого!</td></tr>
         {% endfor %}
     </table>
     {% include "_pagination.html" %}

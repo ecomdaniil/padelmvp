@@ -1,68 +1,65 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>{% if coach %}Редактировать тренера{% else %}Новый тренер{% endif %}</h1>
-    <form method="post" class="card" style="max-width:560px;">
+    <form method="post" class="card coach-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
-        <div class="form-row">
-            <label for="name">Имя *</label>
-            <input type="text" id="name" name="name" required maxlength="120"
-                   value="{{ values.name }}">
-        </div>
+        <div class="coach-form-grid">
+            <div class="form-row">
+                <label for="name">Имя *</label>
+                <input type="text" id="name" name="name" required maxlength="120"
+                       placeholder="Имя и фамилия"
+                       value="{{ values.name }}">
+            </div>
 
-        <div class="form-row">
-            <label for="phone">Номер телефона</label>
-            <input type="text" id="phone" name="phone" maxlength="40"
-                   placeholder="+7 …"
-                   value="{{ values.phone }}">
-        </div>
+            <div class="form-row">
+                <label for="phone">Номер телефона</label>
+                <input type="text" id="phone" name="phone" maxlength="40"
+                       placeholder="+7 …"
+                       value="{{ values.phone }}">
+            </div>
 
-        <div class="form-row">
-            <label for="telegram_username">Юзер в Telegram</label>
-            <input type="text" id="telegram_username" name="telegram_username" maxlength="64"
-                   placeholder="username без @"
-                   value="{{ values.telegram_username }}">
-        </div>
+            <div class="form-row">
+                <label for="telegram_username">Юзер в Telegram</label>
+                <input type="text" id="telegram_username" name="telegram_username" maxlength="64"
+                       placeholder="username без @"
+                       value="{{ values.telegram_username }}">
+            </div>
 
-        <div class="form-row">
-            <label for="experience">Стаж</label>
-            <input type="text" id="experience" name="experience" maxlength="120"
-                   placeholder="например: 8 лет"
-                   value="{{ values.experience }}">
-        </div>
+            <div class="form-row">
+                <label for="experience">Стаж</label>
+                <input type="text" id="experience" name="experience" maxlength="120"
+                       placeholder="например: 8 лет"
+                       value="{{ values.experience }}">
+            </div>
 
-        <div class="form-row">
-            <label for="specialization">Специализация</label>
-            <textarea id="specialization" name="specialization" rows="3"
-                      maxlength="2000"
-                      placeholder="Чем занимается тренер">{{ values.specialization }}</textarea>
-        </div>
+            <div class="form-row coach-form-span">
+                <label for="specialization">Специализация</label>
+                <textarea id="specialization" name="specialization" rows="3"
+                          maxlength="2000"
+                          placeholder="Чем занимается тренер">{{ values.specialization }}</textarea>
+            </div>
 
-        <div class="form-row">
-            <label for="achievements">Достижения</label>
-            <textarea id="achievements" name="achievements" rows="4"
-                      maxlength="4000"
-                      placeholder="Список достижений">{{ values.achievements }}</textarea>
-        </div>
+            <div class="form-row coach-form-span">
+                <label for="achievements">Достижения</label>
+                <textarea id="achievements" name="achievements" rows="4"
+                          maxlength="4000"
+                          placeholder="Список достижений">{{ values.achievements }}</textarea>
+            </div>
 
-        <div class="form-row">
-            <label for="emoji">Эмодзи</label>
-            <input type="text" id="emoji" name="emoji" maxlength="8"
-                   value="{{ values.emoji }}">
-        </div>
+            <div class="form-row">
+                <label for="sort_order">Порядок в списке</label>
+                <input type="number" id="sort_order" name="sort_order" step="1"
+                       value="{{ values.sort_order }}">
+            </div>
 
-        <div class="form-row">
-            <label for="sort_order">Порядок в списке</label>
-            <input type="number" id="sort_order" name="sort_order" step="1"
-                   value="{{ values.sort_order }}">
-        </div>
-
-        <div class="form-row">
-            <label>
-                <input type="checkbox" name="is_active" value="1"
-                       {% if values.is_active %}checked{% endif %}>
-                Показывать в боте
-            </label>
+            <div class="form-row coach-form-check">
+                <label class="coach-check-label">
+                    <input type="checkbox" name="is_active" value="1"
+                           {% if values.is_active %}checked{% endif %}>
+                    Показывать в боте
+                </label>
+            </div>
         </div>
 
         <div class="form-actions">
@@ -73,10 +70,77 @@
 
     {% if coach and coach.is_active %}
     <form method="post" action="{{ url_for('coach_hide', coach_id=coach.id) }}"
-          style="margin-top:16px;max-width:560px;"
+          class="coach-hide-form"
           onsubmit="return confirm('Скрыть тренера из бота?');">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-secondary">Скрыть из бота</button>
     </form>
     {% endif %}
+
+    <style>
+        .coach-form {
+            max-width: 760px;
+            padding: 22px 24px;
+        }
+        .coach-form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px 18px;
+            margin-bottom: 18px;
+        }
+        .coach-form-span { grid-column: 1 / -1; }
+        .coach-form .form-row {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 0;
+        }
+        .coach-form .form-row label {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--muted);
+        }
+        .coach-form .form-row input,
+        .coach-form .form-row textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid rgba(15, 23, 42, 0.12);
+            border-radius: 10px;
+            background: #fff;
+            font: inherit;
+            box-sizing: border-box;
+        }
+        .coach-form .form-row textarea {
+            resize: vertical;
+            min-height: 84px;
+        }
+        .coach-form-check {
+            justify-content: flex-end;
+        }
+        .coach-check-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: auto;
+            padding: 10px 0;
+            font-weight: 600;
+            font-size: 14px;
+            color: var(--text, #0f172a);
+            cursor: pointer;
+        }
+        .coach-form .form-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .coach-hide-form {
+            margin-top: 16px;
+            max-width: 760px;
+        }
+        @media (max-width: 640px) {
+            .coach-form-grid { grid-template-columns: 1fr; }
+            .coach-form-check { justify-content: flex-start; }
+            .coach-check-label { padding-top: 0; }
+        }
+    </style>
 {% endblock %}

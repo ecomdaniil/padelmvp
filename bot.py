@@ -752,7 +752,7 @@ def _game_format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сингл (2 игрока)", callback_data="games_format:2")],
         [InlineKeyboardButton(text="Классика (4 игрока)", callback_data="games_format:4")],
-        [InlineKeyboardButton(text="🏋️ Тренировки", callback_data="games_format:training")],
+        [InlineKeyboardButton(text="💪 Тренировки", callback_data="games_format:training")],
     ])
 
 
@@ -786,7 +786,7 @@ def _game_card(game: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
 
     lines = []
     if is_training and game.get("title"):
-        lines.append(f"🏋️ <b>{_html(game['title'])}</b>")
+        lines.append(f"💪 <b>{_html(game['title'])}</b>")
     lines.append(
         f"📅 <b>{game['game_date'].strftime('%d.%m.%Y')}</b> в {str(game['game_time'])[:5]}"
     )
@@ -883,7 +883,7 @@ async def _show_trainings(message: Message, telegram_id: Optional[int] = None):
         return
 
     await message.answer(
-        "🏋️ <b>Ближайшие тренировки</b>\n"
+        "💪 <b>Ближайшие тренировки</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Выбери занятие и нажми «Записаться»:",
         parse_mode="HTML",
