@@ -1042,12 +1042,8 @@ async def _show_past_bookings(message: Message):
     )
 
     def _past_card(b: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
-        if b["status"] == "посещена":
-            status_line = "✅ Посещена"
-        elif b["status"] == "подтверждена":
-            status_line = "📌 Подтверждена"
-        else:
-            status_line = f"📌 {b['status']}"
+        # Список уже отфильтрован как CRM «Посещения» — это прошедшие записи.
+        status_line = "✅ Посещение"
         text = (
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
@@ -1070,12 +1066,14 @@ def _format_statistics(stats: dict) -> str:
         "📊 <b>Моя статистика</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📝 Всего заявок подано: <b>{stats['total']}</b>\n"
-        f"💳 Игр оплачено: <b>{stats['paid']}</b>\n"
-        f"✅ Игр посещено: <b>{stats['attended']}</b>\n"
-        f"❌ Игр отменено: <b>{stats['cancelled']}</b>\n\n"
+        f"💳 Оплачено: <b>{stats['paid']}</b>\n"
+        f"✅ Посещений: <b>{stats['attended']}</b>\n"
+        f"❌ Отменено: <b>{stats['cancelled']}</b>\n\n"
         f"📈 Посещаемость: <b>{stats['attendance_rate']}%</b>\n"
         f"⏱ Сыграно часов: <b>{stats['hours_played']}</b>\n\n"
-        "<i>Сыгранные — игры, которые уже начались и на которые ты был записан.</i>"
+        "<i>Посещение — прошедшая (уже начавшаяся) игра или тренировка, "
+        "на которую ты был записан и которую не отменял. "
+        "То же самое, что раздел «Посещения» в CRM.</i>"
     )
 
 
@@ -1626,7 +1624,11 @@ async def process_booking_ask_slots(callback: CallbackQuery):
     game_id = int(callback.data.split(":")[1])
     ok = await _prompt_slots_for_game(callback.message, game_id)
     if not ok:
-        await callback.message.answer("Эта игра больше не доступна или мест нет.")
+        await callback.message.answer(
+            "Эта игра временно недоступна: другой игрок уже заявил оплату, "
+            "и администратор ещё подтверждает её.\n"
+            "Или мест уже нет — загляни в «🎾 Игры» чуть позже."
+        )
 
 
 @router.callback_query(F.data == "book_back")
@@ -1725,6 +1727,13 @@ async def _do_booking_confirm(callback: CallbackQuery) -> None:
 
     if result["status"] == "not_found":
         await callback.message.answer("Эта игра больше не доступна.")
+        return
+    if result["status"] == "payment_hold":
+        await callback.message.answer(
+            "Эта игра временно недоступна для записи.\n"
+            "Другой игрок уже заявил оплату — дождитесь подтверждения администратором. "
+            "После этого свободные места снова появятся в «🎾 Игры», если они останутся."
+        )
         return
     if result["status"] == "full":
         await callback.message.answer(
@@ -2455,6 +2464,9 @@ async def process_paid_notify(callback: CallbackQuery):
             "Дождись подтверждения администратора."
         )
         return
+
+    # Скрываем игру из списка для остальных, пока админ не подтвердит.
+    _invalidate_games_cache()
 
     await callback.message.answer(_payment_awaiting_admin_text())
 

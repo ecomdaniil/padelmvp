@@ -220,7 +220,11 @@ async def get_upcoming_games_with_slots() -> list:
     (или админ уменьшит booked_places), освободившееся место сразу видно
     новым пользователям — кэш инвалидируется при любой брони/отмене (см.
     _invalidate_games_cache в bot.py) и при сохранении игры в CRM, так что
-    устаревших данных дольше TTL/факта изменения не бывает."""
+    устаревших данных дольше TTL/факта изменения не бывает.
+
+    Также скрываем игры, где игрок уже нажал «Я оплатил», а админ ещё не
+    подтвердил оплату — для остальных слоты временно недоступны. После
+    confirm в CRM кэш сбрасывается; игра снова видна, если места остались."""
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
@@ -241,6 +245,7 @@ async def get_upcoming_games_with_slots() -> list:
         WHERE (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR}
           AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
           AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) < g.total_slots
+          AND NOT {_PAYMENT_AWAITING_ADMIN_EXISTS}
         ORDER BY g.game_date, g.game_time
         """
     )
@@ -315,6 +320,39 @@ _TAKEN_EXPR = (
     "(COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0))"
 )
 
+# Игра скрыта из бота, пока есть оплата «Я оплатил» без подтверждения админа.
+_PAYMENT_AWAITING_ADMIN_EXISTS = """
+    EXISTS (
+        SELECT 1
+        FROM bookings b_hold
+        JOIN payments p_hold ON p_hold.booking_id = b_hold.id
+        WHERE b_hold.game_id = g.id
+          AND b_hold.status != 'отменена'
+          AND p_hold.status = 'ожидает'
+          AND p_hold.player_notified_at IS NOT NULL
+    )
+"""
+
+
+async def _game_has_payment_awaiting_admin(conn, game_id: int) -> bool:
+    """True — на игре есть бронь с оплатой, заявленной игроком и ещё не
+    подтверждённой админом (место «заморожено» для остальных)."""
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT 1
+            FROM bookings b
+            JOIN payments p ON p.booking_id = b.id
+            WHERE b.game_id = $1
+              AND b.status != 'отменена'
+              AND p.status = 'ожидает'
+              AND p.player_notified_at IS NOT NULL
+            LIMIT 1
+            """,
+            game_id,
+        )
+    )
+
 
 async def _games_underfill_in_window(start_interval: str, end_interval: str, extra_where: str) -> list:
     """Обычные игры с недобором состава в заданном окне до старта (Москва).
@@ -355,9 +393,10 @@ async def get_games_needing_underfill_warn_3h() -> list:
 
 async def get_games_needing_underfill_cancel_1h() -> list:
     """Автоотмена недобора за ~час до старта.
-    Нижняя граница −90 мин — catch-up, если job проснулся уже после старта."""
+    Нижняя граница 0 — только до начала игры (не отменяем уже стартовавшие,
+    даже если планировщик на Render проснулся с опозданием)."""
     return await _games_underfill_in_window(
-        "-90 minutes",
+        "0 minutes",
         "1 hour 15 minutes",
         "TRUE",
     )
@@ -401,8 +440,12 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
     За менее чем 1 час до старта нельзя взять часть мест: только выкуп
     всех оставшихся (must_fill_all), иначе игра уйдёт в недобор.
 
-    Возвращает dict {"status": "ok"|"full"|"duplicate"|"not_found"|"must_fill_all",
+    Возвращает dict
+    {"status": "ok"|"full"|"duplicate"|"not_found"|"must_fill_all"|"payment_hold",
     "booking": ..., "game": ..., "free_slots": int?}.
+
+    payment_hold — на игре уже есть «Я оплатил» без confirm админа; новым
+    игрокам запись закрыта (своя duplicate-бронь по-прежнему отдаётся).
 
     Отдаём game здесь же (мы и так уже сходили за ней в БД внутри
     транзакции) — раньше bot.py делал отдельный предварительный
@@ -457,6 +500,14 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                     "booking": _to_dict(existing),
                     "game": game_dict,
                     "payment": _to_dict(latest_payment) if latest_payment else None,
+                }
+
+            # Чужой игрок уже заявил оплату — игра скрыта, пока админ не подтвердит.
+            if await _game_has_payment_awaiting_admin(conn, game_id):
+                return {
+                    "status": "payment_hold",
+                    "booking": None,
+                    "game": game_dict,
                 }
 
             taken = await conn.fetchval(
@@ -521,48 +572,52 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
 
 
 async def get_game_slot_offer(game_id: int) -> Optional[dict]:
-    """Данные для экрана «Сколько мест?»: свободно мест и флаг «меньше часа»."""
+    """Данные для экрана «Сколько мест?»: свободно мест и флаг «меньше часа».
+    None — игра недоступна / мест нет / ждёт подтверждения оплаты админом."""
     pool = await get_pool()
-    row = await pool.fetchrow(
-        f"""
-        SELECT g.*,
-               LEAST(
-                   COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0),
-                   g.total_slots
-               ) AS taken,
-               (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming,
-               (g.game_date + g.game_time) < {_LOCAL_NOW_EXPR} + INTERVAL '1 hour'
-                   AS within_last_hour
-        FROM games g
-        LEFT JOIN (
-            SELECT game_id, SUM(slots_count) AS taken
-            FROM bookings
-            WHERE status != 'отменена'
-            GROUP BY game_id
-        ) bk ON bk.game_id = g.id
-        WHERE g.id = $1
-        """,
-        game_id,
-    )
-    if row is None:
-        return None
-    data = _to_dict(row)
-    if data.get("underfill_cancelled") or not data.get("still_upcoming"):
-        return None
-    taken = int(data.get("taken") or 0)
-    total = int(data["total_slots"])
-    free_slots = max(0, total - taken)
-    if free_slots <= 0:
-        return None
-    # Тренировки не отменяем по недобору — в последний час частичная запись ок.
-    is_training = (data.get("event_type") or "game") == "training"
-    return {
-        "game": data,
-        "taken": taken,
-        "total_slots": total,
-        "free_slots": free_slots,
-        "within_last_hour": bool(data.get("within_last_hour")) and not is_training,
-    }
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT g.*,
+                   LEAST(
+                       COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0),
+                       g.total_slots
+                   ) AS taken,
+                   (g.game_date + g.game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming,
+                   (g.game_date + g.game_time) < {_LOCAL_NOW_EXPR} + INTERVAL '1 hour'
+                       AS within_last_hour
+            FROM games g
+            LEFT JOIN (
+                SELECT game_id, SUM(slots_count) AS taken
+                FROM bookings
+                WHERE status != 'отменена'
+                GROUP BY game_id
+            ) bk ON bk.game_id = g.id
+            WHERE g.id = $1
+            """,
+            game_id,
+        )
+        if row is None:
+            return None
+        data = _to_dict(row)
+        if data.get("underfill_cancelled") or not data.get("still_upcoming"):
+            return None
+        if await _game_has_payment_awaiting_admin(conn, game_id):
+            return None
+        taken = int(data.get("taken") or 0)
+        total = int(data["total_slots"])
+        free_slots = max(0, total - taken)
+        if free_slots <= 0:
+            return None
+        # Тренировки не отменяем по недобору — в последний час частичная запись ок.
+        is_training = (data.get("event_type") or "game") == "training"
+        return {
+            "game": data,
+            "taken": taken,
+            "total_slots": total,
+            "free_slots": free_slots,
+            "within_last_hour": bool(data.get("within_last_hour")) and not is_training,
+        }
 
 
 async def get_active_bookings_for_user(user_id: int) -> list:
@@ -741,7 +796,8 @@ async def increase_booking_slots_safe(
 
 
 async def get_past_bookings_for_user(user_id: int) -> list:
-    """Сыгранные / уже прошедшие игры (не отменённые записи)."""
+    """Сыгранные / уже прошедшие игры и тренировки — тот же смысл, что CRM
+    «Посещения»: запись не отменена, событие уже началось, не автоотмена недобора."""
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
@@ -751,7 +807,8 @@ async def get_past_bookings_for_user(user_id: int) -> list:
         JOIN games g ON g.id = b.game_id
         WHERE b.user_id = $1
           AND b.status != 'отменена'
-          AND (g.game_date + g.game_time) < {_LOCAL_NOW_EXPR}
+          AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+          AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
         ORDER BY g.game_date DESC, g.game_time DESC
         """,
         user_id,
@@ -1695,14 +1752,21 @@ async def confirm_payment_owned(payment_id: int, user_id: int, amount_kopecks: i
 # ---------------------------------------------------------------------------
 
 async def get_user_statistics(user_id: int) -> dict:
-    """Статистика игрока — раньше требовала 4 отдельных запроса,
-    теперь один запрос с условными агрегатами (FILTER)."""
+    """Статистика игрока. «Посещено» = тот же смысл, что CRM «Посещения»:
+    незакрытая запись на уже начавшуюся игру/тренировку (не недобор).
+
+    Посещаемость = посещено / все записи на уже прошедшие события
+    (включая отменённые игроком), без игр с автоотменой по недобору."""
     pool = await get_pool()
     row = await pool.fetchrow(
         f"""
         SELECT
             COUNT(*) AS total,
             COUNT(*) FILTER (WHERE b.status = 'отменена') AS cancelled,
+            COUNT(*) FILTER (
+                WHERE COALESCE(g.underfill_cancelled, FALSE) = FALSE
+                  AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+            ) AS past_total,
             COUNT(*) FILTER (
                 WHERE b.status != 'отменена'
                   AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
@@ -1721,13 +1785,13 @@ async def get_user_statistics(user_id: int) -> dict:
         user_id,
     )
 
-    total = row["total"]
-    cancelled = row["cancelled"]
-    attended = row["attended"]
-    paid = row["paid"]
+    total = int(row["total"] or 0)
+    cancelled = int(row["cancelled"] or 0)
+    attended = int(row["attended"] or 0)
+    past_total = int(row["past_total"] or 0)
+    paid = int(row["paid"] or 0)
 
-    active_total = total - cancelled
-    attendance_rate = round(attended / active_total * 100) if active_total > 0 else 0
+    attendance_rate = round(attended / past_total * 100) if past_total > 0 else 0
     hours_played = round(attended * 1.5, 1)
 
     return {

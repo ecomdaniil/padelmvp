@@ -1444,39 +1444,47 @@ def get_participants_for_game(game_id: int):
 
 
 def get_user_statistics(user_id: int) -> dict:
-    """Персональная статистика игрока для раздела «Моя статистика»."""
+    """Персональная статистика — тот же смысл «посещения», что в CRM и боте:
+    незакрытая запись на уже начавшуюся игру/тренировку."""
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) AS cnt FROM bookings WHERE user_id = %s", (user_id,))
-    total = cur.fetchone()["cnt"]
-
     cur.execute(
-        "SELECT COUNT(*) AS cnt FROM bookings WHERE user_id = %s AND status = 'отменена'",
-        (user_id,),
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE b.status = 'отменена') AS cancelled,
+            COUNT(*) FILTER (
+                WHERE COALESCE(g.underfill_cancelled, FALSE) = FALSE
+                  AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+            ) AS past_total,
+            COUNT(*) FILTER (
+                WHERE b.status != 'отменена'
+                  AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+                  AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+            ) AS attended,
+            (
+                SELECT COUNT(DISTINCT b2.id)
+                FROM bookings b2
+                JOIN payments p ON p.booking_id = b2.id
+                WHERE b2.user_id = %s AND p.status = 'подтверждена'
+            ) AS paid
+        FROM bookings b
+        LEFT JOIN games g ON g.id = b.game_id
+        WHERE b.user_id = %s
+        """,
+        (user_id, user_id),
     )
-    cancelled = cur.fetchone()["cnt"]
-
-    cur.execute(
-        """SELECT COUNT(DISTINCT b.id) AS cnt
-           FROM bookings b
-           JOIN payments p ON p.booking_id = b.id
-           WHERE b.user_id = %s AND p.status = 'подтверждена'""",
-        (user_id,),
-    )
-    paid = cur.fetchone()["cnt"]
-
-    cur.execute(
-        "SELECT COUNT(*) AS cnt FROM bookings WHERE user_id = %s AND status = 'посещена'",
-        (user_id,),
-    )
-    attended = cur.fetchone()["cnt"]
-
+    row = cur.fetchone()
     cur.close()
     conn.close()
 
-    active_total = total - cancelled
-    attendance_rate = round(attended / active_total * 100) if active_total > 0 else 0
+    total = int(row["total"] or 0)
+    cancelled = int(row["cancelled"] or 0)
+    attended = int(row["attended"] or 0)
+    past_total = int(row["past_total"] or 0)
+    paid = int(row["paid"] or 0)
+
+    attendance_rate = round(attended / past_total * 100) if past_total > 0 else 0
     hours_played = round(attended * 1.5, 1)
 
     return {

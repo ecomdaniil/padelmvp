@@ -629,8 +629,33 @@ def index():
 @app.route("/health")
 @limiter.exempt
 def health_check():
-    """Публичный health для Render/uptime-cron. Без деталей (recon)."""
-    return {"status": "ok"}, 200
+    """Публичный health для Render healthCheckPath и keep-alive.
+
+    Всегда 200 (иначе Render убьёт сервис на старте бота), но в теле есть
+    bot_ready — внешний cron/Actions может проверить живость Telegram-бота.
+    """
+    bot = get_bot_health()
+    return {
+        "status": "ok",
+        "bot_ready": bool(bot.get("bot_ready")),
+        "bot_error": bot.get("bot_error"),
+    }, 200
+
+
+@app.route("/health/bot")
+@limiter.exempt
+def health_bot():
+    """Проверка бота: 200 если event loop жив, иначе 503.
+    Для мониторинга / GitHub keep-alive без логина в CRM."""
+    bot = get_bot_health()
+    payload = {
+        "status": "ok" if bot.get("bot_ready") else "bot_not_ready",
+        **{k: bot.get(k) for k in (
+            "bot_ready", "bot_error", "bot_thread_started",
+            "bot_loop_running", "run_bot_flag", "has_bot_token",
+        )},
+    }
+    return payload, (200 if bot.get("bot_ready") else 503)
 
 
 @app.route("/health/detail")
@@ -1433,6 +1458,8 @@ def payment_confirm(payment_id):
         flash("Не удалось подтвердить оплату — статус уже изменился или заявка отменена")
         return redirect(url_for("payments_list"))
     db.clear_badge_cache()
+    # После confirm игра снова может появиться в боте (если остались места).
+    cache.invalidate_games_cache()
     description = (
         f"Статус оплаты и заявки №{context['booking_id']} изменён на «подтверждена» "
         f"(игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
