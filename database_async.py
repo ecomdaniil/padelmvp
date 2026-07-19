@@ -18,12 +18,15 @@ database_async.py
 """
 
 import asyncio
+import logging
 import os
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import asyncpg
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -418,7 +421,20 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                 user_id, game_id,
             )
             if existing is not None:
-                return {"status": "duplicate", "booking": _to_dict(existing), "game": game_dict}
+                # Повторный клик / гонка: не ошибка — отдаём текущую бронь,
+                # чтобы бот мог продолжить оплату, а не «ты уже записан».
+                latest_payment = await conn.fetchrow(
+                    """SELECT * FROM payments
+                       WHERE booking_id = $1
+                       ORDER BY id DESC LIMIT 1""",
+                    existing["id"],
+                )
+                return {
+                    "status": "duplicate",
+                    "booking": _to_dict(existing),
+                    "game": game_dict,
+                    "payment": _to_dict(latest_payment) if latest_payment else None,
+                }
 
             taken = await conn.fetchval(
                 "SELECT COALESCE(SUM(slots_count), 0) FROM bookings WHERE game_id = $1 AND status != 'отменена'",
@@ -460,11 +476,20 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                    VALUES ($1, $2, 'новая', $3) RETURNING *""",
                 user_id, game_id, slots_count,
             )
+            # Платёж в той же транзакции — иначе при сбое после INSERT брони
+            # пользователь «записан», но не видит оплату и ловит duplicate.
+            amount = float(game_dict["price"]) * int(slots_count)
+            payment = await conn.fetchrow(
+                """INSERT INTO payments (booking_id, amount, status, method)
+                   VALUES ($1, $2, 'ожидает', NULL) RETURNING *""",
+                booking["id"], amount,
+            )
             new_taken = effective_taken + slots_count
             return {
                 "status": "ok",
                 "booking": _to_dict(booking),
                 "game": game_dict,
+                "payment": _to_dict(payment),
                 "taken": new_taken,
                 "total_slots": int(game["total_slots"]),
             }
@@ -908,6 +933,31 @@ async def create_payment(booking_id: int, amount: float, method: Optional[str] =
         booking_id, amount, method,
     )
     return _to_dict(row)
+
+
+async def get_or_create_pending_payment(booking_id: int, amount: float) -> Optional[dict]:
+    """Идемпотентно: один «ожидает» на бронь (см. idx_payments_one_pending)."""
+    pool = await get_pool()
+    existing = await pool.fetchrow(
+        """SELECT * FROM payments
+           WHERE booking_id = $1 AND status = 'ожидает'
+           ORDER BY id DESC LIMIT 1""",
+        booking_id,
+    )
+    if existing is not None:
+        return _to_dict(existing)
+    try:
+        return await create_payment(booking_id, amount)
+    except Exception as e:
+        # Гонка двух insert'ов — читаем снова.
+        logger.warning("get_or_create_pending_payment race booking=%s: %s", booking_id, e)
+        existing = await pool.fetchrow(
+            """SELECT * FROM payments
+               WHERE booking_id = $1 AND status = 'ожидает'
+               ORDER BY id DESC LIMIT 1""",
+            booking_id,
+        )
+        return _to_dict(existing) if existing else None
 
 
 async def attach_provider_payment(

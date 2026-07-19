@@ -1470,10 +1470,7 @@ async def process_booking_confirm(callback: CallbackQuery):
             parse_mode="HTML",
         )
         return
-    if result["status"] == "duplicate":
-        await callback.message.answer("Ты уже записан на эту игру.")
-        return
-    if result["status"] != "ok" or not result.get("booking") or not result.get("game"):
+    if result["status"] not in {"ok", "duplicate"} or not result.get("booking") or not result.get("game"):
         await callback.message.answer("Не удалось записаться. Попробуй ещё раз.")
         return
 
@@ -1482,42 +1479,59 @@ async def process_booking_confirm(callback: CallbackQuery):
     booking_id = booking["id"]
     # Сумма только из фактически записанных мест в БД — не из callback
     # (иначе подмена book_slots:...:0 давала бы оплату 0 ₽ при 1 месте).
-    slots_count = int(booking["slots_count"])
+    slots_count = int(booking.get("slots_count") or 1)
     total_price = float(game["price"]) * slots_count
     _invalidate_games_cache()
 
-    # Заявка создаётся сразу со «своим» платежом (статус «ожидает», способ
-    # оплаты пока не выбран) — так администратор в CRM видит ожидаемую
-    # оплату даже если игрок не пройдёт шаги ниже до конца (например,
-    # оплатит наличными на месте).
-    payment = await db.create_payment(booking_id, total_price)
+    payment = result.get("payment")
+    is_resume = result["status"] == "duplicate"
 
-    # Ответ пользователю не должен ждать отправки уведомления админу —
-    # раньше это был await ДО ответа пользователю, то есть каждая запись на
-    # игру платила ещё одним полным сетевым round-trip до Telegram сверху.
-    # Запускаем как fire-and-forget задачу; ошибки уже логируются внутри
-    # _notify_admin_new_booking и не могут сломать ответ игроку.
-    asyncio.create_task(
-        _notify_admin_new_booking(callback.bot, user, game, booking_id, slots_count, total_price)
-    )
-    await callback.message.answer(
-        f"✅ Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
-        f"в {str(game['game_time'])[:5]}!\n\n"
-        f"👥 Мест: <b>{slots_count}</b>\n"
-        f"💰 К оплате: <b>{total_price:.0f} ₽</b>\n"
-        "📌 Статус заявки: <b>новая</b>\n\n"
-        "Посмотреть записи: «📋 Мои записи» в меню",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="HTML",
-    )
-
-    # taken уже посчитан в create_booking_safe — без лишнего round-trip.
-    taken = int(result.get("taken") or 0)
-    total_slots = int(result.get("total_slots") or game["total_slots"])
-    if taken and taken < total_slots:
+    # Уже оплачено — не создаём второй «ожидает» и не шлём счёт снова.
+    if is_resume and payment and payment.get("status") == "подтверждена":
         await callback.message.answer(
-            _underfill_booking_notice(taken, total_slots),
+            "✅ Ты уже записан и оплатил эту игру.\n"
+            "Детали — в «📋 Мои записи».",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Платёж в той же транзакции, что бронь; при resume без «ожидает» — создаём.
+    if not payment or payment.get("status") != "ожидает":
+        payment = await db.get_or_create_pending_payment(booking_id, total_price)
+    if not payment:
+        await callback.message.answer(
+            "❌ Не удалось открыть оплату. Открой «📋 Мои записи» или попробуй ещё раз.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if not is_resume:
+        # Уведомление админу только при первой записи, не при повторном клике.
+        asyncio.create_task(
+            _notify_admin_new_booking(callback.bot, user, game, booking_id, slots_count, total_price)
+        )
+        await callback.message.answer(
+            f"✅ Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
+            f"в {str(game['game_time'])[:5]}!\n\n"
+            f"👥 Мест: <b>{slots_count}</b>\n"
+            f"💰 К оплате: <b>{total_price:.0f} ₽</b>\n"
+            "📌 Статус заявки: <b>новая</b>\n\n"
+            "Посмотреть записи: «📋 Мои записи» в меню",
+            reply_markup=main_menu_keyboard(),
             parse_mode="HTML",
+        )
+        taken = int(result.get("taken") or 0)
+        total_slots = int(result.get("total_slots") or game["total_slots"])
+        if taken and taken < total_slots:
+            await callback.message.answer(
+                _underfill_booking_notice(taken, total_slots),
+                parse_mode="HTML",
+            )
+    else:
+        await callback.message.answer(
+            "Ты уже записан на эту игру — продолжаем оплату.\n"
+            "Отменить можно кнопкой ниже или в «📋 Мои записи».",
+            reply_markup=main_menu_keyboard(),
         )
 
     await _offer_payment(
