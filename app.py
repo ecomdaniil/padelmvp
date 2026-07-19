@@ -1372,6 +1372,26 @@ def coach_hide(coach_id):
     return redirect(url_for("coaches_list"))
 
 
+@app.route("/coaches/<int:coach_id>/delete", methods=["POST"])
+@login_required
+def coach_delete(coach_id):
+    coach = db.get_coach_by_id(coach_id)
+    if not coach:
+        flash("Тренер не найден")
+        return redirect(url_for("coaches_list"))
+    deleted = db.permanently_delete_coach(coach_id)
+    if not deleted:
+        flash("Не удалось удалить тренера")
+        return redirect(url_for("coaches_list"))
+    cache.invalidate_games_cache()
+    log_admin_action(
+        "delete", "coach", coach_id,
+        description=f"Тренер «{coach['name']}» удалён",
+    )
+    flash("Тренер удалён")
+    return redirect(url_for("coaches_list"))
+
+
 # ---------------------------------------------------------------------------
 # Заявки (bookings)
 # ---------------------------------------------------------------------------

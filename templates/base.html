@@ -397,6 +397,42 @@
         .btn-secondary:hover { background: #475569; }
         .btn-danger { background: #dc2626; box-shadow: none; }
         .btn-danger:hover { background: #b91c1c; }
+        .confirm-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 300;
+            background: rgba(15, 23, 42, 0.45);
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .confirm-overlay.show { display: flex; }
+        .confirm-dialog {
+            background: #fff;
+            border-radius: 16px;
+            padding: 22px 24px;
+            max-width: 400px;
+            width: 100%;
+            box-shadow: 0 24px 48px rgba(15, 23, 42, 0.28);
+        }
+        .confirm-dialog h3 {
+            margin: 0 0 8px;
+            font-size: 18px;
+            color: var(--text);
+        }
+        .confirm-dialog p {
+            margin: 0 0 18px;
+            font-size: 14px;
+            color: var(--muted);
+            line-height: 1.45;
+        }
+        .confirm-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
         .game-number-tag {
             display: inline-block;
             background: rgba(37,99,235,0.08);
@@ -585,6 +621,73 @@
         {% endwith %}
         {% block content %}{% endblock %}
     </div>
+    <div class="confirm-overlay" id="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="confirm-title" hidden>
+        <div class="confirm-dialog">
+            <h3 id="confirm-title">Точно удалить?</h3>
+            <p id="confirm-message">Это действие нельзя отменить.</p>
+            <div class="confirm-actions">
+                <button type="button" class="btn btn-secondary" id="confirm-no">Нет</button>
+                <button type="button" class="btn btn-danger" id="confirm-yes">Да</button>
+            </div>
+        </div>
+    </div>
+    <script>
+        // Единое подтверждение удаления: Да / Нет (для form[data-confirm]).
+        (function () {
+            const overlay = document.getElementById('confirm-overlay');
+            const titleEl = document.getElementById('confirm-title');
+            const msgEl = document.getElementById('confirm-message');
+            const yesBtn = document.getElementById('confirm-yes');
+            const noBtn = document.getElementById('confirm-no');
+            if (!overlay || !yesBtn || !noBtn) return;
+
+            let pendingForm = null;
+
+            function closeConfirm() {
+                overlay.classList.remove('show');
+                overlay.hidden = true;
+                pendingForm = null;
+            }
+
+            function openConfirm(form) {
+                pendingForm = form;
+                titleEl.textContent = form.getAttribute('data-confirm-title') || 'Точно удалить?';
+                msgEl.textContent = form.getAttribute('data-confirm') || 'Это действие нельзя отменить.';
+                overlay.hidden = false;
+                overlay.classList.add('show');
+                yesBtn.focus();
+            }
+
+            document.addEventListener('submit', function (e) {
+                const form = e.target;
+                if (!(form instanceof HTMLFormElement)) return;
+                if (!form.hasAttribute('data-confirm')) return;
+                if (form.dataset.confirmAccepted === '1') {
+                    delete form.dataset.confirmAccepted;
+                    return;
+                }
+                e.preventDefault();
+                openConfirm(form);
+            });
+
+            yesBtn.addEventListener('click', function () {
+                const form = pendingForm;
+                if (!form) return;
+                form.dataset.confirmAccepted = '1';
+                closeConfirm();
+                form.submit();
+            });
+            noBtn.addEventListener('click', closeConfirm);
+            overlay.addEventListener('click', function (e) {
+                if (e.target === overlay) closeConfirm();
+            });
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && overlay.classList.contains('show')) {
+                    closeConfirm();
+                }
+            });
+        })();
+    </script>
     <script>
         const navToggle = document.querySelector('.nav-toggle');
         const navLinks = document.querySelector('.nav-links');

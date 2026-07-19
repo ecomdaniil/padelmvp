@@ -22,8 +22,14 @@
             <td>{{ c.experience or '—' }}</td>
             <td>{{ (c.specialization or '—')[:80] }}{% if c.specialization and c.specialization|length > 80 %}…{% endif %}</td>
             <td>{% if c.is_active %}<span class="badge badge-ok">активен</span>{% else %}<span class="badge badge-new">скрыт</span>{% endif %}</td>
-            <td>
+            <td style="white-space:nowrap; display:flex; gap:8px; flex-wrap:wrap;">
                 <a class="btn btn-secondary" href="{{ url_for('coach_edit', coach_id=c.id) }}">Изменить</a>
+                <form method="post" action="{{ url_for('coach_delete', coach_id=c.id) }}" style="margin:0;"
+                      data-confirm-title="Точно удалить?"
+                      data-confirm="Удалить тренера «{{ c.name }}»? У тренировок с ним тренер будет сброшен.">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-danger">Удалить</button>
+                </form>
             </td>
         </tr>
         {% else %}

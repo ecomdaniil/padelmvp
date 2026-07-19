@@ -68,13 +68,23 @@
         </div>
     </form>
 
-    {% if coach and coach.is_active %}
-    <form method="post" action="{{ url_for('coach_hide', coach_id=coach.id) }}"
-          class="coach-hide-form"
-          onsubmit="return confirm('Скрыть тренера из бота?');">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn btn-secondary">Скрыть из бота</button>
-    </form>
+    {% if coach %}
+    <div class="coach-hide-form" style="display:flex; gap:10px; flex-wrap:wrap;">
+        {% if coach.is_active %}
+        <form method="post" action="{{ url_for('coach_hide', coach_id=coach.id) }}" style="margin:0;"
+              data-confirm-title="Точно скрыть?"
+              data-confirm="Скрыть тренера «{{ coach.name }}» из бота?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-secondary">Скрыть из бота</button>
+        </form>
+        {% endif %}
+        <form method="post" action="{{ url_for('coach_delete', coach_id=coach.id) }}" style="margin:0;"
+              data-confirm-title="Точно удалить?"
+              data-confirm="Удалить тренера «{{ coach.name }}» навсегда? У тренировок с ним тренер будет сброшен.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-danger">Удалить</button>
+        </form>
+    </div>
     {% endif %}
 
     <style>

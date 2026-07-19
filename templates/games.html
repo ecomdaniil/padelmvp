@@ -157,9 +157,10 @@
             <div class="game-card-actions">
                 <a class="btn btn-secondary" href="{{ url_for('training_edit' if is_training else 'game_edit', game_id=g.id) }}">Изменить</a>
                 <form method="post" action="{{ url_for('training_delete' if is_training else 'game_delete', game_id=g.id) }}"
-                      onsubmit="return confirm('Удалить {% if is_training %}эту тренировку{% else %}эту игру{% endif %}? Все заявки и оплаты по ней тоже будут удалены.');">
+                      data-confirm-title="Точно удалить?"
+                      data-confirm="Удалить {% if is_training %}эту тренировку{% else %}эту игру{% endif %} №{{ g.id }}? Все заявки и оплаты по ней тоже будут удалены.">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" class="btn" style="background:#dc2626; box-shadow:none;">Удалить</button>
+                    <button type="submit" class="btn btn-danger">Удалить</button>
                 </form>
             </div>
         </div>

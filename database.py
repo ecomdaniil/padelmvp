@@ -2383,6 +2383,25 @@ def delete_coach(coach_id: int):
     return row
 
 
+def permanently_delete_coach(coach_id: int):
+    """Полное удаление тренера. У тренировок coach_id обнуляется (история слотов остаётся)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE games SET coach_id = NULL WHERE coach_id = %s",
+        (coach_id,),
+    )
+    cur.execute(
+        "DELETE FROM coaches WHERE id = %s RETURNING *",
+        (coach_id,),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
 # ---------------------------------------------------------------------------
 # ADMIN LOGS — журнал действий администратора
 # ---------------------------------------------------------------------------
