@@ -15,7 +15,7 @@ services:
       - key: RUN_BOT_IN_BACKGROUND
         value: "1"
       - key: WEBHOOK_ENFORCE_SECRET
-        value: "0"
+        value: "1"
       - key: SESSION_COOKIE_SECURE
         value: "1"
       - key: DB_POOL_MIN_SIZE

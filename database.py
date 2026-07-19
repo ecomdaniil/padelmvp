@@ -452,6 +452,13 @@ def _migrate_payments_table(cur):
     оплаты."""
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT;")
     cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS player_notified_at TIMESTAMP;")
+    # ЮKassa: id платежа у провайдера и ссылка на оплату (confirmation_url).
+    cur.execute(
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider_payment_id TEXT;"
+    )
+    cur.execute(
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirmation_url TEXT;"
+    )
     # Разово подчищаем «висящие» оплаты по уже отменённым заявкам — они
     # больше не должны отображаться в разделе «Оплаты» CRM.
     cur.execute(
@@ -473,6 +480,8 @@ def _create_indexes(cur):
         "CREATE INDEX IF NOT EXISTS idx_games_date_time ON games (game_date, game_time);",
         "CREATE INDEX IF NOT EXISTS idx_games_reminder_pending ON games (reminder_sent) WHERE reminder_sent = FALSE;",
         "CREATE INDEX IF NOT EXISTS idx_games_reminder_2h_pending ON games (reminder_2h_sent) WHERE reminder_2h_sent = FALSE;",
+        "CREATE INDEX IF NOT EXISTS idx_games_underfill_warn ON games (underfill_warn_3h_sent) WHERE underfill_warn_3h_sent = FALSE;",
+        "CREATE INDEX IF NOT EXISTS idx_games_underfill_active ON games (game_date, game_time) WHERE underfill_cancelled = FALSE;",
         # список игр в CRM фильтруется по уровню (см. games_list в app.py)
         "CREATE INDEX IF NOT EXISTS idx_games_level ON games (level);",
         "CREATE INDEX IF NOT EXISTS idx_games_club_id ON games (club_id);",
@@ -488,6 +497,8 @@ def _create_indexes(cur):
         # payments: JOIN по booking_id и фильтрация по статусу оплаты
         "CREATE INDEX IF NOT EXISTS idx_payments_booking_id ON payments (booking_id);",
         "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments (status);",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_id "
+        "ON payments (provider_payment_id) WHERE provider_payment_id IS NOT NULL;",
 
         # admin_logs: журнал всегда читается с ORDER BY created_at DESC
         "CREATE INDEX IF NOT EXISTS idx_admin_logs_created_at ON admin_logs (created_at DESC);",
@@ -497,6 +508,22 @@ def _create_indexes(cur):
     ]
     for statement in index_statements:
         cur.execute(statement)
+
+    # Один «ожидает» на бронь. Сначала убираем дубли (оставляем последний id).
+    cur.execute(
+        """
+        DELETE FROM payments a
+        USING payments b
+        WHERE a.booking_id = b.booking_id
+          AND a.status = 'ожидает'
+          AND b.status = 'ожидает'
+          AND a.id < b.id
+        """
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_one_pending "
+        "ON payments (booking_id) WHERE status = 'ожидает'"
+    )
 
 
 def _migrate_clubs_table(cur):
@@ -590,7 +617,8 @@ def update_user(
     cur.execute(
         """UPDATE users
            SET name = %s, phone = %s, level = %s,
-               age = %s, city = %s, has_inventory = %s, needs_rules = %s
+               age = %s, city = COALESCE(%s, city),
+               has_inventory = %s, needs_rules = %s
            WHERE telegram_id = %s RETURNING *""",
         (name, phone, level, age, city, has_inventory, needs_rules, telegram_id),
     )
@@ -689,16 +717,19 @@ def get_games_paginated(
     _ended_expr = f"{_GAME_END_EXPR} < {_LOCAL_NOW_EXPR}"
 
     if show_past:
-        # Только прошедшие: слот закончился ИЛИ пустая игра уже стартовала.
+        # Только прошедшие: слот закончился, пустая начавшаяся, или недобор.
         where_clause += f"""
           AND (
                 {_ended_expr}
                 OR ({_started_expr} AND {_empty_expr})
+                OR COALESCE(g.underfill_cancelled, FALSE) = TRUE
               )
         """
     else:
-        # Актуальные: слот ещё не закончился И не «пустая начавшаяся».
+        # Актуальные: не отменены по недобору, слот не закончился,
+        # не «пустая начавшаяся».
         where_clause += f"""
+          AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
           AND {_GAME_END_EXPR} >= {_LOCAL_NOW_EXPR}
           AND NOT ({_started_expr} AND {_empty_expr})
         """
@@ -1497,12 +1528,130 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
 
 
 def confirm_payment(payment_id: int):
+    """Атомарно подтверждает только платёж в статусе «ожидает».
+    Возвращает обновлённую строку или None (уже подтверждён / возврат / нет)."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE payments SET status = 'подтверждена' WHERE id = %s", (payment_id,))
+    cur.execute(
+        """UPDATE payments SET status = 'подтверждена',
+               player_notified_at = COALESCE(player_notified_at, NOW())
+           WHERE id = %s AND status = 'ожидает' RETURNING *""",
+        (payment_id,),
+    )
+    updated = cur.fetchone()
     conn.commit()
     cur.close()
     conn.close()
+    return updated
+
+
+def get_payment_by_id(payment_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def attach_provider_payment(
+    payment_id: int,
+    provider_payment_id: str,
+    confirmation_url: str,
+    method: str = "yookassa",
+):
+    """Сохраняет id и ссылку ЮKassa на локальном платеже."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """UPDATE payments
+           SET provider_payment_id = %s,
+               confirmation_url = %s,
+               method = COALESCE(method, %s)
+           WHERE id = %s AND status = 'ожидает'
+           RETURNING *""",
+        (provider_payment_id, confirmation_url, method, payment_id),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
+def get_payment_by_provider_id(provider_payment_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM payments WHERE provider_payment_id = %s",
+        (provider_payment_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def set_payment_method_sync(payment_id: int, method: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE payments SET method = %s WHERE id = %s",
+        (method, payment_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def confirm_payment_from_yookassa(
+    provider_payment_id: str,
+    local_payment_id: int = None,
+    expected_amount=None,
+    payment_method: str = None,
+):
+    """Идемпотентное подтверждение из webhook ЮKassa.
+
+    Возвращает {"status": "ok"|"already"|"not_found"|"mismatch"|"forbidden",
+                "payment": row|None}.
+    """
+    payment = get_payment_by_provider_id(provider_payment_id)
+    if payment is None and local_payment_id:
+        local = get_payment_by_id(local_payment_id)
+        if local and local.get("status") == "ожидает":
+            attach_provider_payment(
+                int(local["id"]),
+                provider_payment_id,
+                local.get("confirmation_url") or "",
+                method=payment_method or "yookassa",
+            )
+            payment = get_payment_by_provider_id(provider_payment_id)
+        elif local is None:
+            return {"status": "not_found", "payment": None}
+        else:
+            payment = local
+
+    if payment is None:
+        return {"status": "not_found", "payment": None}
+    if payment.get("status") == "подтверждена":
+        return {"status": "already", "payment": payment}
+    if payment.get("status") != "ожидает":
+        return {"status": "forbidden", "payment": payment}
+    if expected_amount is not None:
+        if abs(float(payment["amount"]) - float(expected_amount)) > 0.009:
+            return {"status": "mismatch", "payment": payment}
+
+    updated = confirm_payment(int(payment["id"]))
+    if not updated:
+        again = get_payment_by_id(int(payment["id"]))
+        if again and again.get("status") == "подтверждена":
+            return {"status": "already", "payment": again}
+        return {"status": "forbidden", "payment": payment}
+    if payment_method:
+        set_payment_method_sync(int(payment["id"]), payment_method)
+        updated = get_payment_by_id(int(payment["id"])) or updated
+    return {"status": "ok", "payment": updated}
 
 
 def confirm_refund(payment_id: int):

@@ -39,6 +39,7 @@ from flask_wtf import CSRFProtect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openpyxl import Workbook
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
 import cache
@@ -95,6 +96,10 @@ if not FLASK_SECRET_KEY:
     )
 app.secret_key = FLASK_SECRET_KEY
 
+# Render/прокси: реальный клиентский IP и HTTPS из X-Forwarded-*.
+# Нужно для корректного rate-limit (иначе все запросы = один IP прокси).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
 # Cookie сессии: недоступны из JS, не передаются на сторонние сайты.
 # SESSION_COOKIE_SECURE по умолчанию выключен, чтобы не сломать локальный
 # запуск по HTTP — в production (за HTTPS) обязательно включите
@@ -150,6 +155,12 @@ if not ADMIN_LOGIN or (not ADMIN_PASSWORD_HASH and not ADMIN_PASSWORD):
         "или временно ADMIN_PASSWORD для локальной разработки."
     )
 if ADMIN_PASSWORD and not ADMIN_PASSWORD_HASH:
+    if os.getenv("RENDER") or os.getenv("REQUIRE_PASSWORD_HASH", "").lower() in {"1", "true", "yes"}:
+        raise RuntimeError(
+            "В production нужен ADMIN_PASSWORD_HASH, а не открытый ADMIN_PASSWORD. "
+            "Сгенерируйте хеш: python -c \"from werkzeug.security import "
+            "generate_password_hash; print(generate_password_hash('пароль'))\""
+        )
     logger.warning(
         "ADMIN_PASSWORD задан в открытом виде. Перейдите на ADMIN_PASSWORD_HASH "
         "и удалите ADMIN_PASSWORD из .env."
@@ -603,7 +614,14 @@ def index():
 @app.route("/health")
 @limiter.exempt
 def health_check():
-    """Публичный health для Render/uptime-cron. Без БД и без блокировок."""
+    """Публичный health для Render/uptime-cron. Без деталей (recon)."""
+    return {"status": "ok"}, 200
+
+
+@app.route("/health/detail")
+@login_required
+def health_detail():
+    """Подробный health только для залогиненного админа CRM."""
     payload = {"status": "ok", "webhook_path": WEBHOOK_PATH}
     payload.update(get_bot_health())
     return payload, 200
@@ -996,10 +1014,24 @@ def game_delete(game_id):
         flash("Игра не найдена")
         return redirect(url_for("games_list"))
 
+    # CASCADE стёр бы заявки и оплаты — нельзя удалять игру с живыми записями
+    # или подтверждёнными платежами (история/возвраты пропадут).
+    active_taken = db.count_bookings_for_game(game_id)
+    if active_taken > 0:
+        flash(
+            "Нельзя удалить игру с активными записями. "
+            "Сначала отмените заявки в разделе «Заявки» или дождитесь автоотмены."
+        )
+        return redirect(url_for("games_list"))
+    confirmed_sum = db.get_confirmed_payments_sum_for_game(game_id) or 0
+    if float(confirmed_sum) > 0:
+        flash(
+            "Нельзя удалить игру с подтверждёнными оплатами. "
+            "Оформите возвраты в разделе «Оплаты»."
+        )
+        return redirect(url_for("games_list"))
+
     db.delete_game(game_id)
-    # Удаление игры каскадно удаляет её заявки и оплаты (ON DELETE CASCADE) —
-    # число занятых мест по другим играм не меняется, но кэш списка игр,
-    # который видит бот, всё равно нужно сбросить.
     cache.invalidate_games_cache()
     description = (
         f"Игра №{game_id} удалена: {game['location']}, "
@@ -1118,17 +1150,17 @@ def payment_confirm(payment_id):
         flash(f"Платёж уже в статусе «{context['status']}» — подтверждение не требуется")
         return redirect(url_for("payments_list"))
 
-    db.confirm_payment(payment_id)
-    if context:
-        description = (
-            f"Статус оплаты для брони №{context['booking_id']} изменён с «ожидает» "
-            f"на «подтверждена» (игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
-        )
-    else:
-        description = f"Статус оплаты №{payment_id} изменён с «ожидает» на «подтверждена»"
+    updated = db.confirm_payment(payment_id)
+    if not updated:
+        flash("Не удалось подтвердить оплату — статус уже изменился")
+        return redirect(url_for("payments_list"))
+    description = (
+        f"Статус оплаты для брони №{context['booking_id']} изменён с «ожидает» "
+        f"на «подтверждена» (игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
+    )
     log_admin_action("confirm", "payment", payment_id, description=description, old="ожидает", new="подтверждена")
 
-    if context and context.get("telegram_id"):
+    if context.get("telegram_id"):
         game_dt = f"{context['game_date'].strftime('%d.%m.%Y')} в {str(context['game_time'])[:5]}"
         loc = html.escape(str(context.get("location") or ""), quote=False)
         text = (
@@ -1387,8 +1419,115 @@ def report_excel():
 
 
 # ---------------------------------------------------------------------------
-# Webhook для Telegram-бота
+# ЮKassa: return URL + webhook оплаты
 # ---------------------------------------------------------------------------
+
+@app.route("/payments/return")
+def payment_return():
+    """Страница после оплаты в ЮKassa — игрок возвращается сюда из банка."""
+    return (
+        "<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Оплата</title></head><body style='font-family:system-ui;"
+        "max-width:28rem;margin:3rem auto;padding:0 1rem;line-height:1.5'>"
+        "<h1 style='font-size:1.25rem'>Спасибо!</h1>"
+        "<p>Если оплата прошла успешно, статус в Telegram-боте обновится "
+        "автоматически в течение минуты.</p>"
+        "<p>Можешь вернуться в бот.</p>"
+        "</body></html>"
+    ), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/payments/yookassa", methods=["POST"])
+@csrf.exempt
+@limiter.limit(os.getenv("YOOKASSA_WEBHOOK_RATE_LIMIT", "60 per minute"))
+def yookassa_webhook():
+    """Webhook ЮKassa: payment.succeeded → подтверждаем платёж и пишем игроку.
+
+    В кабинете ЮKassa укажи URL: https://<домен>/payments/yookassa
+    События: payment.succeeded (обязательно).
+    """
+    import payment_provider
+
+    if not payment_provider.is_yookassa_configured():
+        return {"status": "disabled"}, 503
+
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return {"status": "bad_json"}, 400
+
+    parsed = payment_provider.parse_webhook_notification(payload)
+    event = parsed.get("event") or ""
+    provider_id = parsed.get("provider_payment_id")
+    logger.info(
+        "YooKassa webhook event=%s provider_id=%s payment_id=%s",
+        event, provider_id, parsed.get("payment_id"),
+    )
+
+    if event != "payment.succeeded":
+        return {"status": "ignored", "event": event}, 200
+
+    if not provider_id:
+        return {"status": "missing_provider_id"}, 400
+
+    result = db.confirm_payment_from_yookassa(
+        provider_payment_id=provider_id,
+        local_payment_id=parsed.get("payment_id"),
+        expected_amount=parsed.get("amount"),
+        payment_method=parsed.get("payment_method"),
+    )
+    status = result.get("status")
+    payment = result.get("payment")
+
+    if status == "ok" and payment:
+        description = (
+            f"Оплата #{payment['id']} подтверждена автоматически (ЮKassa "
+            f"{provider_id}, метод: {parsed.get('payment_method') or '—'})"
+        )
+        try:
+            log_admin_action(
+                "confirm", "payment", int(payment["id"]),
+                description=description, old="ожидает", new="подтверждена",
+            )
+        except Exception as e:
+            logger.warning("Не удалось записать лог автоподтверждения: %s", e)
+        _notify_player_payment_confirmed(int(payment["id"]))
+        return {"status": "ok"}, 200
+
+    if status == "already":
+        return {"status": "already"}, 200
+
+    if status == "mismatch":
+        logger.error(
+            "YooKassa amount mismatch provider_id=%s payment=%s",
+            provider_id, payment,
+        )
+        return {"status": "mismatch"}, 200
+
+    if status == "not_found":
+        logger.warning("YooKassa webhook: платёж не найден provider_id=%s", provider_id)
+        return {"status": "not_found"}, 200
+
+    return {"status": status or "unchanged"}, 200
+
+
+def _notify_player_payment_confirmed(payment_id: int) -> None:
+    context = db.get_payment_notification_context(payment_id)
+    if not context or not context.get("telegram_id"):
+        return
+    game_dt = f"{context['game_date'].strftime('%d.%m.%Y')} в {str(context['game_time'])[:5]}"
+    loc = html.escape(str(context.get("location") or ""), quote=False)
+    text = (
+        "✅ <b>Оплата прошла успешно!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Сумма: {float(context['amount']):.0f} ₽\n"
+        f"📅 {html.escape(game_dt, quote=False)}\n"
+        f"📍 {loc}\n\n"
+        "Ждём тебя на корте! 🎾"
+    )
+    send_telegram_message(context["telegram_id"], text)
+
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 @csrf.exempt  # Telegram отправляет JSON без CSRF-токена — это не браузерная форма
@@ -1396,14 +1535,13 @@ def report_excel():
 def webhook():
     """Принимает обновления от Telegram через webhook.
 
-    Secret-token опционален (WEBHOOK_ENFORCE_SECRET=1): на Render из-за
-    рассинхрона FLASK_SECRET_KEY / WEBHOOK_SECRET_TOKEN Telegram слал
-    апдейты, а мы отвечали 403 — бот «молчал», хотя webhook был
-    зарегистрирован. По умолчанию принимаем HTTPS POST на секретный путь.
+    По умолчанию WEBHOOK_ENFORCE_SECRET=1: без верного
+    X-Telegram-Bot-Api-Secret-Token отвечаем 403 (иначе любой может
+    подделать апдейты от имени игроков).
 
     Обработка в event loop бота через run_coroutine_threadsafe; Telegram
     достаточно ответа 200 OK сразу."""
-    enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "0").lower() in {"1", "true", "yes"}
+    enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "1").lower() in {"1", "true", "yes"}
     if enforce_secret:
         header_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or ""
         expected = WEBHOOK_SECRET_TOKEN or ""
@@ -1483,19 +1621,26 @@ def run_bot():
 
         if WEBHOOK_URL:
             webhook_endpoint = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-            enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "0").lower() in {"1", "true", "yes"}
+            # В проде секрет обязателен: иначе /webhook принимает чужие POST.
+            enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "1").lower() in {"1", "true", "yes"}
             set_kwargs = {
                 "url": webhook_endpoint,
                 "drop_pending_updates": False,
                 "allowed_updates": ["message", "callback_query", "pre_checkout_query"],
             }
-            if enforce_secret and WEBHOOK_SECRET_TOKEN:
+            if WEBHOOK_SECRET_TOKEN:
                 set_kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN
+            elif enforce_secret:
+                logger.error(
+                    "WEBHOOK_ENFORCE_SECRET=1, но WEBHOOK_SECRET_TOKEN/FLASK_SECRET_KEY пуст — "
+                    "секрет вебхука не будет проверен"
+                )
             await bot_instance.set_webhook(**set_kwargs)
             logger.warning(
-                "Telegram webhook зарегистрирован: %s (secret=%s)",
+                "Telegram webhook зарегистрирован: %s (secret=%s enforce=%s)",
                 webhook_endpoint,
                 "on" if set_kwargs.get("secret_token") else "off",
+                enforce_secret,
             )
         else:
             logger.warning("WEBHOOK_URL пуст — long polling")

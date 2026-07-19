@@ -131,18 +131,13 @@
             function fillFromClub() {
                 const opt = clubSelect.options[clubSelect.selectedIndex];
                 if (!opt || !opt.value) return;
-                const city = opt.getAttribute('data-city') || '';
-                const addr = opt.getAttribute('data-address') || '';
-                if (city) cityInput.value = city;
-                if (addr) addressInput.value = addr;
+                // Всегда подставляем данные клуба при смене — иначе остаётся
+                // город/адрес предыдущего клуба.
+                cityInput.value = opt.getAttribute('data-city') || '';
+                addressInput.value = opt.getAttribute('data-address') || '';
             }
 
             clubSelect.addEventListener('change', fillFromClub);
-            // Если клуб уже выбран при открытии формы редактирования,
-            // а город/адрес пустые — дозаполним.
-            if (clubSelect.value && (!cityInput.value.trim() || !addressInput.value.trim())) {
-                fillFromClub();
-            }
         })();
 
         // "Занято вручную" — это ДОПОЛНИТЕЛЬНЫЕ места сверх уже забронированных

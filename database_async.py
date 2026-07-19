@@ -165,7 +165,8 @@ async def update_user(
     row = await pool.fetchrow(
         """UPDATE users
            SET name = $1, phone = $2, level = $3,
-               age = $4, city = $5, has_inventory = $6, needs_rules = $7
+               age = $4, city = COALESCE($5, city),
+               has_inventory = $6, needs_rules = $7
            WHERE telegram_id = $8 RETURNING *""",
         name, phone, level, age, city, has_inventory, needs_rules, telegram_id,
     )
@@ -256,16 +257,15 @@ async def count_bookings_for_game(game_id: int) -> int:
 
 
 async def get_games_needing_reminder_24h() -> list:
-    """Игры, для которых пора отправить напоминание за 24 часа (окно
-    23-25ч, чтобы точно поймать нужный момент при ежечасной/более частой
-    проверке планировщиком) и оно ещё не было отправлено."""
+    """Напоминание ~за сутки: идеальное окно 23–25ч, нижняя граница
+    расширена до 2ч15м (catch-up), пока не сработает 2ч-напоминание."""
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
         SELECT * FROM games
         WHERE reminder_sent = FALSE
           AND COALESCE(underfill_cancelled, FALSE) = FALSE
-          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '23 hours'
+          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '2 hours 15 minutes'
                                             AND {_LOCAL_NOW_EXPR} + INTERVAL '25 hours'
         """
     )
@@ -273,16 +273,14 @@ async def get_games_needing_reminder_24h() -> list:
 
 
 async def get_games_needing_reminder_2h() -> list:
-    """Аналогично get_games_needing_reminder_24h, но для напоминания за 2
-    часа. Окно уже (1ч45м-2ч15м), поэтому планировщик должен проверять чаще
-    (см. main() в bot.py/app.py — интервал 15 минут)."""
+    """Напоминание ~за 2 часа: верх 2ч15м, низ 0 (catch-up до старта)."""
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
         SELECT * FROM games
         WHERE reminder_2h_sent = FALSE
           AND COALESCE(underfill_cancelled, FALSE) = FALSE
-          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '1 hour 45 minutes'
+          AND (game_date + game_time) BETWEEN {_LOCAL_NOW_EXPR}
                                             AND {_LOCAL_NOW_EXPR} + INTERVAL '2 hours 15 minutes'
         """
     )
@@ -321,18 +319,19 @@ async def _games_underfill_in_window(start_interval: str, end_interval: str, ext
 
 
 async def get_games_needing_underfill_warn_3h() -> list:
-    """За ~3 часа до старта: состав неполный — предупредить записавшихся."""
+    """За ~3 часа: недобор. Catch-up до окна автоотмены (~1ч15м)."""
     return await _games_underfill_in_window(
-        "2 hours 45 minutes",
+        "1 hour 15 minutes",
         "3 hours 15 minutes",
         "COALESCE(g.underfill_warn_3h_sent, FALSE) = FALSE",
     )
 
 
 async def get_games_needing_underfill_cancel_1h() -> list:
-    """За ~1 час до старта: состав всё ещё неполный — автоотмена + возврат."""
+    """Автоотмена недобора за ~час до старта.
+    Нижняя граница −90 мин — catch-up, если job проснулся уже после старта."""
     return await _games_underfill_in_window(
-        "45 minutes",
+        "-90 minutes",
         "1 hour 15 minutes",
         "TRUE",
     )
@@ -385,7 +384,7 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
     данные для текста сообщения/уведомления админу, то есть на каждую
     заявку тратился лишний round-trip к БД.
     """
-    slots_count = max(1, min(MAX_SLOTS_PER_BOOKING, int(slots_count)))
+    requested_slots = max(1, int(slots_count))
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -431,25 +430,44 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
             # максимум, иначе бот пустил бы запись сверх реального лимита.
             effective_taken = int(taken) + int(game_dict.get("booked_places") or 0)
             free_slots = int(game["total_slots"]) - effective_taken
-            if free_slots <= 0 or effective_taken + slots_count > game["total_slots"]:
+            if free_slots <= 0:
                 return {"status": "full", "booking": None, "game": game_dict, "free_slots": 0}
 
-            # Меньше часа до старта — только полный выкуп оставшихся мест.
-            if timing["within_last_hour"] and slots_count != free_slots:
-                return {
-                    "status": "must_fill_all",
-                    "booking": None,
-                    "game": game_dict,
-                    "free_slots": free_slots,
-                    "total_slots": int(game["total_slots"]),
-                }
+            # Меньше часа до старта — только полный выкуп оставшихся мест
+            # (даже если их > MAX_SLOTS_PER_BOOKING).
+            if timing["within_last_hour"]:
+                if requested_slots != free_slots:
+                    return {
+                        "status": "must_fill_all",
+                        "booking": None,
+                        "game": game_dict,
+                        "free_slots": free_slots,
+                        "total_slots": int(game["total_slots"]),
+                    }
+                slots_count = free_slots
+            else:
+                slots_count = min(MAX_SLOTS_PER_BOOKING, requested_slots)
+                if slots_count > free_slots:
+                    return {
+                        "status": "full",
+                        "booking": None,
+                        "game": game_dict,
+                        "free_slots": free_slots,
+                    }
 
             booking = await conn.fetchrow(
                 """INSERT INTO bookings (user_id, game_id, status, slots_count)
                    VALUES ($1, $2, 'новая', $3) RETURNING *""",
                 user_id, game_id, slots_count,
             )
-            return {"status": "ok", "booking": _to_dict(booking), "game": game_dict}
+            new_taken = effective_taken + slots_count
+            return {
+                "status": "ok",
+                "booking": _to_dict(booking),
+                "game": game_dict,
+                "taken": new_taken,
+                "total_slots": int(game["total_slots"]),
+            }
 
 
 async def get_game_slot_offer(game_id: int) -> Optional[dict]:
@@ -670,12 +688,17 @@ async def get_booking_cancel_info(booking_id: int, user_id: int) -> dict:
     game = await pool.fetchrow(
         f"""
         SELECT *,
-               ((game_date + game_time) - {_LOCAL_NOW_EXPR}) > INTERVAL '12 hours' AS refund_window
+               ((game_date + game_time) - {_LOCAL_NOW_EXPR}) > INTERVAL '12 hours' AS refund_window,
+               (game_date + game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming
         FROM games
         WHERE id = $1
         """,
         booking["game_id"],
     )
+    if game is None:
+        return {"status": "not_found"}
+    if not game["still_upcoming"] or game.get("underfill_cancelled"):
+        return {"status": "too_late", "game": _to_dict(game)}
     payment = await pool.fetchrow(
         """
         SELECT * FROM payments
@@ -694,7 +717,7 @@ async def get_booking_cancel_info(booking_id: int, user_id: int) -> dict:
     had_confirmed = bool(payment_dict and payment_dict.get("status") == "подтверждена")
     return {
         "status": "ok",
-        "refund_window": bool(game and game["refund_window"]),
+        "refund_window": bool(game["refund_window"]),
         "payment_pending_confirm": pending_confirm,
         "had_confirmed_payment": had_confirmed,
         "game": _to_dict(game),
@@ -750,12 +773,17 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
             game = await conn.fetchrow(
                 f"""
                 SELECT *,
-                       ((game_date + game_time) - {_LOCAL_NOW_EXPR}) > INTERVAL '12 hours' AS refund_window
+                       ((game_date + game_time) - {_LOCAL_NOW_EXPR}) > INTERVAL '12 hours' AS refund_window,
+                       (game_date + game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming
                 FROM games WHERE id = $1
                 """,
                 booking["game_id"],
             )
-            refund_window = bool(game and game["refund_window"])
+            if game is None:
+                return {"status": "not_found"}
+            if not game["still_upcoming"] or game.get("underfill_cancelled"):
+                return {"status": "too_late", "game": _to_dict(game)}
+            refund_window = bool(game["refund_window"])
 
             latest_payment = await conn.fetchrow(
                 """SELECT * FROM payments
@@ -882,10 +910,38 @@ async def create_payment(booking_id: int, amount: float, method: Optional[str] =
     return _to_dict(row)
 
 
+async def attach_provider_payment(
+    payment_id: int,
+    provider_payment_id: str,
+    confirmation_url: str,
+    method: str = "yookassa",
+) -> Optional[dict]:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """UPDATE payments
+           SET provider_payment_id = $1,
+               confirmation_url = $2,
+               method = COALESCE(method, $3)
+           WHERE id = $4 AND status = 'ожидает'
+           RETURNING *""",
+        provider_payment_id, confirmation_url, method, payment_id,
+    )
+    return _to_dict(row) if row else None
+
+
 async def get_payment_by_id(payment_id: int) -> Optional[dict]:
     pool = await get_pool()
     row = await pool.fetchrow("SELECT * FROM payments WHERE id = $1", payment_id)
     return _to_dict(row)
+
+
+async def get_payment_by_provider_id(provider_payment_id: str) -> Optional[dict]:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM payments WHERE provider_payment_id = $1",
+        provider_payment_id,
+    )
+    return _to_dict(row) if row else None
 
 
 async def set_payment_method(payment_id: int, method: str) -> None:
@@ -920,34 +976,81 @@ async def set_payment_method_owned(payment_id: int, user_id: int, method: str) -
     return payment
 
 
-async def mark_payment_notified(payment_id: int) -> None:
-    """Игрок нажал «✅ Я оплатил» (см. process_paid_notify в bot.py) —
-    отмечаем момент отдельным полем player_notified_at. Именно это поле, а
-    не сам факт создания платежа (он создаётся автоматически сразу при
-    записи на игру, ещё до реальной оплаты), включает бейдж «+N» рядом с
-    «Оплаты» в шапке CRM — см. count_new_since в database.py."""
+async def mark_payment_notified(payment_id: int) -> Optional[dict]:
+    """Игрок нажал «✅ Я оплатил» — атомарно и идемпотентно: только статус
+    «ожидает» и только если ещё не уведомлял. Возвращает обновлённую
+    строку или None (уже уведомлён / другой статус)."""
     pool = await get_pool()
-    await pool.execute(
-        "UPDATE payments SET player_notified_at = NOW() WHERE id = $1", payment_id
+    row = await pool.fetchrow(
+        """UPDATE payments SET player_notified_at = NOW()
+           WHERE id = $1 AND status = 'ожидает' AND player_notified_at IS NULL
+           RETURNING *""",
+        payment_id,
     )
+    return _to_dict(row) if row else None
 
 
 async def mark_payment_notified_owned(payment_id: int, user_id: int) -> Optional[dict]:
-    """«Я оплатил» только для своего платежа."""
+    """«Я оплатил» только для своего платежа.
+    Если уже уведомлял — вернёт payment с флагом _already_notified (без спама админу)."""
     payment = await get_payment_for_user(payment_id, user_id)
     if not payment:
         return None
-    await mark_payment_notified(payment_id)
-    return payment
+    if payment.get("status") != "ожидает":
+        return None
+    if payment.get("player_notified_at") is not None:
+        payment["_already_notified"] = True
+        return payment
+    updated = await mark_payment_notified(payment_id)
+    if not updated:
+        payment["_already_notified"] = True
+        return payment
+    return updated
 
 
-async def confirm_payment(payment_id: int) -> None:
-    """Используется автоматическим подтверждением оплаты картой через
-    реальный Telegram Payments provider (см. process_successful_payment в
-    bot.py) — если провайдер не подключён, подтверждение делает
-    администратор вручную в CRM (db.confirm_payment в database.py)."""
+async def confirm_payment(payment_id: int) -> Optional[dict]:
+    """Атомарно подтверждает только «ожидает». None — статус уже другой."""
     pool = await get_pool()
-    await pool.execute("UPDATE payments SET status = 'подтверждена' WHERE id = $1", payment_id)
+    row = await pool.fetchrow(
+        """UPDATE payments SET status = 'подтверждена',
+               player_notified_at = COALESCE(player_notified_at, NOW())
+           WHERE id = $1 AND status = 'ожидает' RETURNING *""",
+        payment_id,
+    )
+    return _to_dict(row) if row else None
+
+
+async def confirm_payment_by_provider_id(
+    provider_payment_id: str,
+    expected_amount: Optional[float] = None,
+) -> dict:
+    """Подтверждение из webhook ЮKassa. Идемпотентно.
+
+    Возвращает {"status": "ok"|"already"|"not_found"|"mismatch"|"forbidden", "payment": ...}
+    """
+    pool = await get_pool()
+    payment = await pool.fetchrow(
+        "SELECT * FROM payments WHERE provider_payment_id = $1",
+        provider_payment_id,
+    )
+    if payment is None:
+        return {"status": "not_found"}
+    payment_dict = _to_dict(payment)
+    if payment_dict.get("status") == "подтверждена":
+        return {"status": "already", "payment": payment_dict}
+    if payment_dict.get("status") != "ожидает":
+        return {"status": "forbidden", "payment": payment_dict}
+    if expected_amount is not None:
+        if abs(float(payment_dict["amount"]) - float(expected_amount)) > 0.009:
+            return {"status": "mismatch", "payment": payment_dict}
+    updated = await confirm_payment(int(payment_dict["id"]))
+    if not updated:
+        # гонка с CRM
+        again = await get_payment_by_id(int(payment_dict["id"]))
+        if again and again.get("status") == "подтверждена":
+            return {"status": "already", "payment": again}
+        return {"status": "forbidden", "payment": payment_dict}
+    return {"status": "ok", "payment": updated}
 
 
 async def confirm_payment_owned(payment_id: int, user_id: int, amount_kopecks: int) -> dict:
@@ -964,9 +1067,10 @@ async def confirm_payment_owned(payment_id: int, user_id: int, amount_kopecks: i
         return {"status": "mismatch", "payment": payment}
     if payment.get("status") != "ожидает":
         return {"status": "forbidden", "payment": payment}
-    await confirm_payment(payment_id)
-    payment["status"] = "подтверждена"
-    return {"status": "ok", "payment": payment}
+    updated = await confirm_payment(payment_id)
+    if not updated:
+        return {"status": "forbidden", "payment": payment}
+    return {"status": "ok", "payment": updated}
 
 
 # ---------------------------------------------------------------------------
@@ -978,19 +1082,24 @@ async def get_user_statistics(user_id: int) -> dict:
     теперь один запрос с условными агрегатами (FILTER)."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        """
+        f"""
         SELECT
             COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE status = 'отменена') AS cancelled,
-            COUNT(*) FILTER (WHERE status = 'посещена') AS attended,
+            COUNT(*) FILTER (WHERE b.status = 'отменена') AS cancelled,
+            COUNT(*) FILTER (
+                WHERE b.status != 'отменена'
+                  AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+                  AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+            ) AS attended,
             (
-                SELECT COUNT(DISTINCT b.id)
-                FROM bookings b
-                JOIN payments p ON p.booking_id = b.id
-                WHERE b.user_id = $1 AND p.status = 'подтверждена'
+                SELECT COUNT(DISTINCT b2.id)
+                FROM bookings b2
+                JOIN payments p ON p.booking_id = b2.id
+                WHERE b2.user_id = $1 AND p.status = 'подтверждена'
             ) AS paid
-        FROM bookings
-        WHERE user_id = $1
+        FROM bookings b
+        LEFT JOIN games g ON g.id = b.game_id
+        WHERE b.user_id = $1
         """,
         user_id,
     )

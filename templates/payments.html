@@ -36,10 +36,14 @@
             </td>
             <td>{{ p.amount }} ₽</td>
             <td>
-                {% if p.method == 'card' %}
+                {% if p.method in ('card', 'bank_card') %}
                     💳 Карта
                 {% elif p.method == 'sbp' %}
                     📱 СБП
+                {% elif p.method == 'yookassa' %}
+                    ЮKassa
+                {% elif p.method %}
+                    {{ p.method }}
                 {% else %}
                     <span style="color: #6b7280;">—</span>
                 {% endif %}
