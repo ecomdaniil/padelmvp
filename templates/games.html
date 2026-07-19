@@ -31,6 +31,19 @@
                     {% endfor %}
                 </select>
             </div>
+            {% if is_training %}
+            <div class="filter-field">
+                <label class="filter-label">Тренер</label>
+                <select name="coach_id">
+                    <option value="" {% if not selected_coach_id %}selected{% endif %}>Все тренеры</option>
+                    {% for co in coaches %}
+                    <option value="{{ co.id }}" {% if selected_coach_id == co.id|string %}selected{% endif %}>
+                        {% if co.emoji %}{{ co.emoji }} {% endif %}{{ co.name }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% endif %}
             <div class="filter-field">
                 <label class="filter-label">Дата с</label>
                 <input type="date" name="date_from" value="{{ date_from }}">
@@ -56,10 +69,14 @@
                 </select>
             </div>
             <div class="filter-field">
-                <label class="filter-label">Сортировка по дате</label>
+                <label class="filter-label">Сортировка</label>
                 <select name="sort">
-                    <option value="asc" {% if sort_order != 'desc' %}selected{% endif %}>Сначала ближайшие</option>
+                    <option value="asc" {% if sort_order == 'asc' %}selected{% endif %}>Сначала ближайшие</option>
                     <option value="desc" {% if sort_order == 'desc' %}selected{% endif %}>Сначала дальние</option>
+                    {% if is_training %}
+                    <option value="coach_asc" {% if sort_order == 'coach_asc' %}selected{% endif %}>По тренеру (А→Я)</option>
+                    <option value="coach_desc" {% if sort_order == 'coach_desc' %}selected{% endif %}>По тренеру (Я→А)</option>
+                    {% endif %}
                 </select>
             </div>
             <div class="filter-field">

@@ -979,21 +979,29 @@ def _render_events_list(event_type: str):
     time_from_raw = request.args.get("time_from", "")
     time_to_raw = request.args.get("time_to", "")
     sort_order = request.args.get("sort", "asc")
-    if sort_order not in ("asc", "desc"):
+    allowed_sort = ("asc", "desc", "coach_asc", "coach_desc")
+    if sort_order not in allowed_sort:
+        sort_order = "asc"
+    if event_type != "training" and sort_order in ("coach_asc", "coach_desc"):
         sort_order = "asc"
     fullness = request.args.get("fullness", "")
     if fullness not in ("full", "available"):
         fullness = ""
     show_past = request.args.get("show_past") == "1"
+    coach_id = None
+    coach_raw = (request.args.get("coach_id") or "").strip()
+    if event_type == "training" and coach_raw.isdigit():
+        coach_id = int(coach_raw)
 
     result = db.get_games_paginated(
         page=page, per_page=DEFAULT_PAGE_SIZE, level=level, city=city,
         date_from=_safe_date(date_from_raw), date_to=_safe_date(date_to_raw),
         time_from=_safe_time(time_from_raw), time_to=_safe_time(time_to_raw),
         sort_order=sort_order, fullness=fullness, show_past=show_past,
-        event_type=event_type,
+        event_type=event_type, coach_id=coach_id,
     )
     cities = db.get_distinct_game_cities()
+    coaches = db.get_all_coaches(active_only=False) if event_type == "training" else []
     return render_template(
         "games.html", games=result["items"], pagination=result,
         levels=GAME_LEVELS, selected_level=level,
@@ -1002,6 +1010,7 @@ def _render_events_list(event_type: str):
         time_from=time_from_raw, time_to=time_to_raw,
         sort_order=sort_order, fullness=fullness, show_past=show_past,
         event_type=event_type,
+        coaches=coaches, selected_coach_id=str(coach_id) if coach_id else "",
     )
 
 

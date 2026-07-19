@@ -827,24 +827,12 @@ def get_games_paginated(
     page: int = 1, per_page: int = 20, level: str = "",
     date_from=None, date_to=None, time_from=None, time_to=None, city: str = "",
     sort_order: str = "asc", fullness: str = "", show_past: bool = False,
-    event_type: str = "game",
+    event_type: str = "game", coach_id=None,
 ):
-    """Список игр с пагинацией + количество занятых мест/собранных оплат
-    одним запросом (без N+1), с опциональными фильтрами по уровню, дате
-    (диапазон date_from..date_to), времени суток (диапазон time_from..time_to,
-    например «найти вечерние слоты 18:00-20:00 в любой день»), городу и
-    заполненности (fullness: "full" — только полностью занятые по реальным
-    бронированиям, "available" — только со свободными местами, "" — все).
+    """Список игр/тренировок с пагинацией и фильтрами.
 
-    show_past — режим списка:
-      False (по умолчанию): только актуальные — ещё не начавшиеся, либо
-      уже идущие, но с игроками. Пустые игры с наступившим стартом и
-      полностью закончившиеся сюда НЕ попадают.
-      True: только прошедшие — закончившиеся ИЛИ пустые с наступившим
-      стартом (отдельный «раздел», без смешивания с будущими).
-
-    sort_order — "asc" (по умолчанию: ближайшие даты сверху) или "desc"
-    (сначала самые дальние/прошедшие). Возвращает dict с items/total/total_pages."""
+    sort_order: asc/desc по дате; coach_asc/coach_desc — по имени тренера
+    (для тренировок). coach_id — фильтр по тренеру."""
     page = max(1, page)
     offset = (page - 1) * per_page
 
@@ -871,6 +859,9 @@ def get_games_paginated(
     if city:
         where_clause += " AND g.city = %s"
         params.append(city)
+    if coach_id:
+        where_clause += " AND g.coach_id = %s"
+        params.append(int(coach_id))
 
     # Пустая = нет броней через бота и нет ручных мест.
     _empty_expr = "(COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) = 0"
@@ -895,14 +886,15 @@ def get_games_paginated(
           AND NOT ({_started_expr} AND {_empty_expr})
         """
 
-    # Занятость = СУММА реальных бронирований и ручного booked_places (та же
-    # логика, что прячет заполненные игры в боте — см.
-    # get_upcoming_games_with_slots в database_async.py). booked_places —
-    # это места, занятые мимо бота (например, по телефону), ДОПОЛНИТЕЛЬНО к
-    # реальным бронированиям, а не альтернативная величина. Если у игры 1
-    # реальная бронь и total_slots=2, а админ вручную поставил
-    # booked_places=1 — игра полностью занята (1+1=2), а не наполовину.
-    order_dir = "DESC" if sort_order == "desc" else "ASC"
+    # Занятость = реальные бронирования + booked_places (мимо бота).
+    if sort_order == "coach_asc":
+        order_sql = "co.name ASC NULLS LAST, g.game_date ASC, g.game_time ASC"
+    elif sort_order == "coach_desc":
+        order_sql = "co.name DESC NULLS LAST, g.game_date DESC, g.game_time DESC"
+    elif sort_order == "desc":
+        order_sql = "g.game_date DESC, g.game_time DESC"
+    else:
+        order_sql = "g.game_date ASC, g.game_time ASC"
 
     if fullness == "full":
         fullness_clause = " AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) >= g.total_slots"
@@ -914,14 +906,13 @@ def get_games_paginated(
     conn = get_connection()
     cur = conn.cursor()
 
-    # total_count = COUNT(*) OVER() считается в том же запросе, что и сами
-    # строки страницы — 1 round-trip к БД вместо 2 (COUNT(*) отдельно +
-    # SELECT страницы). См. _paginated_from_window.
+    # total_count = COUNT(*) OVER() в том же запросе — см. _paginated_from_window.
     cur.execute(
         f"""
         SELECT g.*,
                c.name AS club_name,
                co.name AS coach_name,
+               co.emoji AS coach_emoji,
                COALESCE(bk.taken, 0) AS taken,
                COALESCE(pm.collected, 0) AS collected,
                (
@@ -934,9 +925,6 @@ def get_games_paginated(
         LEFT JOIN clubs c ON c.id = g.club_id
         LEFT JOIN coaches co ON co.id = g.coach_id
         LEFT JOIN (
-            -- SUM(slots_count), а не COUNT(*): одна заявка теперь может
-            -- занимать сразу несколько мест (фича «Сколько мест? (1-4)»
-            -- в боте), поэтому число заявок больше не равно числу мест.
             SELECT game_id, SUM(slots_count) AS taken
             FROM bookings
             WHERE status != 'отменена'
@@ -950,7 +938,7 @@ def get_games_paginated(
             GROUP BY b.game_id
         ) pm ON pm.game_id = g.id
         {where_clause}{fullness_clause}
-        ORDER BY g.game_date {order_dir}, g.game_time {order_dir}
+        ORDER BY {order_sql}
         LIMIT %s OFFSET %s
         """,
         params + [per_page, offset],
@@ -2552,23 +2540,22 @@ _PAYMENT_BADGE_WHERE = """
 """
 
 
-def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_id: int) -> dict:
-    """Сколько новых заявок/оплат/отзывов появилось после last_* — основа
-    бейджей-счётчиков "+N" рядом с «Заявки»/«Оплаты»/«Отзывы» в шапке CRM.
-    last_booking_id/last_review_id — это id, максимальные на момент, когда
-    админ последний раз ОТКРЫВАЛ соответствующий раздел (хранится в сессии,
-    см. app.py) — бейдж показывает то, что появилось НОВОГО с того момента,
-    и пропадает, как только раздел открыт снова.
+# Заявки в бейдже — только «новая»: после подтверждения оплаты заявка
+# становится «подтверждена», и +N у «Заявки» гаснет без захода в раздел.
+_BOOKING_BADGE_WHERE = "id > %s AND status = 'новая'"
 
-    last_payment_notified_at — watermark по admin_attention_at (ISO или None):
-    бейдж у «Оплаты» загорается, когда игрок сообщил об оплате или когда
-    подтверждённый платёж перешёл в «возврат» (отмена записи)."""
+
+def count_new_since(last_booking_id: int, last_payment_notified_at, last_review_id: int) -> dict:
+    """Сколько новых заявок/оплат/отзывов после last_* — бейджи "+N" в шапке.
+
+    new_bookings считает только статус «новая» (не все id > watermark):
+    подтверждение оплаты автоматически снимает бейдж у «Заявки»."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         f"""
         SELECT
-            (SELECT COUNT(*) FROM bookings WHERE id > %s) AS new_bookings,
+            (SELECT COUNT(*) FROM bookings WHERE {_BOOKING_BADGE_WHERE}) AS new_bookings,
             (SELECT COUNT(*) FROM payments
                 WHERE {_PAYMENT_BADGE_WHERE}) AS new_payments,
             (SELECT COUNT(*) FROM reviews WHERE id > %s) AS new_reviews
@@ -2656,7 +2643,7 @@ def get_activity_snapshot(last_booking_id: int, last_payment_notified_at, last_r
             (SELECT COUNT(*) FROM bookings) AS bookings_count,
             (SELECT COUNT(*) FROM payments) AS payments_count,
             (SELECT COUNT(*) FROM reviews) AS reviews_count,
-            (SELECT COUNT(*) FROM bookings WHERE id > %s) AS new_bookings,
+            (SELECT COUNT(*) FROM bookings WHERE {_BOOKING_BADGE_WHERE}) AS new_bookings,
             (SELECT COUNT(*) FROM payments
                 WHERE {_PAYMENT_BADGE_WHERE}) AS new_payments,
             (SELECT COUNT(*) FROM reviews WHERE id > %s) AS new_reviews
