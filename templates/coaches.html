@@ -4,7 +4,7 @@
     <div class="top-actions">
         <a class="btn" href="{{ url_for('coach_new') }}">+ Добавить тренера</a>
     </div>
-    <table>
+    <table class="coaches-table">
         <tr>
             <th>Имя</th>
             <th>Телефон</th>
@@ -12,7 +12,7 @@
             <th>Стаж</th>
             <th>Специализация</th>
             <th>Статус</th>
-            <th></th>
+            <th class="coaches-actions-col"></th>
         </tr>
         {% for c in coaches %}
         <tr>
@@ -22,14 +22,16 @@
             <td>{{ c.experience or '—' }}</td>
             <td>{{ (c.specialization or '—')[:80] }}{% if c.specialization and c.specialization|length > 80 %}…{% endif %}</td>
             <td>{% if c.is_active %}<span class="badge badge-ok">активен</span>{% else %}<span class="badge badge-new">скрыт</span>{% endif %}</td>
-            <td style="white-space:nowrap; display:flex; gap:8px; flex-wrap:wrap;">
-                <a class="btn btn-secondary" href="{{ url_for('coach_edit', coach_id=c.id) }}">Изменить</a>
-                <form method="post" action="{{ url_for('coach_delete', coach_id=c.id) }}" style="margin:0;"
-                      data-confirm-title="Точно удалить?"
-                      data-confirm="Удалить тренера «{{ c.name }}»? У тренировок с ним тренер будет сброшен.">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" class="btn btn-danger">Удалить</button>
-                </form>
+            <td class="coaches-actions-col">
+                <div class="coach-actions">
+                    <a class="coach-action coach-action-edit" href="{{ url_for('coach_edit', coach_id=c.id) }}">Изменить</a>
+                    <form method="post" action="{{ url_for('coach_delete', coach_id=c.id) }}"
+                          data-confirm-title="Точно удалить?"
+                          data-confirm="Удалить тренера «{{ c.name }}»? У тренировок с ним тренер будет сброшен.">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="coach-action coach-action-delete">Удалить</button>
+                    </form>
+                </div>
             </td>
         </tr>
         {% else %}
@@ -37,4 +39,55 @@
         {% endfor %}
     </table>
     {% include "_pagination.html" %}
+
+    <style>
+        .coaches-actions-col {
+            width: 1%;
+            white-space: nowrap;
+            text-align: right;
+            vertical-align: middle;
+        }
+        .coach-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .coach-actions form { margin: 0; }
+        .coach-action {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 30px;
+            padding: 5px 11px;
+            border: none;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 12px;
+            font-weight: 600;
+            line-height: 1.2;
+            color: #fff;
+            text-decoration: none;
+            cursor: pointer;
+            box-sizing: border-box;
+            transition: filter 0.15s ease, transform 0.15s ease;
+        }
+        .coach-action:hover {
+            filter: brightness(1.05);
+            transform: translateY(-1px);
+        }
+        .coach-action-edit {
+            background: #64748b;
+        }
+        .coach-action-edit:hover {
+            background: #475569;
+            filter: none;
+        }
+        .coach-action-delete {
+            background: #dc2626;
+        }
+        .coach-action-delete:hover {
+            background: #b91c1c;
+            filter: none;
+        }
+    </style>
 {% endblock %}
