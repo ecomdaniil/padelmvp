@@ -1631,13 +1631,16 @@ def webhook():
 
     if bot_instance and dp_instance and bot_loop:
         try:
-            update = Update.model_validate(request.json)
+            update = Update.model_validate(
+                request.json,
+                context={"bot": bot_instance},
+            )
         except Exception as e:
             logger.error("Ошибка разбора webhook-обновления: %s", e)
             return {"status": "error"}, 400
 
         future = asyncio.run_coroutine_threadsafe(
-            dp_instance.feed_webhook_update(bot_instance, update), bot_loop
+            dp_instance.feed_update(bot_instance, update), bot_loop
         )
 
         def _log_webhook_failure(fut):
@@ -1694,10 +1697,20 @@ def run_bot():
             webhook_endpoint = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
             # В проде секрет обязателен: иначе /webhook принимает чужие POST.
             enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "1").lower() in {"1", "true", "yes"}
+            # resolve_used_update_types — чтобы pre_checkout_query / message
+            # (successful_payment) точно попадали в webhook, а не терялись
+            # из‑за устаревшего жёсткого списка.
+            try:
+                allowed = dp_instance.resolve_used_update_types()
+            except Exception:
+                allowed = ["message", "callback_query", "pre_checkout_query"]
+            for required in ("message", "callback_query", "pre_checkout_query"):
+                if required not in allowed:
+                    allowed.append(required)
             set_kwargs = {
                 "url": webhook_endpoint,
                 "drop_pending_updates": False,
-                "allowed_updates": ["message", "callback_query", "pre_checkout_query"],
+                "allowed_updates": allowed,
             }
             if WEBHOOK_SECRET_TOKEN:
                 set_kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN

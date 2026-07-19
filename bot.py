@@ -131,7 +131,12 @@ async def setup_bot_commands(bot: Bot) -> None:
 class ThrottlingMiddleware(BaseMiddleware):
     """Простой rate limiting: не более RATE_LIMIT_PER_SECOND событий
     (сообщений/нажатий кнопок) от одного пользователя за скользящее окно
-    в 1 секунду. Защищает бота и БД от флуда/спама одним пользователем."""
+    в 1 секунду. Защищает бота и БД от флуда/спама одним пользователем.
+
+    successful_payment никогда не режем: после серии кликов «оплатить»
+    Telegram присылает служебное сообщение об оплате в том же окне, и
+    его потеря = нет «спасибо» игроку и нет уведомления админу.
+    """
 
     def __init__(self, limit: int = 10, window_seconds: float = 1.0):
         self.limit = limit
@@ -144,6 +149,10 @@ class ThrottlingMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
+        # Оплату PayMaster/Telegram Payments нельзя дропать антифлудом.
+        if isinstance(event, Message) and getattr(event, "successful_payment", None):
+            return await handler(event, data)
+
         user = data.get("event_from_user")
         user_id = user.id if user else None
 
@@ -541,7 +550,7 @@ async def process_games_format(callback: CallbackQuery):
     )
 
 
-@router.message(StateFilter(RegistrationForm.waiting_for_name))
+@router.message(StateFilter(RegistrationForm.waiting_for_name), F.text)
 async def process_name(message: Message, state: FSMContext):
     name = _safe_text(message)
     if name in MENU_BUTTONS or name.startswith("/"):
@@ -568,7 +577,7 @@ async def process_name(message: Message, state: FSMContext):
     )
 
 
-@router.message(StateFilter(RegistrationForm.waiting_for_age))
+@router.message(StateFilter(RegistrationForm.waiting_for_age), F.text)
 async def process_age(message: Message, state: FSMContext):
     text = _safe_text(message)
     if not text.isdigit():
@@ -596,7 +605,7 @@ async def process_age(message: Message, state: FSMContext):
     )
 
 
-@router.message(StateFilter(RegistrationForm.waiting_for_level))
+@router.message(StateFilter(RegistrationForm.waiting_for_level), F.text)
 async def process_level(message: Message, state: FSMContext):
     level = _safe_text(message)
     valid_levels = await get_valid_levels()
@@ -618,7 +627,7 @@ async def process_level(message: Message, state: FSMContext):
     )
 
 
-@router.message(StateFilter(RegistrationForm.waiting_for_inventory))
+@router.message(StateFilter(RegistrationForm.waiting_for_inventory), F.text)
 async def process_inventory(message: Message, state: FSMContext):
     answer = _safe_text(message).lower()
     if answer not in YES_ANSWERS | NO_ANSWERS:
@@ -647,7 +656,7 @@ async def process_inventory(message: Message, state: FSMContext):
     )
 
 
-@router.message(StateFilter(RegistrationForm.waiting_for_rules))
+@router.message(StateFilter(RegistrationForm.waiting_for_rules), F.text)
 async def process_rules(message: Message, state: FSMContext):
     answer = _safe_text(message).lower()
     if answer not in YES_ANSWERS | NO_ANSWERS:
@@ -674,7 +683,7 @@ async def process_rules(message: Message, state: FSMContext):
     )
 
 
-@router.message(StateFilter(RegistrationForm.waiting_for_phone))
+@router.message(StateFilter(RegistrationForm.waiting_for_phone), F.text)
 async def process_phone(message: Message, state: FSMContext):
     # Принимаем только цифры (без букв, пробелов и символов)
     phone = re.sub(r"\D", "", _safe_text(message))
@@ -1142,9 +1151,10 @@ async def menu_contact_admin(message: Message, state: FSMContext):
     )
 
 
-@router.message(StateFilter(AdminContact.waiting_for_message))
+@router.message(StateFilter(AdminContact.waiting_for_message), F.text)
 async def process_admin_message(message: Message, state: FSMContext, bot: Bot):
     # Кнопки меню не должны уходить админу как текст сообщения.
+    # F.text — чтобы successful_payment не перехватывался этим хендлером.
     if message.text in MENU_BUTTONS:
         await state.clear()
         user = await _require_registered(message.from_user.id)
@@ -1228,7 +1238,7 @@ async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(StateFilter(AdminReply.waiting_for_reply))
+@router.message(StateFilter(AdminReply.waiting_for_reply), F.text)
 async def admin_reply_send(message: Message, state: FSMContext, bot: Bot):
     if not await _is_admin_user(message.from_user.id):
         await state.clear()
@@ -2391,29 +2401,46 @@ async def process_paid_notify(callback: CallbackQuery):
 
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Telegram требует ответить в течение 10 секунд. Проверяем владельца
-    платежа и сумму до согласия на списание."""
+    """Telegram даёт ~10 секунд на ответ. Сначала быстро подтверждаем
+    наш payload (без тяжёлых round-trip к Neon), иначе PayMaster «висит»
+    и successful_payment может не дойти. Полная сверка — в successful_payment."""
     payload = pre_checkout_query.invoice_payload or ""
     try:
-        payment_id = int(payload.split(":", 1)[1])
+        prefix, raw_id = payload.split(":", 1)
+        payment_id = int(raw_id)
     except (IndexError, ValueError):
         await pre_checkout_query.answer(ok=False, error_message="Некорректный платёж.")
         return
-
-    user = await _require_registered(pre_checkout_query.from_user.id)
-    if not user:
-        await pre_checkout_query.answer(ok=False, error_message="Сначала заполни анкету.")
+    if prefix != "payment" or payment_id < 1:
+        await pre_checkout_query.answer(ok=False, error_message="Некорректный платёж.")
         return
 
-    payment = await db.get_payment_for_user(payment_id, user["id"])
-    if not payment or payment.get("status") != "ожидает":
-        await pre_checkout_query.answer(ok=False, error_message="Платёж недоступен.")
-        return
-
-    expected = int(round(float(payment["amount"]) * 100))
-    if int(pre_checkout_query.total_amount) != expected:
-        await pre_checkout_query.answer(ok=False, error_message="Сумма не совпадает.")
-        return
+    # Быстрый путь: подтверждаем сразу. Если БД ответит быстро — дополнительно
+    # сверим сумму/статус и при расхождении отклоним.
+    try:
+        user = await asyncio.wait_for(
+            _require_registered(pre_checkout_query.from_user.id),
+            timeout=2.5,
+        )
+        if not user:
+            await pre_checkout_query.answer(ok=False, error_message="Сначала заполни анкету.")
+            return
+        payment = await asyncio.wait_for(
+            db.get_payment_for_user(payment_id, user["id"]),
+            timeout=2.5,
+        )
+        if not payment or payment.get("status") != "ожидает":
+            await pre_checkout_query.answer(ok=False, error_message="Платёж недоступен.")
+            return
+        expected = int(round(float(payment["amount"]) * 100))
+        if int(pre_checkout_query.total_amount) != expected:
+            await pre_checkout_query.answer(ok=False, error_message="Сумма не совпадает.")
+            return
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.warning(
+            "pre_checkout: быстрая проверка не успела/упала (#%s): %s — подтверждаем по payload",
+            payment_id, e,
+        )
 
     await pre_checkout_query.answer(ok=True)
 
@@ -2456,71 +2483,87 @@ async def _notify_admin_player_paid(
 
 @router.message(F.successful_payment)
 async def process_successful_payment(message: Message):
-    """Деньги списаны через Telegram Payments — статус «подтверждена»
-    ставит администратор в CRM. Игроку — благодарность; админу — уведомление."""
-    payload = message.successful_payment.invoice_payload
+    """Деньги списаны через Telegram Payments (PayMaster) — статус «подтверждена»
+    ставит администратор в CRM. Игроку — «спасибо»; админу — DM с @username."""
+    sp = message.successful_payment
+    payload = sp.invoice_payload if sp else ""
     try:
         payment_id = int(payload.split(":", 1)[1])
-    except (IndexError, ValueError):
+    except (IndexError, ValueError, AttributeError):
         logger.error("Некорректный payload успешного платежа: %s", payload)
+        await message.answer(
+            "Спасибо за оплату! Не удалось сопоставить платёж — "
+            "напиши администратору через «Связаться с администратором»."
+        )
         return
+
+    logger.warning(
+        "successful_payment received payment_id=%s user=%s amount=%s",
+        payment_id,
+        message.from_user.id if message.from_user else None,
+        getattr(sp, "total_amount", None),
+    )
+
+    # Сразу благодарим — даже если дальше БД/админ упадут.
+    try:
+        await message.answer(_payment_awaiting_admin_text())
+    except Exception as e:
+        logger.error("Не удалось отправить «спасибо» игроку #%s: %s", payment_id, e)
 
     user = await _require_registered(message.from_user.id)
     if not user:
-        logger.error("successful_payment без зарегистрированного пользователя")
+        logger.error("successful_payment без зарегистрированного пользователя #%s", payment_id)
         return
 
     payment = await db.get_payment_for_user(payment_id, user["id"])
     if not payment:
         await message.answer(
-            "❌ Платёж не найден. Напиши администратору через «Связаться с администратором»."
+            "Платёж не найден в системе. Напиши администратору — приложи чек из Telegram."
         )
         return
 
+    paid_amount = int(sp.total_amount)
     expected = int(round(float(payment["amount"]) * 100))
-    if int(message.successful_payment.total_amount) != expected:
+    if paid_amount != expected:
         logger.error(
             "successful_payment сумма не совпала #%s: got=%s expected=%s",
-            payment_id, message.successful_payment.total_amount, expected,
+            payment_id, paid_amount, expected,
         )
         await message.answer(
-            "❌ Сумма оплаты не совпала. Напиши администратору."
+            "⚠️ Сумма в чеке отличается от ожидаемой. Администратор проверит оплату вручную."
         )
-        return
 
     if payment.get("status") == "подтверждена":
-        await message.answer("✅ Оплата уже подтверждена. Ждём тебя на корте! 🎾")
         return
 
-    # Помечаем для бейджа CRM «+N», без автоподтверждения статуса.
+    # Повторный webhook — не спамим админа.
+    already_notified = payment.get("player_notified_at") is not None
     notified = await db.mark_payment_notified_owned(payment_id, user["id"])
-    if notified is None:
-        await message.answer(
-            "❌ Не удалось зафиксировать оплату. Напиши администратору."
-        )
-        return
-    if notified.get("_already_notified"):
-        await message.answer(_payment_awaiting_admin_text())
+    if notified is None and not already_notified and payment.get("status") == "ожидает":
+        try:
+            notified = await db.mark_payment_notified(payment_id)
+        except Exception as e:
+            logger.error("mark_payment_notified failed #%s: %s", payment_id, e)
+
+    if already_notified or (isinstance(notified, dict) and notified.get("_already_notified")):
         return
 
-    # Обновим method для CRM (sbp/card из invoice).
     try:
         await db.set_payment_method_owned(payment_id, user["id"], "sbp")
-        payment = await db.get_payment_for_user(payment_id, user["id"]) or notified
+        payment = await db.get_payment_for_user(payment_id, user["id"]) or payment
     except Exception:
+        pass
+    if isinstance(notified, dict) and not notified.get("_already_notified"):
         payment = notified
 
-    await message.answer(_payment_awaiting_admin_text())
-
-    # Админу в личку — имя + @username, как раньше.
     try:
-        charge = message.successful_payment.provider_payment_charge_id
+        charge = sp.provider_payment_charge_id
         await _notify_admin_player_paid(
             message.bot,
             user=user,
             payment=payment,
             telegram_user=message.from_user,
-            source="Telegram Payments",
+            source="PayMaster / Telegram Payments",
             extra_lines=f"🔖 Provider charge: <code>{_html(charge)}</code>",
         )
     except Exception as e:
