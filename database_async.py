@@ -539,13 +539,26 @@ async def get_game_slot_offer(game_id: int) -> Optional[dict]:
 
 
 async def get_active_bookings_for_user(user_id: int) -> list:
-    """Только предстоящие (ещё не начавшиеся) незакрытые записи."""
+    """Только предстоящие (ещё не начавшиеся) незакрытые записи.
+    free_slots — сколько мест ещё свободно на этой игре (для «Докупить места»)."""
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
-        SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots
+        SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots,
+               GREATEST(
+                   0,
+                   g.total_slots
+                   - COALESCE(bk.taken, 0)
+                   - COALESCE(g.booked_places, 0)
+               ) AS free_slots
         FROM bookings b
         JOIN games g ON g.id = b.game_id
+        LEFT JOIN (
+            SELECT game_id, SUM(slots_count) AS taken
+            FROM bookings
+            WHERE status != 'отменена'
+            GROUP BY game_id
+        ) bk ON bk.game_id = g.id
         WHERE b.user_id = $1
           AND b.status != 'отменена'
           AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
@@ -555,6 +568,143 @@ async def get_active_bookings_for_user(user_id: int) -> list:
         user_id,
     )
     return _to_dict_list(rows)
+
+
+async def increase_booking_slots_safe(
+    user_id: int, booking_id: int, extra_slots: int,
+) -> dict:
+    """Докупить места к существующей брони на ту же игру.
+
+    Атомарно (FOR UPDATE на игре): проверяет свободные места, увеличивает
+    slots_count, создаёт/увеличивает платёж «ожидает» на сумму доплаты.
+
+    Возвращает {"status": "ok"|"full"|"not_found"|"forbidden"|"must_fill_all",
+                "booking", "game", "payment", "extra_slots", "extra_amount", ...}.
+    """
+    requested = max(1, int(extra_slots))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            booking = await conn.fetchrow(
+                """SELECT * FROM bookings
+                   WHERE id = $1 AND user_id = $2 AND status != 'отменена'
+                   FOR UPDATE""",
+                booking_id, user_id,
+            )
+            if booking is None:
+                return {"status": "not_found", "booking": None, "game": None}
+
+            game = await conn.fetchrow(
+                "SELECT * FROM games WHERE id = $1 FOR UPDATE",
+                booking["game_id"],
+            )
+            if game is None:
+                return {"status": "not_found", "booking": None, "game": None}
+            game_dict = _to_dict(game)
+            if game_dict.get("underfill_cancelled"):
+                return {"status": "not_found", "booking": _to_dict(booking), "game": game_dict}
+
+            timing = await conn.fetchrow(
+                f"""
+                SELECT
+                    (game_date + game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming,
+                    (game_date + game_time) < {_LOCAL_NOW_EXPR} + INTERVAL '1 hour'
+                        AS within_last_hour
+                FROM games WHERE id = $1
+                """,
+                game["id"],
+            )
+            if not timing or not timing["still_upcoming"]:
+                return {
+                    "status": "not_found",
+                    "booking": _to_dict(booking),
+                    "game": game_dict,
+                }
+
+            taken = await conn.fetchval(
+                """SELECT COALESCE(SUM(slots_count), 0) FROM bookings
+                   WHERE game_id = $1 AND status != 'отменена'""",
+                game["id"],
+            )
+            effective_taken = int(taken) + int(game_dict.get("booked_places") or 0)
+            free_slots = int(game["total_slots"]) - effective_taken
+            if free_slots <= 0:
+                return {
+                    "status": "full",
+                    "booking": _to_dict(booking),
+                    "game": game_dict,
+                    "free_slots": 0,
+                }
+
+            if timing["within_last_hour"]:
+                if requested != free_slots:
+                    return {
+                        "status": "must_fill_all",
+                        "booking": _to_dict(booking),
+                        "game": game_dict,
+                        "free_slots": free_slots,
+                        "total_slots": int(game["total_slots"]),
+                    }
+                slots_to_add = free_slots
+            else:
+                slots_to_add = min(MAX_SLOTS_PER_BOOKING, requested)
+                if slots_to_add > free_slots:
+                    return {
+                        "status": "full",
+                        "booking": _to_dict(booking),
+                        "game": game_dict,
+                        "free_slots": free_slots,
+                    }
+
+            extra_amount = float(game_dict["price"]) * int(slots_to_add)
+            updated_booking = await conn.fetchrow(
+                """UPDATE bookings
+                   SET slots_count = slots_count + $1
+                   WHERE id = $2
+                   RETURNING *""",
+                slots_to_add, booking_id,
+            )
+
+            pending = await conn.fetchrow(
+                """SELECT * FROM payments
+                   WHERE booking_id = $1 AND status = 'ожидает'
+                   ORDER BY id DESC LIMIT 1
+                   FOR UPDATE""",
+                booking_id,
+            )
+            if pending is not None:
+                # Увеличиваем текущий «ожидает»; сбрасываем ссылку провайдера —
+                # старая сумма/invoice больше не актуальны (PayMaster и т.п.).
+                payment = await conn.fetchrow(
+                    """UPDATE payments
+                       SET amount = amount + $1,
+                           provider_payment_id = NULL,
+                           confirmation_url = NULL,
+                           player_notified_at = NULL,
+                           method = NULL
+                       WHERE id = $2 AND status = 'ожидает'
+                       RETURNING *""",
+                    extra_amount, pending["id"],
+                )
+            else:
+                payment = await conn.fetchrow(
+                    """INSERT INTO payments (booking_id, amount, status, method)
+                       VALUES ($1, $2, 'ожидает', NULL) RETURNING *""",
+                    booking_id, extra_amount,
+                )
+
+            new_taken = effective_taken + slots_to_add
+            return {
+                "status": "ok",
+                "booking": _to_dict(updated_booking),
+                "game": game_dict,
+                "payment": _to_dict(payment) if payment else None,
+                "extra_slots": slots_to_add,
+                "extra_amount": extra_amount,
+                "taken": new_taken,
+                "total_slots": int(game["total_slots"]),
+                "free_slots": free_slots - slots_to_add,
+            }
 
 
 async def get_past_bookings_for_user(user_id: int) -> list:
@@ -1070,22 +1220,20 @@ async def confirm_payment(payment_id: int) -> Optional[dict]:
     return _to_dict(row) if row else None
 
 
-async def confirm_payment_by_provider_id(
+async def register_provider_payment_awaiting_admin(
     provider_payment_id: str,
     expected_amount: Optional[float] = None,
+    payment_method: Optional[str] = None,
 ) -> dict:
-    """Подтверждение из webhook ЮKassa. Идемпотентно.
+    """Деньги пришли у провайдера — статус остаётся «ожидает»,
+    ставим player_notified_at; подтверждает админ в CRM.
 
-    Возвращает {"status": "ok"|"already"|"not_found"|"mismatch"|"forbidden", "payment": ...}
+    Возвращает {"status": "ok"|"already"|"already_notified"|"not_found"|
+                "mismatch"|"forbidden", "payment": ...}
     """
-    pool = await get_pool()
-    payment = await pool.fetchrow(
-        "SELECT * FROM payments WHERE provider_payment_id = $1",
-        provider_payment_id,
-    )
-    if payment is None:
-        return {"status": "not_found"}
-    payment_dict = _to_dict(payment)
+    payment_dict = await get_payment_by_provider_id(provider_payment_id)
+    if payment_dict is None:
+        return {"status": "not_found", "payment": None}
     if payment_dict.get("status") == "подтверждена":
         return {"status": "already", "payment": payment_dict}
     if payment_dict.get("status") != "ожидает":
@@ -1093,14 +1241,28 @@ async def confirm_payment_by_provider_id(
     if expected_amount is not None:
         if abs(float(payment_dict["amount"]) - float(expected_amount)) > 0.009:
             return {"status": "mismatch", "payment": payment_dict}
-    updated = await confirm_payment(int(payment_dict["id"]))
+    if payment_method:
+        await set_payment_method(int(payment_dict["id"]), payment_method)
+    if payment_dict.get("player_notified_at") is not None:
+        return {"status": "already_notified", "payment": payment_dict}
+    updated = await mark_payment_notified(int(payment_dict["id"]))
     if not updated:
-        # гонка с CRM
         again = await get_payment_by_id(int(payment_dict["id"]))
-        if again and again.get("status") == "подтверждена":
-            return {"status": "already", "payment": again}
+        if again and again.get("player_notified_at") is not None:
+            return {"status": "already_notified", "payment": again}
         return {"status": "forbidden", "payment": payment_dict}
     return {"status": "ok", "payment": updated}
+
+
+async def confirm_payment_by_provider_id(
+    provider_payment_id: str,
+    expected_amount: Optional[float] = None,
+) -> dict:
+    """Обратная совместимость: больше не автоподтверждает, а ждёт админа."""
+    return await register_provider_payment_awaiting_admin(
+        provider_payment_id,
+        expected_amount=expected_amount,
+    )
 
 
 async def confirm_payment_owned(payment_id: int, user_id: int, amount_kopecks: int) -> dict:

@@ -869,21 +869,35 @@ async def _show_my_bookings(message: Message):
     await message.answer(
         "📋 <b>Твои записи</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Только предстоящие игры. Нажми «Отменить», если не сможешь прийти:",
+        "Только предстоящие игры. Можно докупить места, пока набор не полный, "
+        "или отменить запись:",
         parse_mode="HTML",
     )
 
     def _booking_card(b: dict) -> tuple[str, InlineKeyboardMarkup]:
         status_emoji = "✅" if b['status'] == 'подтверждена' else "⏳"
+        free_slots = int(b.get("free_slots") or 0)
+        total_slots = int(b.get("total_slots") or 0)
         text = (
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
-            f"👥 Мест: {b.get('slots_count', 1)}\n"
-            f"📌 Статус: {status_emoji} {_html(b['status'])}"
+            f"👥 Твоих мест: {b.get('slots_count', 1)}\n"
         )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_ask:{b['id']}")]
-        ])
+        if total_slots:
+            taken = max(0, total_slots - free_slots)
+            text += f"📊 Набор: {taken}/{total_slots}\n"
+        text += f"📌 Статус: {status_emoji} {_html(b['status'])}"
+        rows = []
+        if free_slots > 0:
+            rows.append([InlineKeyboardButton(
+                text="➕ Докупить места",
+                callback_data=f"buy_more:{b['id']}",
+            )])
+        rows.append([InlineKeyboardButton(
+            text="❌ Отменить запись",
+            callback_data=f"cancel_ask:{b['id']}",
+        )])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
         return text, keyboard
 
     sends = [_send_answer(message, *_booking_card(b)) for b in bookings]
@@ -1328,6 +1342,17 @@ def _slots_choice_keyboard(game_id: int, max_slots: int) -> InlineKeyboardMarkup
     ])
 
 
+def _buy_more_slots_keyboard(booking_id: int, max_slots: int) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=str(n), callback_data=f"buy_more_slots:{booking_id}:{n}")
+        for n in range(1, max_slots + 1)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        buttons,
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="buy_more_back")],
+    ])
+
+
 def _last_hour_fill_keyboard(game_id: int, free_slots: int) -> InlineKeyboardMarkup:
     """Меньше часа до старта — только выкуп всех оставшихся мест."""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1336,6 +1361,16 @@ def _last_hour_fill_keyboard(game_id: int, free_slots: int) -> InlineKeyboardMar
             callback_data=f"book_slots:{game_id}:{free_slots}",
         )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="book_back")],
+    ])
+
+
+def _buy_more_last_hour_keyboard(booking_id: int, free_slots: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"✅ Выкупить все {free_slots} мест",
+            callback_data=f"buy_more_slots:{booking_id}:{free_slots}",
+        )],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="buy_more_back")],
     ])
 
 
@@ -1542,6 +1577,193 @@ async def process_booking_confirm(callback: CallbackQuery):
         game=game,
         total_price=total_price,
     )
+
+
+@router.callback_query(F.data.regexp(r"^buy_more:\d+$"))
+async def process_buy_more_ask(callback: CallbackQuery):
+    """Из «Мои записи»: докупить места на ту же игру, пока набор не полный."""
+    await callback.answer()
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    booking_id = int(callback.data.split(":")[1])
+    booking = await db.get_booking_by_id(booking_id)
+    if not booking or booking.get("user_id") != user["id"] or booking.get("status") == "отменена":
+        await callback.message.answer("Запись не найдена.")
+        return
+
+    offer = await db.get_game_slot_offer(int(booking["game_id"]))
+    if not offer:
+        await callback.message.answer(
+            "На этой игре больше нет свободных мест или она уже недоступна."
+        )
+        return
+
+    game = offer["game"]
+    free_slots = offer["free_slots"]
+    total_slots = offer["total_slots"]
+
+    if offer["within_last_hour"]:
+        await callback.message.answer(
+            _must_fill_all_text(free_slots, total_slots) +
+            f"\n\n💰 Цена за место: {game['price']} ₽\n"
+            f"Итого за {free_slots}: <b>{float(game['price']) * free_slots:.0f} ₽</b>",
+            reply_markup=_buy_more_last_hour_keyboard(booking_id, free_slots),
+            parse_mode="HTML",
+        )
+        return
+
+    max_choice = min(MAX_SLOTS_PER_BOOKING, free_slots)
+    await callback.message.answer(
+        "➕ <b>Докупить места</b>\n"
+        f"Свободно на игре: {free_slots} из {total_slots}\n"
+        f"У тебя сейчас: {booking.get('slots_count', 1)}\n"
+        f"Цена за место: {game['price']} ₽\n\n"
+        "Сколько мест добавить?",
+        reply_markup=_buy_more_slots_keyboard(booking_id, max_choice),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "buy_more_back")
+async def process_buy_more_back(callback: CallbackQuery):
+    await callback.answer()
+    await _show_my_bookings(callback.message)
+
+
+@router.callback_query(F.data.startswith("buy_more_slots:"))
+async def process_buy_more_confirm(callback: CallbackQuery):
+    """Подтверждение докупки мест → увеличиваем бронь и открываем оплату доплаты."""
+    await callback.answer("Добавляю места…")
+    user = await _require_registered(callback.from_user.id)
+    if not user:
+        await callback.message.answer(
+            "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.message.answer("Некорректные данные.")
+        return
+    try:
+        booking_id = int(parts[1])
+        extra_slots = int(parts[2])
+    except ValueError:
+        await callback.message.answer("Некорректные данные.")
+        return
+    if extra_slots < 1:
+        await callback.message.answer("Некорректное количество мест.")
+        return
+
+    result = await db.increase_booking_slots_safe(
+        user_id=user["id"],
+        booking_id=booking_id,
+        extra_slots=extra_slots,
+    )
+
+    if result["status"] == "not_found":
+        await callback.message.answer("Запись или игра больше недоступны.")
+        return
+    if result["status"] == "forbidden":
+        await callback.message.answer("Это не твоя запись.")
+        return
+    if result["status"] == "full":
+        await callback.message.answer(
+            "Свободных мест уже меньше, чем ты выбрал. Открой «Мои записи» снова."
+        )
+        return
+    if result["status"] == "must_fill_all":
+        free_slots = int(result.get("free_slots") or 0)
+        total_slots = int(result.get("total_slots") or 0)
+        await callback.message.answer(
+            _must_fill_all_text(free_slots, total_slots),
+            reply_markup=(
+                _buy_more_last_hour_keyboard(booking_id, free_slots)
+                if free_slots > 0 else None
+            ),
+            parse_mode="HTML",
+        )
+        return
+    if result["status"] != "ok" or not result.get("payment") or not result.get("game"):
+        await callback.message.answer("Не удалось докупить места. Попробуй ещё раз.")
+        return
+
+    booking = result["booking"]
+    game = result["game"]
+    payment = result["payment"]
+    added = int(result["extra_slots"])
+    # К оплате — сумма текущего «ожидает» (доплата или увеличенный счёт).
+    total_price = float(payment["amount"])
+    _invalidate_games_cache()
+
+    asyncio.create_task(
+        _notify_admin_extra_slots(
+            callback.bot, user, game, booking_id, added, total_price,
+            int(booking.get("slots_count") or added),
+        )
+    )
+
+    await callback.message.answer(
+        f"✅ Добавлено мест: <b>{added}</b>\n"
+        f"👥 Всего твоих мест: <b>{booking.get('slots_count', added)}</b>\n"
+        f"💰 К оплате сейчас: <b>{total_price:.0f} ₽</b>\n\n"
+        "Оплати доплату ниже — администратор подтвердит её в CRM.",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    taken = int(result.get("taken") or 0)
+    total_slots = int(result.get("total_slots") or game["total_slots"])
+    if taken and taken < total_slots:
+        await callback.message.answer(
+            _underfill_booking_notice(taken, total_slots),
+            parse_mode="HTML",
+        )
+
+    await _offer_payment(
+        callback.message,
+        callback.bot,
+        user=user,
+        payment=payment,
+        game=game,
+        total_price=total_price,
+    )
+
+
+async def _notify_admin_extra_slots(
+    bot: Bot,
+    user: dict,
+    game: dict,
+    booking_id: int,
+    extra_slots: int,
+    pay_amount: float,
+    total_slots_owned: int,
+) -> None:
+    game_datetime = (
+        f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+    )
+    text = (
+        "➕ <b>Докупка мест</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Имя: {_html(user['name'])}\n"
+        f"📞 Телефон: {_html(user['phone'])}\n"
+        f"📅 Дата и время: {_html(game_datetime)}\n"
+        f"📍 Корт / площадка: {_html(game['location'])}\n"
+        f"➕ Добавлено мест: {extra_slots}\n"
+        f"👥 Всего мест у игрока: {total_slots_owned}\n"
+        f"💰 К оплате (текущий счёт): {pay_amount:.0f} ₽\n"
+        f"🆔 ID заявки: {booking_id}"
+    )
+    try:
+        await _send_admin_message(bot, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error("Не удалось уведомить админа о докупке #%s: %s", booking_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1838,8 +2060,15 @@ async def process_pay_open(callback: CallbackQuery):
         await callback.message.answer("❌ Не удалось открыть счёт. Попробуй позже.")
 
 
-async def _sync_pending_yookassa_status(payment: dict) -> dict:
-    """Если ссылка открыта, а webhook ещё не дошёл — подтянуть статус из ЮKassa."""
+async def _sync_pending_yookassa_status(
+    payment: dict,
+    *,
+    bot: Optional[Bot] = None,
+    user: Optional[dict] = None,
+    telegram_user=None,
+) -> dict:
+    """Если ссылка открыта, а webhook ещё не дошёл — подтянуть статус из ЮKassa.
+    При первой фиксации оплаты — уведомляем админа (с @username, если есть)."""
     provider_id = payment.get("provider_payment_id")
     if (
         not provider_id
@@ -1853,12 +2082,39 @@ async def _sync_pending_yookassa_status(payment: dict) -> dict:
         logger.warning("Не удалось проверить статус ЮKassa %s: %s", provider_id, e)
         return payment
     if yk.get("status") == "succeeded" or yk.get("paid"):
-        result = await db.confirm_payment_by_provider_id(
+        result = await db.register_provider_payment_awaiting_admin(
             provider_id,
             expected_amount=yk.get("amount"),
+            payment_method="yookassa",
         )
-        if result.get("payment"):
-            return result["payment"]
+        updated = result.get("payment") or payment
+        if result.get("status") == "ok" and bot and telegram_user:
+            try:
+                await bot.send_message(
+                    telegram_user.id,
+                    _payment_awaiting_admin_text(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Не удалось написать игроку об оплате ЮKassa #%s: %s",
+                    updated.get("id"), e,
+                )
+            if user:
+                try:
+                    await _notify_admin_player_paid(
+                        bot,
+                        user=user,
+                        payment=updated,
+                        telegram_user=telegram_user,
+                        source="ЮKassa",
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Не удалось уведомить админа об оплате ЮKassa #%s: %s",
+                        updated.get("id"), e,
+                    )
+        if updated:
+            return updated
     return payment
 
 
@@ -1880,7 +2136,12 @@ async def process_pay_cancel_ask(callback: CallbackQuery):
         await callback.message.answer("Платёж не найден или это не твоя запись.")
         return
 
-    payment = await _sync_pending_yookassa_status(payment)
+    payment = await _sync_pending_yookassa_status(
+        payment,
+        bot=callback.bot,
+        user=user,
+        telegram_user=callback.from_user,
+    )
     info = await db.get_booking_cancel_info(payment["booking_id"], user["id"])
     if info["status"] == "not_found":
         await callback.message.answer("Запись не найдена.")
@@ -1956,7 +2217,12 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
         await callback.message.answer("Платёж не найден или это не твоя запись.")
         return
 
-    payment = await _sync_pending_yookassa_status(payment)
+    payment = await _sync_pending_yookassa_status(
+        payment,
+        bot=callback.bot,
+        user=user,
+        telegram_user=callback.from_user,
+    )
     booking_id = int(payment["booking_id"])
 
     # Неоплаченный платёж в ЮKassa — best-effort cancel у провайдера.
@@ -2058,20 +2324,12 @@ async def process_paid_notify(callback: CallbackQuery):
     await callback.message.answer(_payment_awaiting_admin_text())
 
     try:
-        display_name = user.get("name") or callback.from_user.full_name or "Игрок"
-        username = callback.from_user.username
-        username_part = f" (@{_html(username)})" if username else ""
-        await _send_admin_message(
+        await _notify_admin_player_paid(
             callback.bot,
-            "💰 <b>Игрок сообщил об оплате</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Пользователь {_html(display_name)}{username_part} сообщил об оплате "
-            f"брони №{payment['booking_id']}\n\n"
-            f"🆔 Платёж #{payment_id}\n"
-            f"💳 Способ: {_html(payment.get('method') or '—')}\n"
-            f"💰 Сумма: {_html(payment['amount'])} ₽\n\n"
-            "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
-            parse_mode="HTML",
+            user=user,
+            payment=payment,
+            telegram_user=callback.from_user,
+            source=payment.get("method") or "перевод / на месте",
         )
     except Exception as e:
         logger.error("Не удалось уведомить админа об оплате #%s: %s", payment_id, e)
@@ -2112,10 +2370,40 @@ def _payment_awaiting_admin_text() -> str:
     )
 
 
+async def _notify_admin_player_paid(
+    bot: Bot,
+    *,
+    user: dict,
+    payment: dict,
+    telegram_user,
+    source: str = "оплата",
+    extra_lines: Optional[str] = None,
+) -> None:
+    """Личное сообщение админу об оплате — имя + @username, как раньше."""
+    display_name = user.get("name") or getattr(telegram_user, "full_name", None) or "Игрок"
+    username = getattr(telegram_user, "username", None)
+    username_part = f" (@{_html(username)})" if username else ""
+    tg_id = getattr(telegram_user, "id", None) or user.get("telegram_id") or "—"
+    text = (
+        "💰 <b>Игрок оплатил игру</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Пользователь {_html(display_name)}{username_part} оплатил "
+        f"бронь №{payment['booking_id']}\n\n"
+        f"🆔 Telegram ID: <code>{_html(tg_id)}</code>\n"
+        f"🆔 Платёж #{payment['id']}\n"
+        f"💳 Способ: {_html(payment.get('method') or source)}\n"
+        f"💰 Сумма: {_html(payment['amount'])} ₽\n"
+    )
+    if extra_lines:
+        text += f"{extra_lines}\n"
+    text += "\nПроверь и подтверди оплату в CRM (раздел «Оплаты»)."
+    await _send_admin_message(bot, text, parse_mode="HTML")
+
+
 @router.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     """Деньги списаны через Telegram Payments — статус «подтверждена»
-    ставит администратор в CRM. Игроку — благодарность и ожидание."""
+    ставит администратор в CRM. Игроку — благодарность; админу — уведомление."""
     payload = message.successful_payment.invoice_payload
     try:
         payment_id = int(payload.split(":", 1)[1])
@@ -2152,30 +2440,34 @@ async def process_successful_payment(message: Message):
 
     # Помечаем для бейджа CRM «+N», без автоподтверждения статуса.
     notified = await db.mark_payment_notified_owned(payment_id, user["id"])
-    if notified is None and payment.get("status") != "ожидает":
+    if notified is None:
         await message.answer(
             "❌ Не удалось зафиксировать оплату. Напиши администратору."
         )
         return
+    if notified.get("_already_notified"):
+        await message.answer(_payment_awaiting_admin_text())
+        return
+
+    # Обновим method для CRM (sbp/card из invoice).
+    try:
+        await db.set_payment_method_owned(payment_id, user["id"], "sbp")
+        payment = await db.get_payment_for_user(payment_id, user["id"]) or notified
+    except Exception:
+        payment = notified
 
     await message.answer(_payment_awaiting_admin_text())
 
+    # Админу в личку — имя + @username, как раньше.
     try:
-        display_name = user.get("name") or message.from_user.full_name or "Игрок"
-        username = message.from_user.username
-        username_part = f" (@{_html(username)})" if username else ""
-        await _send_admin_message(
+        charge = message.successful_payment.provider_payment_charge_id
+        await _notify_admin_player_paid(
             message.bot,
-            "💳 <b>Оплата через Telegram получена</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Пользователь {_html(display_name)}{username_part} оплатил "
-            f"бронь №{payment['booking_id']}\n\n"
-            f"🆔 Платёж #{payment_id}\n"
-            f"💰 Сумма: {_html(payment['amount'])} ₽\n"
-            f"🔖 Provider charge: "
-            f"{_html(message.successful_payment.provider_payment_charge_id)}\n\n"
-            "Проверь и подтверди оплату в CRM (раздел «Оплаты»).",
-            parse_mode="HTML",
+            user=user,
+            payment=payment,
+            telegram_user=message.from_user,
+            source="Telegram Payments",
+            extra_lines=f"🔖 Provider charge: <code>{_html(charge)}</code>",
         )
     except Exception as e:
         logger.error("Не удалось уведомить админа об оплате #%s: %s", payment_id, e)

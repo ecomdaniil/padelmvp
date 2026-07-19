@@ -1718,8 +1718,8 @@ def get_payment_notification_context(payment_id: int):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT p.id AS payment_id, p.amount, p.status,
-               u.telegram_id, u.name AS user_name,
+        SELECT p.id AS payment_id, p.amount, p.status, p.method,
+               u.telegram_id, u.name AS user_name, u.phone AS user_phone,
                b.id AS booking_id, b.slots_count,
                g.game_date, g.game_time, g.location
         FROM payments p
@@ -2068,7 +2068,9 @@ def get_dashboard_summary() -> dict:
     cur = conn.cursor()
     cur.execute(f"""
         SELECT
-            (SELECT COUNT(*) FROM games) AS games,
+            (SELECT COUNT(*) FROM games
+             WHERE COALESCE(underfill_cancelled, FALSE) = FALSE
+               AND (game_date + game_time) >= {_LOCAL_NOW_EXPR}) AS games,
             (SELECT COUNT(*) FROM bookings WHERE status != 'отменена') AS bookings,
             (SELECT COUNT(*) FROM payments p
              JOIN bookings b ON b.id = p.booking_id

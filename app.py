@@ -1493,6 +1493,7 @@ def yookassa_webhook():
         except Exception as e:
             logger.warning("Не удалось записать лог оплаты ЮKassa: %s", e)
         _notify_player_payment_awaiting_admin(int(payment["id"]))
+        _notify_admin_payment_awaiting_confirm(int(payment["id"]))
         return {"status": "ok"}, 200
 
     if status in {"already", "already_notified"}:
@@ -1510,6 +1511,64 @@ def yookassa_webhook():
         return {"status": "not_found"}, 200
 
     return {"status": status or "unchanged"}, 200
+
+
+def _resolve_admin_chat_ids() -> list:
+    """ADMIN_CHAT_ID из env + club_info.admin_telegram_id из CRM."""
+    ids = []
+    for part in (os.getenv("ADMIN_CHAT_ID") or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            logger.error("ADMIN_CHAT_ID содержит нечисловое значение: %r", part)
+    try:
+        info = db.get_club_info()
+        if info and info.get("admin_telegram_id"):
+            ids.append(int(info["admin_telegram_id"]))
+    except Exception as e:
+        logger.error("Не удалось прочитать admin_telegram_id из БД: %s", e)
+    unique = []
+    seen = set()
+    for chat_id in ids:
+        if chat_id not in seen:
+            seen.add(chat_id)
+            unique.append(chat_id)
+    return unique
+
+
+def _notify_admin_payment_awaiting_confirm(payment_id: int) -> None:
+    """Личное сообщение админу об оплате (имя + Telegram ID; @username в БД нет)."""
+    context = db.get_payment_notification_context(payment_id)
+    if not context:
+        return
+    admin_ids = _resolve_admin_chat_ids()
+    if not admin_ids:
+        logger.warning(
+            "Нет ADMIN_CHAT_ID / club_info.admin_telegram_id — уведомление админу об оплате #%s пропущено",
+            payment_id,
+        )
+        return
+    name = html.escape(str(context.get("user_name") or "Игрок"), quote=False)
+    tg_id = html.escape(str(context.get("telegram_id") or "—"), quote=False)
+    booking_id = context.get("booking_id") or "—"
+    amount = context.get("amount")
+    amount_text = f"{float(amount):.0f}" if amount is not None else "—"
+    method = html.escape(str(context.get("method") or "yookassa"), quote=False)
+    text = (
+        "💰 <b>Игрок оплатил игру</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Пользователь {name} оплатил бронь №{booking_id}\n\n"
+        f"🆔 Telegram ID: <code>{tg_id}</code>\n"
+        f"🆔 Платёж #{payment_id}\n"
+        f"💳 Способ: {method}\n"
+        f"💰 Сумма: {html.escape(amount_text, quote=False)} ₽\n\n"
+        "Проверь и подтверди оплату в CRM (раздел «Оплаты»)."
+    )
+    for chat_id in admin_ids:
+        send_telegram_message(chat_id, text)
 
 
 def _notify_player_payment_awaiting_admin(payment_id: int) -> None:
