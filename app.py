@@ -979,10 +979,7 @@ def _render_events_list(event_type: str):
     time_from_raw = request.args.get("time_from", "")
     time_to_raw = request.args.get("time_to", "")
     sort_order = request.args.get("sort", "asc")
-    allowed_sort = ("asc", "desc", "coach_asc", "coach_desc")
-    if sort_order not in allowed_sort:
-        sort_order = "asc"
-    if event_type != "training" and sort_order in ("coach_asc", "coach_desc"):
+    if sort_order not in ("asc", "desc"):
         sort_order = "asc"
     fullness = request.args.get("fullness", "")
     if fullness not in ("full", "available"):
