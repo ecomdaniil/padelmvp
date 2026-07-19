@@ -1521,8 +1521,11 @@ async def process_booking_confirm(callback: CallbackQuery):
     payment = result.get("payment")
     is_resume = result["status"] == "duplicate"
 
-    # Уже оплачено — не создаём второй «ожидает» и не шлём счёт снова.
-    if is_resume and payment and payment.get("status") == "подтверждена":
+    # Уже оплачено / ждёт подтверждения админа — не шлём счёт снова.
+    if is_resume and payment and (
+        payment.get("status") == "подтверждена"
+        or payment.get("player_notified_at") is not None
+    ):
         await callback.message.answer(
             "✅ Ты уже записан и оплатил эту игру.\n"
             "Детали — в «📋 Мои записи».",
@@ -1799,7 +1802,7 @@ def _payment_header(game: dict, amount: float) -> str:
 def _payment_method_choice_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="СБП (Банк, Карта)",
+            text="💳 СБП (Банк, Карта)",
             callback_data=f"pay_method_sbp:{payment_id}",
         )],
         [InlineKeyboardButton(
@@ -1809,8 +1812,18 @@ def _payment_method_choice_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def _payment_cancel_only_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    """После выбора СБП: ссылка/invoice уже в чате — только отмена."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🗑 Отменить заказ",
+            callback_data=f"pay_cancel_ask:{payment_id}",
+        )],
+    ])
+
+
 def _payment_link_keyboard(payment_id: int, pay_url: Optional[str] = None) -> InlineKeyboardMarkup:
-    """Кнопка оплаты: url (ЮKassa) или callback → настоящий счёт Telegram."""
+    """Устарело для нового потока; оставлено для старых сообщений / pay_open."""
     if pay_url:
         pay_btn = InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)
     else:
@@ -1998,19 +2011,23 @@ async def process_pay_method_sbp(callback: CallbackQuery):
             logger.error("ЮKassa create failed payment #%s: %s", payment_id, e)
             pay_url = None
 
-    # Текст второго экрана — ссылка в теле сообщения, если есть.
+    # Ссылка/invoice уже в чате — кнопку «Перейти к оплате» не дублируем.
     link_block = ""
     if pay_url:
         link_block = f"\n{_html(pay_url)}"
     text = (
         _payment_header(game, amount)
-        + "Пожалуйста, кликните по ссылке для оплаты:"
+        + (
+            "Пожалуйста, кликните по ссылке для оплаты:"
+            if pay_url
+            else "Ниже откроется счёт для оплаты."
+        )
         + link_block
     )
     await _replace_payment_message(
         callback.message,
         text,
-        _payment_link_keyboard(payment_id, pay_url),
+        _payment_cancel_only_keyboard(payment_id),
     )
 
     # Настоящая оплата через Telegram Payments (PayMaster и т.п.) — счёт invoice.
@@ -2021,8 +2038,9 @@ async def process_pay_method_sbp(callback: CallbackQuery):
         except Exception as e:
             logger.error("Не удалось отправить invoice #%s: %s", payment_id, e)
             await callback.message.answer(
-                "❌ Не удалось открыть оплату. Попробуй кнопку «Перейти к оплате» ниже "
-                "или напиши администратору.",
+                "❌ Не удалось открыть оплату. Напиши администратору "
+                "или отметь оплату вручную после перевода.",
+                reply_markup=_manual_pay_keyboard(payment_id),
             )
 
 
@@ -2158,8 +2176,24 @@ async def process_pay_cancel_ask(callback: CallbackQuery):
 
     paid = payment.get("status") == "подтверждена"
     refund_window = bool(info.get("refund_window"))
+    is_open_unpaid = (
+        payment.get("status") == "ожидает"
+        and payment.get("player_notified_at") is None
+    )
+    keep_paid_seats = False
+    if is_open_unpaid:
+        keep_paid_seats = await db.booking_has_protected_payment(
+            int(payment["booking_id"]),
+            exclude_payment_id=payment_id,
+        )
 
-    if not paid:
+    if keep_paid_seats:
+        text = (
+            "Отменить доплату?\n\n"
+            "Уже оплаченные места останутся в «Мои записи». "
+            "Снимется только неоплаченная докупка."
+        )
+    elif not paid:
         text = (
             "Точно отменить запись?\n\n"
             "Оплата ещё не поступила — место снова станет свободным."
@@ -2233,7 +2267,9 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
     ):
         await payment_provider.cancel_yookassa_payment(payment["provider_payment_id"])
 
-    result = await db.cancel_booking_owned(booking_id, user["id"])
+    result = await db.cancel_payment_or_booking_owned(
+        booking_id, user["id"], payment_id,
+    )
     if result["status"] == "not_found":
         await callback.message.answer("Запись не найдена.")
         return
@@ -2250,6 +2286,24 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
         await callback.message.answer(
             "Игра уже началась или была отменена — отменить запись нельзя.",
             reply_markup=main_menu_keyboard(),
+        )
+        return
+    if result["status"] == "extra_cancelled":
+        _invalidate_games_cache()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        kept = int(result.get("slots_kept") or 1)
+        removed = int(result.get("extra_slots_removed") or 0)
+        await callback.message.answer(
+            "✅ Доплата отменена.\n\n"
+            f"Твоя запись сохранена: <b>{kept}</b> "
+            f"{'место' if kept == 1 else 'места' if kept < 5 else 'мест'}"
+            + (f" (снято неоплаченных: {removed})" if removed else "")
+            + ".\nСмотри в «📋 Мои записи».",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="HTML",
         )
         return
     if result["status"] != "ok":

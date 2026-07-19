@@ -665,26 +665,30 @@ async def increase_booking_slots_safe(
                 slots_to_add, booking_id,
             )
 
-            pending = await conn.fetchrow(
+            # Только «открытый» неоплаченный счёт можно увеличить.
+            # Уже оплаченный через PayMaster (player_notified_at) или
+            # подтверждённый админом НЕ трогаем — для доплаты новый платёж.
+            open_pending = await conn.fetchrow(
                 """SELECT * FROM payments
-                   WHERE booking_id = $1 AND status = 'ожидает'
+                   WHERE booking_id = $1
+                     AND status = 'ожидает'
+                     AND player_notified_at IS NULL
                    ORDER BY id DESC LIMIT 1
                    FOR UPDATE""",
                 booking_id,
             )
-            if pending is not None:
-                # Увеличиваем текущий «ожидает»; сбрасываем ссылку провайдера —
-                # старая сумма/invoice больше не актуальны (PayMaster и т.п.).
+            if open_pending is not None:
                 payment = await conn.fetchrow(
                     """UPDATE payments
                        SET amount = amount + $1,
                            provider_payment_id = NULL,
                            confirmation_url = NULL,
-                           player_notified_at = NULL,
                            method = NULL
-                       WHERE id = $2 AND status = 'ожидает'
+                       WHERE id = $2
+                         AND status = 'ожидает'
+                         AND player_notified_at IS NULL
                        RETURNING *""",
-                    extra_amount, pending["id"],
+                    extra_amount, open_pending["id"],
                 )
             else:
                 payment = await conn.fetchrow(
@@ -901,6 +905,146 @@ async def get_booking_cancel_info(booking_id: int, user_id: int) -> dict:
     }
 
 
+async def cancel_payment_or_booking_owned(
+    booking_id: int, user_id: int, payment_id: int,
+) -> dict:
+    """Отмена с экрана оплаты.
+
+    Если отменяемый платёж — открытая доплата (ожидает, без player_notified_at),
+    а по брони уже есть защищённые оплаты (подтверждена или ожидает с
+    player_notified_at), то удаляем только доплату и откатываем лишние места.
+    Иначе — полная отмена брони (cancel_booking_owned).
+
+    Возвращает status:
+      extra_cancelled — доплата снята, бронь и оплаченные места сохранены
+      (+ поля booking, slots_kept, extra_slots_removed, ...)
+      остальные — как у cancel_booking_owned
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            booking = await conn.fetchrow(
+                "SELECT * FROM bookings WHERE id = $1 FOR UPDATE", booking_id
+            )
+            if booking is None:
+                return {"status": "not_found"}
+            if booking["user_id"] != user_id:
+                return {"status": "forbidden"}
+            if booking["status"] == "отменена":
+                return {"status": "not_found"}
+
+            payment = await conn.fetchrow(
+                """SELECT * FROM payments
+                   WHERE id = $1 AND booking_id = $2 FOR UPDATE""",
+                payment_id, booking_id,
+            )
+            if payment is None:
+                return {"status": "not_found"}
+
+            game = await conn.fetchrow(
+                f"""
+                SELECT *,
+                       (game_date + game_time) >= {_LOCAL_NOW_EXPR} AS still_upcoming
+                FROM games WHERE id = $1
+                """,
+                booking["game_id"],
+            )
+            if game is None:
+                return {"status": "not_found"}
+            if not game["still_upcoming"] or game.get("underfill_cancelled"):
+                return {"status": "too_late", "game": _to_dict(game)}
+
+            is_open_unpaid = (
+                payment["status"] == "ожидает"
+                and payment["player_notified_at"] is None
+            )
+            if is_open_unpaid:
+                protected = await conn.fetch(
+                    """SELECT * FROM payments
+                       WHERE booking_id = $1
+                         AND id != $2
+                         AND (
+                             status = 'подтверждена'
+                             OR (status = 'ожидает' AND player_notified_at IS NOT NULL)
+                         )
+                       FOR UPDATE""",
+                    booking_id, payment_id,
+                )
+                if protected:
+                    price = float(game["price"] or 0)
+                    pending_amount = float(payment["amount"] or 0)
+                    if price > 0.009:
+                        slots_to_remove = int(round(pending_amount / price))
+                        protected_amount = sum(float(p["amount"] or 0) for p in protected)
+                        protected_slots = max(1, int(round(protected_amount / price)))
+                    else:
+                        slots_to_remove = 0
+                        protected_slots = max(1, int(booking["slots_count"] or 1))
+
+                    current_slots = int(booking["slots_count"] or 1)
+                    new_slots = max(protected_slots, current_slots - max(0, slots_to_remove))
+                    if new_slots < 1:
+                        new_slots = protected_slots
+
+                    await conn.execute(
+                        "DELETE FROM payments WHERE id = $1 AND status = 'ожидает'",
+                        payment_id,
+                    )
+                    updated = await conn.fetchrow(
+                        """UPDATE bookings SET slots_count = $1
+                           WHERE id = $2 RETURNING *""",
+                        new_slots, booking_id,
+                    )
+                    return {
+                        "status": "extra_cancelled",
+                        "booking": _to_dict(updated),
+                        "game": _to_dict(game),
+                        "slots_kept": new_slots,
+                        "extra_slots_removed": max(0, current_slots - new_slots),
+                        "payment_deleted": True,
+                        "had_payment": True,
+                        "refund_eligible": False,
+                        "refund_window": False,
+                        "admin_notify_message_id": booking["admin_notify_message_id"],
+                        "payment": None,
+                    }
+
+    # Полная отмена брони (нет защищённых оплат / отмена всей записи).
+    return await cancel_booking_owned(booking_id, user_id)
+
+
+async def booking_has_protected_payment(
+    booking_id: int, exclude_payment_id: Optional[int] = None,
+) -> bool:
+    """Есть ли по брони оплата, которую нельзя терять при отмене доплаты:
+    подтверждённая или уже отмеченная игроком (PayMaster / «Я оплатил»)."""
+    pool = await get_pool()
+    if exclude_payment_id is None:
+        row = await pool.fetchrow(
+            """SELECT 1 FROM payments
+               WHERE booking_id = $1
+                 AND (
+                     status = 'подтверждена'
+                     OR (status = 'ожидает' AND player_notified_at IS NOT NULL)
+                 )
+               LIMIT 1""",
+            booking_id,
+        )
+    else:
+        row = await pool.fetchrow(
+            """SELECT 1 FROM payments
+               WHERE booking_id = $1
+                 AND id != $2
+                 AND (
+                     status = 'подтверждена'
+                     OR (status = 'ожидает' AND player_notified_at IS NOT NULL)
+                 )
+               LIMIT 1""",
+            booking_id, exclude_payment_id,
+        )
+    return row is not None
+
+
 async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
     """Отменяет заявку только если она принадлежит указанному пользователю.
     Защита от IDOR: раньше отмена работала по одному booking_id без проверки
@@ -1086,11 +1230,15 @@ async def create_payment(booking_id: int, amount: float, method: Optional[str] =
 
 
 async def get_or_create_pending_payment(booking_id: int, amount: float) -> Optional[dict]:
-    """Идемпотентно: один «ожидает» на бронь (см. idx_payments_one_pending)."""
+    """Идемпотентно: один открытый неоплаченный «ожидает» на бронь
+    (player_notified_at IS NULL). Уже оплаченные, но ещё не подтверждённые
+    админом счета сюда не подмешиваем."""
     pool = await get_pool()
     existing = await pool.fetchrow(
         """SELECT * FROM payments
-           WHERE booking_id = $1 AND status = 'ожидает'
+           WHERE booking_id = $1
+             AND status = 'ожидает'
+             AND player_notified_at IS NULL
            ORDER BY id DESC LIMIT 1""",
         booking_id,
     )
@@ -1103,7 +1251,9 @@ async def get_or_create_pending_payment(booking_id: int, amount: float) -> Optio
         logger.warning("get_or_create_pending_payment race booking=%s: %s", booking_id, e)
         existing = await pool.fetchrow(
             """SELECT * FROM payments
-               WHERE booking_id = $1 AND status = 'ожидает'
+               WHERE booking_id = $1
+                 AND status = 'ожидает'
+                 AND player_notified_at IS NULL
                ORDER BY id DESC LIMIT 1""",
             booking_id,
         )

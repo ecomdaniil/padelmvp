@@ -509,20 +509,27 @@ def _create_indexes(cur):
     for statement in index_statements:
         cur.execute(statement)
 
-    # Один «ожидает» на бронь. Сначала убираем дубли (оставляем последний id).
+    # Один «открытый» неоплаченный счёт на бронь (ещё без player_notified_at).
+    # После оплаты через PayMaster счёт остаётся «ожидает» до подтверждения
+    # админом — на такую бронь должна уметь создаваться отдельная доплата
+    # при «Докупить места», поэтому уникальность только на open-pending.
+    cur.execute("DROP INDEX IF EXISTS idx_payments_one_pending;")
     cur.execute(
         """
         DELETE FROM payments a
         USING payments b
         WHERE a.booking_id = b.booking_id
           AND a.status = 'ожидает'
+          AND a.player_notified_at IS NULL
           AND b.status = 'ожидает'
+          AND b.player_notified_at IS NULL
           AND a.id < b.id
         """
     )
     cur.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_one_pending "
-        "ON payments (booking_id) WHERE status = 'ожидает'"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_one_open_pending "
+        "ON payments (booking_id) "
+        "WHERE status = 'ожидает' AND player_notified_at IS NULL"
     )
 
 
