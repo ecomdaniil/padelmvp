@@ -1839,7 +1839,7 @@ def run_bot():
         await setup_bot_commands(bot_instance)
 
         scheduler.add_job(_reminders_job, "interval", minutes=15)
-        # Таймаут оплаты 5 мин — проверяем каждую минуту.
+        # Таймаут оплаты 3 мин — проверяем каждую минуту.
         scheduler.add_job(_unpaid_timeout_job, "interval", minutes=1)
         scheduler.start()
 

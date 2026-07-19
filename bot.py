@@ -3017,7 +3017,7 @@ async def _process_underfill_cancels(bot: Bot) -> None:
 
 def _unpaid_timeout_minutes() -> int:
     try:
-        return max(1, int(os.getenv("UNPAID_PAYMENT_TIMEOUT_MINUTES", "5")))
+        return max(1, int(os.getenv("UNPAID_PAYMENT_TIMEOUT_MINUTES", "3")))
     except ValueError:
         return 5
 

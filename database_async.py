@@ -1062,7 +1062,7 @@ async def cancel_payment_or_booking_owned(
     return await cancel_booking_owned(booking_id, user_id)
 
 
-async def list_expired_unpaid_payment_ids(older_than_minutes: int = 5) -> list:
+async def list_expired_unpaid_payment_ids(older_than_minutes: int = 3) -> list:
     """Открытые неоплаченные счета старше N минут (для автоотмены)."""
     minutes = max(1, int(older_than_minutes))
     pool = await get_pool()
@@ -1084,7 +1084,7 @@ async def list_expired_unpaid_payment_ids(older_than_minutes: int = 5) -> list:
 
 
 async def expire_unpaid_payment(
-    payment_id: int, *, older_than_minutes: int = 5,
+    payment_id: int, *, older_than_minutes: int = 3,
 ) -> Optional[dict]:
     """Автоотмена неоплаченного счёта по таймауту.
 
