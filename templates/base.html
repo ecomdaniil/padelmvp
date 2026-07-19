@@ -540,9 +540,8 @@
                 Оплаты<span class="nav-badge" id="nav-badge-payments" {% if not nav_badges or not nav_badges.payments %}style="display:none;"{% endif %}>+{{ nav_badges.payments if nav_badges else 0 }}</span>
             </a>
             <a href="{{ url_for('visits_list') }}" class="{{ 'active' if request.endpoint == 'visits_list' }}">Посещения</a>
-            <a href="{{ url_for('clubs_list') }}" class="{{ 'active' if request.endpoint in ['clubs_list', 'club_new', 'club_edit'] }}">Клубы</a>
-            <a href="{{ url_for('coaches_list') }}" class="{{ 'active' if request.endpoint in ['coaches_list', 'coach_new', 'coach_edit'] }}">Тренеры</a>
             <a href="{{ url_for('about_club') }}" class="{{ 'active' if request.endpoint == 'about_club' }}">О клубе</a>
+            <a href="{{ url_for('coaches_list') }}" class="{{ 'active' if request.endpoint in ['coaches_list', 'coach_new', 'coach_edit'] }}">Тренеры</a>
             <a href="{{ url_for('logs_list') }}" class="{{ 'active' if request.endpoint == 'logs_list' }}">Журнал</a>
         </div>
         <div class="nav-actions">

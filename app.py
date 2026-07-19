@@ -444,7 +444,14 @@ def _describe_club_diff(old: dict, new: dict) -> str:
 
 
 def _describe_club_info_diff(old: dict, new: dict) -> str:
-    labels = [("name", "название"), ("description", "описание"), ("contact_phone", "телефон"), ("contact_email", "email")]
+    labels = [
+        ("name", "название"),
+        ("city", "город"),
+        ("address", "адрес"),
+        ("description", "описание"),
+        ("contact_phone", "телефон"),
+        ("contact_email", "email"),
+    ]
     changes = []
     for key, label in labels:
         if (old.get(key) or "") != (new.get(key) or ""):
@@ -1568,66 +1575,12 @@ def visit_mark(booking_id):
 # ---------------------------------------------------------------------------
 
 @app.route("/clubs")
-@login_required
-def clubs_list():
-    page = request.args.get("page", 1, type=int)
-    result = db.get_clubs_paginated(page=page, per_page=DEFAULT_PAGE_SIZE)
-    return render_template("clubs.html", clubs=result["items"], pagination=result)
-
-
 @app.route("/clubs/new", methods=["GET", "POST"])
-@login_required
-def club_new():
-    if request.method == "POST":
-        city = (request.form.get("city") or "").strip()
-        if not city:
-            flash("Укажите город клуба")
-            return render_template("club_form.html", club=None)
-        club = db.create_club(
-            name=request.form["name"],
-            city=city,
-            address=request.form["address"],
-            phone=request.form["phone"],
-            description=request.form.get("description", ""),
-        )
-        description = (
-            f"Клуб «{club['name']}» добавлен ({club.get('city') or '—'}, {club['address']})"
-        )
-        log_admin_action("create", "club", club["id"], description=description)
-        flash("Клуб добавлен")
-        return redirect(url_for("clubs_list"))
-    return render_template("club_form.html", club=None)
-
-
 @app.route("/clubs/<int:club_id>/edit", methods=["GET", "POST"])
 @login_required
-def club_edit(club_id):
-    club = db.get_club_by_id(club_id)
-    if not club:
-        flash("Клуб не найден")
-        return redirect(url_for("clubs_list"))
-
-    if request.method == "POST":
-        city = (request.form.get("city") or "").strip()
-        if not city:
-            flash("Укажите город клуба")
-            return render_template("club_form.html", club=club)
-        old_snapshot = dict(club)
-        db.update_club(
-            club_id=club_id,
-            name=request.form["name"],
-            city=city,
-            address=request.form["address"],
-            phone=request.form["phone"],
-            description=request.form.get("description", ""),
-        )
-        updated = db.get_club_by_id(club_id)
-        description = f"Клуб «{updated['name']}» отредактирован: {_describe_club_diff(old_snapshot, dict(updated))}"
-        log_admin_action("update", "club", club_id, description=description)
-        flash("Клуб обновлён")
-        return redirect(url_for("clubs_list"))
-
-    return render_template("club_form.html", club=club)
+def clubs_redirect(club_id=None):
+    """Площадка редактируется в «О клубе» — старые URL ведут туда."""
+    return redirect(url_for("about_club"))
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1615,18 @@ def about_club():
 @login_required
 def about_club_update():
     old_info = db.get_club_info()
+    name = (request.form.get("name") or "").strip()
+    city = (request.form.get("city") or "").strip()
+    address = (request.form.get("address") or "").strip()
+    if not name:
+        flash("Укажите название клуба")
+        return redirect(url_for("about_club"))
+    if not city:
+        flash("Укажите город")
+        return redirect(url_for("about_club"))
+    if not address:
+        flash("Укажите адрес")
+        return redirect(url_for("about_club"))
     raw_admin_id = (request.form.get("admin_telegram_id") or "").strip()
     admin_telegram_id = raw_admin_id  # '' очищает; число — сохраняет
     if raw_admin_id and not raw_admin_id.isdigit():
@@ -1669,13 +1634,17 @@ def about_club_update():
         return redirect(url_for("about_club"))
     raw_admin_user = (request.form.get("admin_telegram_username") or "").strip().lstrip("@")
     db.update_club_info(
-        name=request.form["name"],
-        description=request.form["description"],
-        contact_phone=request.form["contact_phone"],
-        contact_email=request.form.get("contact_email", ""),
+        name=name,
+        description=request.form.get("description") or "",
+        contact_phone=request.form.get("contact_phone") or "",
+        contact_email=request.form.get("contact_email") or "",
         admin_telegram_id=admin_telegram_id,
         admin_telegram_username=raw_admin_user,
+        city=city,
+        address=address,
     )
+    # Инвалидация кэша списка игр — локация могла измениться.
+    cache.invalidate_games_cache()
     new_info = db.get_club_info()
     description = f"Информация о клубе обновлена: {_describe_club_info_diff(dict(old_info) if old_info else {}, dict(new_info) if new_info else {})}"
     log_admin_action(

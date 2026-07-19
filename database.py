@@ -316,14 +316,16 @@ def init_db():
             description TEXT,
             contact_phone TEXT,
             contact_email TEXT,
+            city TEXT NOT NULL DEFAULT '',
+            address TEXT NOT NULL DEFAULT '',
             updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
     """)
 
     # Создаём запись о клубе, если её нет
     cur.execute("""
-        INSERT INTO club_info (name, description, contact_phone, contact_email)
-        SELECT 'Padel Club', 'Добро пожаловать в наш клуб падел!', '', ''
+        INSERT INTO club_info (name, description, contact_phone, contact_email, city, address)
+        SELECT 'Padel Club', 'Добро пожаловать в наш клуб падел!', '', '', '', ''
         WHERE NOT EXISTS (SELECT 1 FROM club_info);
     """)
 
@@ -657,14 +659,32 @@ def _migrate_clubs_table(cur):
 
 
 def _migrate_club_info_table(cur):
-    """admin_telegram_id — куда бот шлёт сообщения «Связаться с админом»
-    и уведомления о записях, если ADMIN_CHAT_ID в env не задан (часто на Render).
-    admin_telegram_username — отображаемый @username администратора."""
+    """admin_telegram_id / username — уведомления бота; city/address — площадка
+    для автоподстановки в формах игр и тренировок (через sync в clubs)."""
     cur.execute(
         "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS admin_telegram_id BIGINT;"
     )
     cur.execute(
         "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS admin_telegram_username TEXT;"
+    )
+    cur.execute(
+        "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT '';"
+    )
+    cur.execute(
+        "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS address TEXT NOT NULL DEFAULT '';"
+    )
+    # Если город/адрес ещё пустые — подтянуть из первой площадки clubs.
+    cur.execute(
+        """
+        UPDATE club_info AS ci
+        SET city = COALESCE(NULLIF(ci.city, ''), c.city, ''),
+            address = COALESCE(NULLIF(ci.address, ''), c.address, '')
+        FROM (
+            SELECT city, address FROM clubs ORDER BY id ASC LIMIT 1
+        ) AS c
+        WHERE ci.id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)
+          AND (COALESCE(ci.city, '') = '' OR COALESCE(ci.address, '') = '')
+        """
     )
 
 
@@ -2728,9 +2748,13 @@ def update_club_info(
     contact_email: str = "",
     admin_telegram_id=None,
     admin_telegram_username=None,
+    city: str = "",
+    address: str = "",
 ):
     """admin_telegram_id=None — не менять id; ''/0 — очистить.
-    admin_telegram_username=None — не менять username; '' — очистить."""
+    admin_telegram_username=None — не менять username; '' — очистить.
+    city/address сохраняются в club_info и синхронизируются в clubs
+    (выбор клуба в форме игры/тренировки подставляет эти значения)."""
     conn = get_connection()
     cur = conn.cursor()
     sets = [
@@ -2738,9 +2762,11 @@ def update_club_info(
         "description = %s",
         "contact_phone = %s",
         "contact_email = %s",
+        "city = %s",
+        "address = %s",
         "updated_at = NOW()",
     ]
-    params = [name, description, contact_phone, contact_email]
+    params = [name, description, contact_phone, contact_email, city or "", address or ""]
     if admin_telegram_id is not None:
         tid = None
         if admin_telegram_id not in ("", 0, "0"):
@@ -2756,9 +2782,29 @@ def update_club_info(
            WHERE id = (SELECT id FROM club_info ORDER BY id DESC LIMIT 1)""",
         tuple(params),
     )
+    _sync_primary_club_venue(cur, name=name, city=city or "", address=address or "", phone=contact_phone or "")
     conn.commit()
     cur.close()
     conn.close()
+
+
+def _sync_primary_club_venue(cur, name: str, city: str, address: str, phone: str = "") -> None:
+    """Одна площадка в clubs для выпадающего списка в формах игр/тренировок."""
+    cur.execute("SELECT id FROM clubs ORDER BY id ASC LIMIT 1")
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            """UPDATE clubs
+               SET name = %s, city = %s, address = %s, phone = %s
+               WHERE id = %s""",
+            (name, city, address, phone, row["id"]),
+        )
+    else:
+        cur.execute(
+            """INSERT INTO clubs (name, city, address, phone, description)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (name, city, address, phone, ""),
+        )
 
 
 def set_club_admin_telegram_id(telegram_id: int, username: str = None) -> None:
