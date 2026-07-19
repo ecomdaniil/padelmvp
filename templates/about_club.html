@@ -36,7 +36,7 @@
             <div style="margin-bottom: 16px;">
                 <label style="display: block; margin-bottom: 6px; font-weight: 600;">Telegram ID администратора (для бота)</label>
                 <input type="text" name="admin_telegram_id" inputmode="numeric" pattern="[0-9]*" value="{{ club_info.admin_telegram_id if club_info and club_info.admin_telegram_id else '' }}" placeholder="Например 5161234567" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-                <p style="margin: 8px 0 0; color: #64748b; font-size: 13px;">ID нужен боту для доставки сообщений. Узнать у @userinfobot. Можно задать ADMIN_CHAT_ID в переменных окружения.</p>
+                <p style="margin: 8px 0 0; color: #64748b; font-size: 13px;">ID нужен боту для доставки сообщений. Узнать у @userinfobot.</p>
             </div>
             <button type="submit" class="btn">Сохранить изменения</button>
         </form>

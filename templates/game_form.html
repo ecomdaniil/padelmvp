@@ -19,18 +19,6 @@
                    placeholder="например: Отработка ударов"
                    value="{{ values.title }}">
         </div>
-        <div class="form-row">
-            <label for="coach_id">Тренер *</label>
-            <select id="coach_id" name="coach_id" required>
-                <option value="">— выберите тренера —</option>
-                {% for co in coaches %}
-                <option value="{{ co.id }}"
-                        {% if values.coach_id == co.id|string %}selected{% endif %}>
-                    {{ co.name }}
-                </option>
-                {% endfor %}
-            </select>
-        </div>
         {% endif %}
 
         <div class="form-row">
@@ -53,6 +41,35 @@
         </div>
 
         <div class="form-row">
+            <label for="city">Город *</label>
+            <input type="text" id="city" name="city" required maxlength="100"
+                   placeholder="Выберите клуб — заполнится автоматически"
+                   value="{{ values.city }}">
+        </div>
+
+        <div class="form-row">
+            <label for="address">Адрес *</label>
+            <input type="text" id="address" name="address" required maxlength="255"
+                   placeholder="Выберите клуб — заполнится автоматически"
+                   value="{{ values.address }}">
+        </div>
+
+        {% if is_training %}
+        <div class="form-row">
+            <label for="coach_id">Тренер *</label>
+            <select id="coach_id" name="coach_id" required>
+                <option value="">— выберите тренера —</option>
+                {% for co in coaches %}
+                <option value="{{ co.id }}"
+                        {% if values.coach_id == co.id|string %}selected{% endif %}>
+                    {{ co.name }}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+        {% endif %}
+
+        <div class="form-row">
             <label for="club_id">Клуб *</label>
             <select id="club_id" name="club_id" required>
                 <option value="">— выберите клуб —</option>
@@ -66,20 +83,6 @@
                 {% endfor %}
             </select>
             <small class="field-hint">Город и адрес подставятся из карточки клуба.</small>
-        </div>
-
-        <div class="form-row">
-            <label for="city">Город *</label>
-            <input type="text" id="city" name="city" required maxlength="100"
-                   placeholder="Выберите клуб — заполнится автоматически"
-                   value="{{ values.city }}">
-        </div>
-
-        <div class="form-row">
-            <label for="address">Адрес *</label>
-            <input type="text" id="address" name="address" required maxlength="255"
-                   placeholder="Выберите клуб — заполнится автоматически"
-                   value="{{ values.address }}">
         </div>
 
         <div class="form-row">
@@ -107,28 +110,14 @@
         </div>
 
         <div class="form-row">
-            <label for="booked_places">Занято вручную, доп. мест</label>
+            <label for="booked_places">Занято вручную</label>
             <input type="number" id="booked_places" name="booked_places"
                    min="0"
                    max="{{ (values.total_slots|int - actual_taken) if (values.total_slots and actual_taken is defined) else (values.total_slots or 100) }}"
                    step="1"
                    value="{{ values.booked_places }}"
                    data-actual-taken="{{ actual_taken if actual_taken is defined else 0 }}">
-            {% if actual_taken is defined %}
-            <small class="field-hint">
-                Через бота уже забронировано: {{ actual_taken }}
-                {% if game %}из {{ game.total_slots }}{% endif %}.
-                Это поле — ДОПОЛНИТЕЛЬНЫЕ места, занятые мимо бота (например, по телефону
-                или на месте), они складываются с реальными бронированиями. Например, при
-                1 брони через бота и total_slots=2 — поставьте здесь 1, чтобы игра считалась
-                полностью занятой (1 + 1 = 2). Список бронирований бота это поле не меняет.
-            </small>
-            {% else %}
-            <small class="field-hint">
-                Дополнительные места, занятые мимо бота (например, по телефону) —
-                складываются с реальными бронированиями бота, а не заменяют их.
-            </small>
-            {% endif %}
+            <small class="field-hint">Места, занятые мимо бота (по телефону или на сайте)</small>
         </div>
 
         <div class="form-actions">

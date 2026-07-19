@@ -700,6 +700,20 @@ def migrate_db():
     _migrate_admin_logs_table(cur)
     _migrate_clubs_table(cur)
     _migrate_club_info_table(cur)
+    # Подтянуть игры/тренировки к актуальной площадке из «О клубе».
+    cur.execute(
+        """SELECT name, city, address, contact_phone
+           FROM club_info ORDER BY id DESC LIMIT 1"""
+    )
+    info = cur.fetchone()
+    if info and ((info.get("city") or "").strip() or (info.get("address") or "").strip()):
+        _sync_primary_club_venue(
+            cur,
+            name=info.get("name") or "Padel Club",
+            city=(info.get("city") or "").strip(),
+            address=(info.get("address") or "").strip(),
+            phone=(info.get("contact_phone") or "").strip(),
+        )
     _create_indexes(cur)
     conn.commit()
     cur.close()
@@ -2789,22 +2803,36 @@ def update_club_info(
 
 
 def _sync_primary_club_venue(cur, name: str, city: str, address: str, phone: str = "") -> None:
-    """Одна площадка в clubs для выпадающего списка в формах игр/тренировок."""
+    """Одна площадка в clubs + перепривязка всех игр/тренировок на неё."""
     cur.execute("SELECT id FROM clubs ORDER BY id ASC LIMIT 1")
     row = cur.fetchone()
     if row:
+        club_id = row["id"]
         cur.execute(
             """UPDATE clubs
                SET name = %s, city = %s, address = %s, phone = %s
                WHERE id = %s""",
-            (name, city, address, phone, row["id"]),
+            (name, city, address, phone, club_id),
         )
     else:
         cur.execute(
             """INSERT INTO clubs (name, city, address, phone, description)
-               VALUES (%s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
             (name, city, address, phone, ""),
         )
+        club_id = cur.fetchone()["id"]
+
+    location = ", ".join(part for part in (name, city, address) if part)
+    cur.execute(
+        """UPDATE games
+           SET club_id = %s,
+               city = %s,
+               address = %s,
+               location = %s""",
+        (club_id, city, address, location),
+    )
+    # В списке выбора остаётся только актуальный клуб.
+    cur.execute("DELETE FROM clubs WHERE id != %s", (club_id,))
 
 
 def set_club_admin_telegram_id(telegram_id: int, username: str = None) -> None:
