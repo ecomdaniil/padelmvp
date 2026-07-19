@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -34,8 +35,7 @@ YOOKASSA_SHOP_ID = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
 YOOKASSA_SECRET_KEY = (os.getenv("YOOKASSA_SECRET_KEY") or "").strip()
 
 # IP-подсети ЮKassa для входящих webhook (документация ЮKassa).
-# Проверка мягкая: при PROXY/неизвестном IP логируем, но не режем жёстко
-# по умолчанию — см. YOOKASSA_WEBHOOK_ENFORCE_IP.
+# Включайте YOOKASSA_WEBHOOK_ENFORCE_IP=1 (по умолчанию в проде).
 YOOKASSA_WEBHOOK_IPS = frozenset({
     "185.71.76.0/27",
     "185.71.77.0/27",
@@ -45,6 +45,26 @@ YOOKASSA_WEBHOOK_IPS = frozenset({
     "77.75.154.128/25",
     "2a02:5180::/32",
 })
+
+
+def is_yookassa_webhook_ip(remote_ip: str) -> bool:
+    """True, если IP входит в опубликованные подсети ЮKassa."""
+    if not remote_ip:
+        return False
+    try:
+        ip = ipaddress.ip_address(remote_ip.split("%")[0].strip())
+    except ValueError:
+        return False
+    for entry in YOOKASSA_WEBHOOK_IPS:
+        try:
+            if "/" in entry:
+                if ip in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif ip == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def is_yookassa_configured() -> bool:
@@ -149,7 +169,7 @@ def create_yookassa_payment_sync(
         "POST",
         "/payments",
         body,
-        idempotence_key=str(uuid.uuid4()),
+        idempotence_key=f"yk-{payment_id}-{int(round(amount * 100))}",
     )
     return _normalize_payment(data)
 
@@ -175,7 +195,7 @@ async def create_yookassa_payment(
         "POST",
         "/payments",
         body,
-        idempotence_key=str(uuid.uuid4()),
+        idempotence_key=f"yk-{payment_id}-{int(round(amount * 100))}",
     )
     return _normalize_payment(data)
 

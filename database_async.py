@@ -317,7 +317,8 @@ _TAKEN_EXPR = (
 
 
 async def _games_underfill_in_window(start_interval: str, end_interval: str, extra_where: str) -> list:
-    """Игры с недобором состава в заданном окне до старта (Москва)."""
+    """Обычные игры с недобором состава в заданном окне до старта (Москва).
+    Тренировки сюда не попадают — их не отменяем из‑за недобора."""
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
@@ -331,6 +332,7 @@ async def _games_underfill_in_window(start_interval: str, end_interval: str, ext
             GROUP BY game_id
         ) bk ON bk.game_id = g.id
         WHERE COALESCE(g.underfill_cancelled, FALSE) = FALSE
+          AND COALESCE(g.event_type, 'game') = 'game'
           AND {_TAKEN_EXPR} < g.total_slots
           AND {_TAKEN_EXPR} > 0
           AND (g.game_date + g.game_time) BETWEEN {_LOCAL_NOW_EXPR} + INTERVAL '{start_interval}'
@@ -471,8 +473,10 @@ async def create_booking_safe(user_id: int, game_id: int, slots_count: int = 1) 
                 return {"status": "full", "booking": None, "game": game_dict, "free_slots": 0}
 
             # Меньше часа до старта — только полный выкуп оставшихся мест
-            # (даже если их > MAX_SLOTS_PER_BOOKING).
-            if timing["within_last_hour"]:
+            # (даже если их > MAX_SLOTS_PER_BOOKING). Для тренировок правило
+            # недобора не действует — частичная запись разрешена до старта.
+            is_training = (game_dict.get("event_type") or "game") == "training"
+            if timing["within_last_hour"] and not is_training:
                 if requested_slots != free_slots:
                     return {
                         "status": "must_fill_all",
@@ -550,12 +554,14 @@ async def get_game_slot_offer(game_id: int) -> Optional[dict]:
     free_slots = max(0, total - taken)
     if free_slots <= 0:
         return None
+    # Тренировки не отменяем по недобору — в последний час частичная запись ок.
+    is_training = (data.get("event_type") or "game") == "training"
     return {
         "game": data,
         "taken": taken,
         "total_slots": total,
         "free_slots": free_slots,
-        "within_last_hour": bool(data.get("within_last_hour")),
+        "within_last_hour": bool(data.get("within_last_hour")) and not is_training,
     }
 
 
@@ -566,6 +572,7 @@ async def get_active_bookings_for_user(user_id: int) -> list:
     rows = await pool.fetch(
         f"""
         SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots,
+               g.event_type, g.title,
                GREATEST(
                    0,
                    g.total_slots
@@ -657,7 +664,7 @@ async def increase_booking_slots_safe(
                     "free_slots": 0,
                 }
 
-            if timing["within_last_hour"]:
+            if timing["within_last_hour"] and (game_dict.get("event_type") or "game") != "training":
                 if requested != free_slots:
                     return {
                         "status": "must_fill_all",
@@ -698,20 +705,24 @@ async def increase_booking_slots_safe(
                    FOR UPDATE""",
                 booking_id,
             )
-            if open_pending is not None:
+            if open_pending is not None and not open_pending["provider_payment_id"]:
+                # Неоплаченный счёт без живой ссылки провайдера — можно
+                # просто увеличить сумму. Если уже есть provider_payment_id,
+                # не трогаем его (иначе старый счёт ЮKassa может пройти, а
+                # локальная сумма/ссылка уже другие) — создаём отдельную доплату.
                 payment = await conn.fetchrow(
                     """UPDATE payments
-                       SET amount = amount + $1,
-                           provider_payment_id = NULL,
-                           confirmation_url = NULL,
-                           method = NULL
+                       SET amount = amount + $1
                        WHERE id = $2
                          AND status = 'ожидает'
                          AND player_notified_at IS NULL
+                         AND provider_payment_id IS NULL
                        RETURNING *""",
                     extra_amount, open_pending["id"],
                 )
             else:
+                payment = None
+            if payment is None:
                 payment = await conn.fetchrow(
                     """INSERT INTO payments (booking_id, amount, status, method)
                        VALUES ($1, $2, 'ожидает', NULL) RETURNING *""",
@@ -737,7 +748,8 @@ async def get_past_bookings_for_user(user_id: int) -> list:
     pool = await get_pool()
     rows = await pool.fetch(
         f"""
-        SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots
+        SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots,
+               g.event_type, g.title
         FROM bookings b
         JOIN games g ON g.id = b.game_id
         WHERE b.user_id = $1
@@ -790,6 +802,9 @@ async def cancel_underfilled_game(game_id: int) -> dict:
             )
             if game is None:
                 return {"status": "not_found", "game": None, "cancelled": []}
+            if (game["event_type"] or "game") == "training":
+                # Тренировки не автоотменяем при недоборе.
+                return {"status": "full", "game": _to_dict(game), "cancelled": []}
             if game["underfill_cancelled"]:
                 return {"status": "already", "game": _to_dict(game), "cancelled": []}
 
@@ -899,29 +914,28 @@ async def get_booking_cancel_info(booking_id: int, user_id: int) -> dict:
         return {"status": "not_found"}
     if not game["still_upcoming"] or game.get("underfill_cancelled"):
         return {"status": "too_late", "game": _to_dict(game)}
-    payment = await pool.fetchrow(
+    payment_rows = await pool.fetch(
         """
         SELECT * FROM payments
         WHERE booking_id = $1
         ORDER BY id DESC
-        LIMIT 1
         """,
         booking_id,
     )
-    payment_dict = _to_dict(payment)
-    pending_confirm = bool(
-        payment_dict
-        and payment_dict.get("status") == "ожидает"
-        and payment_dict.get("player_notified_at") is not None
+    payments = [_to_dict(p) for p in payment_rows]
+    pending_confirm = any(
+        p.get("status") == "ожидает" and p.get("player_notified_at") is not None
+        for p in payments
     )
-    had_confirmed = bool(payment_dict and payment_dict.get("status") == "подтверждена")
+    had_confirmed = any(p.get("status") == "подтверждена" for p in payments)
+    latest = payments[0] if payments else None
     return {
         "status": "ok",
         "refund_window": bool(game["refund_window"]),
         "payment_pending_confirm": pending_confirm,
         "had_confirmed_payment": had_confirmed,
         "game": _to_dict(game),
-        "payment": payment_dict,
+        "payment": latest,
         "booking": _to_dict(booking),
     }
 
@@ -1129,34 +1143,25 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                 return {"status": "too_late", "game": _to_dict(game)}
             refund_window = bool(game["refund_window"])
 
-            latest_payment = await conn.fetchrow(
+            # Все платежи брони: после докупки может быть несколько строк
+            # (старый «подтверждена» + новый «ожидает»).
+            all_payments = await conn.fetch(
                 """SELECT * FROM payments
                    WHERE booking_id = $1
-                   ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                   FOR UPDATE""",
                 booking_id,
             )
-            # Игрок уже нажал «Я оплатил», админ ещё не подтвердил — отмена
-            # запрещена, пока статус не станет «подтверждена» (или не сменится
-            # иначе в CRM). Иначе можно было бы отменить бронь «между» оплатой
-            # и проверкой администратора.
-            if (
-                latest_payment is not None
-                and latest_payment["status"] == "ожидает"
-                and latest_payment["player_notified_at"] is not None
+            if any(
+                p["status"] == "ожидает" and p["player_notified_at"] is not None
+                for p in all_payments
             ):
                 return {"status": "payment_pending_confirm"}
 
-            confirmed_payment = (
-                latest_payment
-                if latest_payment is not None and latest_payment["status"] == "подтверждена"
-                else None
-            )
-            # «Была оплата» для текстов бота — только подтверждённая. Платёж
-            # «ожидает» при отмене до оплаты удаляем (см. ниже) и в CRM он
-            # больше не должен светиться в разделе «Оплаты».
-            had_payment = confirmed_payment is not None
-
-            refund_eligible = refund_window and confirmed_payment is not None
+            confirmed_payments = [
+                p for p in all_payments if p["status"] == "подтверждена"
+            ]
+            had_payment = bool(confirmed_payments)
+            refund_eligible = refund_window and had_payment
             admin_notify_message_id = booking["admin_notify_message_id"]
             admin_extra_notify_message_id = booking.get("admin_extra_notify_message_id")
             payment_deleted = False
@@ -1172,22 +1177,26 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
 
             payment_result = None
             if refund_eligible:
-                payment_result = await conn.fetchrow(
-                    "UPDATE payments SET status = 'возврат' WHERE id = $1 RETURNING *",
-                    confirmed_payment["id"],
-                )
-            else:
-                # Отмена до оплаты (или без подтверждённого платежа) — удаляем
-                # «ожидающие» платежи, чтобы они исчезли из CRM «Оплаты».
-                deleted = await conn.execute(
-                    "DELETE FROM payments WHERE booking_id = $1 AND status = 'ожидает'",
-                    booking_id,
-                )
-                # asyncpg execute возвращает строку вида "DELETE N"
-                try:
-                    payment_deleted = int(str(deleted).split()[-1]) > 0
-                except (ValueError, IndexError):
-                    payment_deleted = True
+                for p in confirmed_payments:
+                    payment_result = await conn.fetchrow(
+                        "UPDATE payments SET status = 'возврат' WHERE id = $1 RETURNING *",
+                        p["id"],
+                    )
+
+            # Удаляем только неоплаченные «ожидает». Оплаченные, но ещё не
+            # подтверждённые админом (player_notified_at) сюда не попадают —
+            # выше уже payment_pending_confirm.
+            deleted = await conn.execute(
+                """DELETE FROM payments
+                   WHERE booking_id = $1
+                     AND status = 'ожидает'
+                     AND player_notified_at IS NULL""",
+                booking_id,
+            )
+            try:
+                payment_deleted = int(str(deleted).split()[-1]) > 0
+            except (ValueError, IndexError):
+                payment_deleted = True
 
             return {
                 "status": "ok",

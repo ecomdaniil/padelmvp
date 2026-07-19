@@ -32,6 +32,9 @@
             <td>{{ b.user_phone }}</td>
             <td>
                 <span class="game-number-tag">№{{ b.game_id }}</span>
+                {% if b.event_type == 'training' %}
+                    {% if b.title %}<b>{{ b.title }}</b> · {% endif %}тренировка ·
+                {% endif %}
                 {{ b.game_date.strftime('%d.%m.%Y') }} {{ b.game_time.strftime('%H:%M') }} — {{ b.location }}
             </td>
             <td>{{ b.slots_count or 1 }}</td>

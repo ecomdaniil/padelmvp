@@ -917,8 +917,8 @@ def get_games_paginated(
 
 
 def get_all_games_with_stats():
-    """Все игры с занятыми местами/собранными оплатами одним запросом.
-    Используется для Excel-отчёта, чтобы не делать 2 запроса на каждую игру."""
+    """Обычные игры (не тренировки) с занятыми местами/оплатами одним запросом.
+    Используется для Excel-отчёта со вкладки «Игры»."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -940,6 +940,7 @@ def get_all_games_with_stats():
             WHERE p.status = 'подтверждена'
             GROUP BY b.game_id
         ) pm ON pm.game_id = g.id
+        WHERE COALESCE(g.event_type, 'game') = 'game'
         ORDER BY g.game_date DESC, g.game_time DESC
         """
     )
@@ -1260,6 +1261,7 @@ def get_bookings_paginated(search: str = "", status: str = "", page: int = 1, pe
         f"""
         SELECT b.*, u.name AS user_name, u.phone AS user_phone,
                g.game_date, g.game_time, g.location,
+               g.event_type, g.title,
                COUNT(*) OVER() AS total_count
         FROM bookings b
         JOIN users u ON u.id = b.user_id
@@ -1565,12 +1567,19 @@ def get_payments_filtered(search: str = "", status: str = ""):
 
 
 def delete_pending_payments_for_booking(booking_id: int) -> int:
-    """Удаляет платежи со статусом «ожидает» по заявке — заявка отменена
-    до реальной оплаты, в разделе «Оплаты» такие строки не нужны."""
+    """Удаляет неоплаченные платежи «ожидает» по заявке.
+    Строки, где игрок уже сообщил об оплате (player_notified_at) или есть
+    provider_payment_id, не трогаем — иначе теряется след денег."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "DELETE FROM payments WHERE booking_id = %s AND status = 'ожидает'",
+        """
+        DELETE FROM payments
+        WHERE booking_id = %s
+          AND status = 'ожидает'
+          AND player_notified_at IS NULL
+          AND (provider_payment_id IS NULL OR provider_payment_id = '')
+        """,
         (booking_id,),
     )
     deleted = cur.rowcount
@@ -1578,6 +1587,44 @@ def delete_pending_payments_for_booking(booking_id: int) -> int:
     cur.close()
     conn.close()
     return deleted
+
+
+def mark_confirmed_payments_refund_for_booking(booking_id: int) -> int:
+    """При отмене заявки админом — все подтверждённые оплаты → «возврат»."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE payments SET status = 'возврат'
+        WHERE booking_id = %s AND status = 'подтверждена'
+        """,
+        (booking_id,),
+    )
+    updated = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return updated
+
+
+def booking_has_notified_pending_payment(booking_id: int) -> bool:
+    """Есть ли оплата, которую игрок уже отправил, но админ ещё не подтвердил."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1 FROM payments
+        WHERE booking_id = %s
+          AND status = 'ожидает'
+          AND player_notified_at IS NOT NULL
+        LIMIT 1
+        """,
+        (booking_id,),
+    )
+    found = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return found
 
 
 def get_payments_paginated(search: str = "", status: str = "", page: int = 1, per_page: int = 20):
@@ -1637,14 +1684,22 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
 
 
 def confirm_payment(payment_id: int):
-    """Атомарно подтверждает только платёж в статусе «ожидает».
-    Возвращает обновлённую строку или None (уже подтверждён / возврат / нет)."""
+    """Атомарно подтверждает только платёж в статусе «ожидает» у активной
+    (не отменённой) заявки. Возвращает обновлённую строку или None."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """UPDATE payments SET status = 'подтверждена',
-               player_notified_at = COALESCE(player_notified_at, NOW())
-           WHERE id = %s AND status = 'ожидает' RETURNING *""",
+        """
+        UPDATE payments p
+           SET status = 'подтверждена',
+               player_notified_at = COALESCE(p.player_notified_at, NOW())
+          FROM bookings b
+         WHERE p.id = %s
+           AND p.booking_id = b.id
+           AND p.status = 'ожидает'
+           AND b.status != 'отменена'
+         RETURNING p.*
+        """,
         (payment_id,),
     )
     updated = cur.fetchone()
@@ -1743,24 +1798,35 @@ def register_provider_payment_awaiting_admin(
     """Webhook провайдера: деньги пришли, статус остаётся «ожидает»,
     выставляем player_notified_at — админ подтвердит в CRM.
 
+    Вызывать только после проверки платежа через API провайдера.
+    Привязка по local_payment_id разрешена лишь если у строки ещё нет
+    другого provider_payment_id (нельзя перезаписать чужим id).
+
     Возвращает {"status": "ok"|"already"|"already_notified"|"not_found"|
-                "mismatch"|"forbidden", "payment": row|None}.
+                "mismatch"|"forbidden"|"cancelled", "payment": row|None}.
     """
+    if not provider_payment_id or expected_amount is None:
+        return {"status": "mismatch", "payment": None}
+
     payment = get_payment_by_provider_id(provider_payment_id)
     if payment is None and local_payment_id:
         local = get_payment_by_id(local_payment_id)
-        if local and local.get("status") == "ожидает":
+        if local is None:
+            return {"status": "not_found", "payment": None}
+        if local.get("status") != "ожидает":
+            return {"status": "forbidden", "payment": local}
+        existing_provider = (local.get("provider_payment_id") or "").strip()
+        if existing_provider and existing_provider != str(provider_payment_id):
+            # Не даём webhook подменить уже привязанный provider id.
+            return {"status": "forbidden", "payment": local}
+        if not existing_provider:
             attach_provider_payment(
                 int(local["id"]),
                 provider_payment_id,
                 local.get("confirmation_url") or "",
                 method=payment_method or "yookassa",
             )
-            payment = get_payment_by_provider_id(provider_payment_id)
-        elif local is None:
-            return {"status": "not_found", "payment": None}
-        else:
-            payment = local
+        payment = get_payment_by_id(int(local["id"]))
 
     if payment is None:
         return {"status": "not_found", "payment": None}
@@ -1768,9 +1834,13 @@ def register_provider_payment_awaiting_admin(
         return {"status": "already", "payment": payment}
     if payment.get("status") != "ожидает":
         return {"status": "forbidden", "payment": payment}
-    if expected_amount is not None:
-        if abs(float(payment["amount"]) - float(expected_amount)) > 0.009:
-            return {"status": "mismatch", "payment": payment}
+    if abs(float(payment["amount"]) - float(expected_amount)) > 0.009:
+        return {"status": "mismatch", "payment": payment}
+
+    # Не отмечаем оплату по уже отменённой заявке.
+    booking = get_booking_by_id(int(payment["booking_id"])) if payment.get("booking_id") else None
+    if booking and booking.get("status") == "отменена":
+        return {"status": "cancelled", "payment": payment}
 
     if payment_method:
         set_payment_method_sync(int(payment["id"]), payment_method)
@@ -1832,8 +1902,8 @@ def get_payment_notification_context(payment_id: int):
         """
         SELECT p.id AS payment_id, p.amount, p.status, p.method,
                u.telegram_id, u.name AS user_name, u.phone AS user_phone,
-               b.id AS booking_id, b.slots_count,
-               g.game_date, g.game_time, g.location
+               b.id AS booking_id, b.slots_count, b.status AS booking_status,
+               g.game_date, g.game_time, g.location, g.event_type, g.title
         FROM payments p
         JOIN bookings b ON b.id = p.booking_id
         JOIN users u ON u.id = b.user_id

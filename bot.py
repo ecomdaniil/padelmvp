@@ -79,7 +79,11 @@ _ADMIN_CHAT_IDS_ENV = [
 ]
 # Обратная совместимость: старый код и проверки читают «первый» id.
 ADMIN_CHAT_ID = _ADMIN_CHAT_IDS_ENV[0] if _ADMIN_CHAT_IDS_ENV else None
-ADMIN_BIND_TOKEN = (os.getenv("ADMIN_BIND_TOKEN") or "").strip()
+_ADMIN_BIND_TOKEN_RAW = (os.getenv("ADMIN_BIND_TOKEN") or "").strip()
+ADMIN_BIND_TOKEN = _ADMIN_BIND_TOKEN_RAW if len(_ADMIN_BIND_TOKEN_RAW) >= 24 else ""
+ADMIN_BIND_ALLOW_REBIND = os.getenv("ADMIN_BIND_ALLOW_REBIND", "0").lower() in {
+    "1", "true", "yes",
+}
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 _FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY") or ""
@@ -88,12 +92,19 @@ WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN") or (
     if _FLASK_SECRET_KEY
     else ""
 )
+# Простые антибрут-лимиты для /bindadmin (in-process).
+_bindadmin_fails: dict[int, list[float]] = {}
+_BINDADMIN_MAX_FAILS = 5
+_BINDADMIN_FAIL_WINDOW_SEC = 900.0
 
 # По умолчанию логируем только ошибки — это отдельно настраиваемо через .env,
 # если для отладки понадобится более подробный вывод (INFO/DEBUG).
 LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.ERROR))
 logger = logging.getLogger(__name__)
+
+if _ADMIN_BIND_TOKEN_RAW and not ADMIN_BIND_TOKEN:
+    logger.error("ADMIN_BIND_TOKEN короче 24 символов — /bindadmin отключён")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -752,7 +763,7 @@ def _game_format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сингл (2 игрока)", callback_data="games_format:2")],
         [InlineKeyboardButton(text="Классика (4 игрока)", callback_data="games_format:4")],
-        [InlineKeyboardButton(text="💪 Тренировки", callback_data="games_format:training")],
+        [InlineKeyboardButton(text="Тренировки", callback_data="games_format:training")],
     ])
 
 
@@ -883,7 +894,7 @@ async def _show_trainings(message: Message, telegram_id: Optional[int] = None):
         return
 
     await message.answer(
-        "💪 <b>Ближайшие тренировки</b>\n"
+        "<b>Ближайшие тренировки</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Выбери занятие и нажми «Записаться»:",
         parse_mode="HTML",
@@ -928,7 +939,11 @@ async def _show_my_bookings(message: Message):
         status_emoji = "✅" if b['status'] == 'подтверждена' else "⏳"
         free_slots = int(b.get("free_slots") or 0)
         total_slots = int(b.get("total_slots") or 0)
-        text = (
+        is_training = (b.get("event_type") or "game") == "training"
+        text = ""
+        if is_training and b.get("title"):
+            text += f"<b>{_html(b['title'])}</b>\n"
+        text += (
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
             f"👥 Твоих мест: {b.get('slots_count', 1)}\n"
@@ -997,6 +1012,8 @@ async def _show_past_bookings(message: Message):
             f"👥 Мест: {b.get('slots_count', 1)}\n"
             f"{status_line}"
         )
+        if (b.get("event_type") or "game") == "training" and b.get("title"):
+            text = f"<b>{_html(b['title'])}</b>\n" + text
         return text, None
 
     sends = [_send_answer(message, *_past_card(b)) for b in bookings]
@@ -1164,28 +1181,57 @@ async def show_coach_detail(callback: CallbackQuery):
 @router.message(Command("bindadmin"))
 async def cmd_bindadmin(message: Message):
     """Привязка Telegram ID админа: /bindadmin <токен из ADMIN_BIND_TOKEN>.
-    Нужно, если на Render не задан ADMIN_CHAT_ID и связь с админом «недоступна»."""
+    Нужно, если на Render не задан ADMIN_CHAT_ID и связь с админом «недоступна».
+
+    Защиты: длинный токен (≥24), rate-limit ошибок, по умолчанию нельзя
+    перезаписать уже привязанного админа (ADMIN_BIND_ALLOW_REBIND=1)."""
     parts = (message.text or "").split(maxsplit=1)
     token = parts[1].strip() if len(parts) > 1 else ""
+    tg_id = int(message.from_user.id) if message.from_user else 0
     if not ADMIN_BIND_TOKEN:
         await message.answer(
             "Привязка через бота выключена. Укажи ADMIN_CHAT_ID в env "
             "или Telegram ID в CRM → «О клубе»."
         )
         return
-    if not token or not secrets.compare_digest(token, ADMIN_BIND_TOKEN):
+
+    now = time.monotonic()
+    fails = [t for t in _bindadmin_fails.get(tg_id, []) if now - t < _BINDADMIN_FAIL_WINDOW_SEC]
+    _bindadmin_fails[tg_id] = fails
+    if len(fails) >= _BINDADMIN_MAX_FAILS:
+        await message.answer("Слишком много попыток. Попробуй позже.")
+        return
+
+    token_ok = (
+        bool(token)
+        and len(token) == len(ADMIN_BIND_TOKEN)
+        and secrets.compare_digest(token, ADMIN_BIND_TOKEN)
+    )
+    if not token_ok:
+        _bindadmin_fails.setdefault(tg_id, []).append(now)
         await message.answer("❌ Неверный токен.")
         return
+
+    if not ADMIN_BIND_ALLOW_REBIND:
+        existing = await db.get_club_admin_telegram_id()
+        if existing and int(existing) != tg_id:
+            await message.answer(
+                "Администратор уже привязан. Смени ADMIN_CHAT_ID в env "
+                "или задай ADMIN_BIND_ALLOW_REBIND=1 для перепривязки."
+            )
+            return
+
     try:
-        await db.set_club_admin_telegram_id(message.from_user.id)
+        await db.set_club_admin_telegram_id(tg_id)
     except Exception as e:
         logger.error("bindadmin failed: %s", e)
         await message.answer("❌ Не удалось сохранить. Попробуй позже.")
         return
+    _bindadmin_fails.pop(tg_id, None)
     global _admin_ids_cache
     _admin_ids_cache = None
     await message.answer(
-        f"✅ Готово. Твой Telegram ID <code>{message.from_user.id}</code> "
+        f"✅ Готово. Твой Telegram ID <code>{tg_id}</code> "
         "сохранён как администратор бота.\n"
         "Теперь «Связаться с администратором» будет работать.",
         parse_mode="HTML",
@@ -1362,9 +1408,16 @@ async def _notify_admin_new_booking(
     game_datetime = (
         f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
     )
+    is_training = (game.get("event_type") or "game") == "training"
+    title_line = ""
+    if is_training and game.get("title"):
+        title_line = f"Тренировка: <b>{_html(game['title'])}</b>\n"
+    elif is_training:
+        title_line = "Тренировка\n"
     notification_text = (
         "🔔 <b>Новая запись на корт!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{title_line}"
         f"👤 Имя: {_html(user['name'])}\n"
         f"📞 Телефон: {_html(user['phone'])}\n"
         f"📅 Дата и время: {_html(game_datetime)}\n"
@@ -1635,8 +1688,14 @@ async def process_booking_confirm(callback: CallbackQuery):
         await _notify_admin_new_booking(
             callback.bot, user, game, booking_id, slots_count, total_price,
         )
+        is_training = (game.get("event_type") or "game") == "training"
+        event_word = "тренировку" if is_training else "игру"
+        title_bit = ""
+        if is_training and game.get("title"):
+            title_bit = f" «{_html(game['title'])}»"
         await callback.message.answer(
-            f"✅ Ты записан на игру {game['game_date'].strftime('%d.%m.%Y')} "
+            f"✅ Ты записан на {event_word}{title_bit} "
+            f"{game['game_date'].strftime('%d.%m.%Y')} "
             f"в {str(game['game_time'])[:5]}!\n\n"
             f"👥 Мест: <b>{slots_count}</b>\n"
             f"💰 К оплате: <b>{total_price:.0f} ₽</b>\n"
@@ -1647,14 +1706,19 @@ async def process_booking_confirm(callback: CallbackQuery):
         )
         taken = int(result.get("taken") or 0)
         total_slots = int(result.get("total_slots") or game["total_slots"])
-        if taken and taken < total_slots:
+        if not is_training and taken and taken < total_slots:
             await callback.message.answer(
                 _underfill_booking_notice(taken, total_slots),
                 parse_mode="HTML",
             )
     else:
+        event_word = (
+            "тренировку"
+            if (game.get("event_type") or "game") == "training"
+            else "игру"
+        )
         await callback.message.answer(
-            "Ты уже записан на эту игру — продолжаем оплату.\n"
+            f"Ты уже записан на эту {event_word} — продолжаем оплату.\n"
             "Отменить можно кнопкой ниже или в «📋 Мои записи».",
             reply_markup=main_menu_keyboard(),
         )
@@ -1808,7 +1872,8 @@ async def process_buy_more_confirm(callback: CallbackQuery):
     )
     taken = int(result.get("taken") or 0)
     total_slots = int(result.get("total_slots") or game["total_slots"])
-    if taken and taken < total_slots:
+    is_training = (game.get("event_type") or "game") == "training"
+    if not is_training and taken and taken < total_slots:
         await callback.message.answer(
             _underfill_booking_notice(taken, total_slots),
             parse_mode="HTML",
@@ -1883,9 +1948,14 @@ def _payment_header(game: dict, amount: float) -> str:
     game_dt = (
         f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
     )
+    is_training = (game.get("event_type") or "game") == "training"
+    title_line = ""
+    if is_training and game.get("title"):
+        title_line = f"<b>{_html(game['title'])}</b>\n"
     return (
         "💳 <b>Оплата</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{title_line}"
         f"📅 {_html(game_dt)}\n"
         f"📍 {_html(game['location'])}\n"
         f"💰 Сумма: <b>{amount:.0f} ₽</b>\n\n"
@@ -1983,19 +2053,34 @@ async def _replace_payment_message(
         return await message.answer(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
-async def _send_telegram_invoice(message: Message, payment: dict) -> None:
+async def _send_telegram_invoice(
+    message: Message, payment: dict, game: Optional[dict] = None,
+) -> None:
     """Настоящий счёт Telegram Payments (PayMaster / ЮKassa через BotFather)."""
     provider_token = os.getenv("PAYMENT_PROVIDER_TOKEN") or ""
     if not provider_token:
         raise RuntimeError("PAYMENT_PROVIDER_TOKEN не задан")
     amount = float(payment["amount"])
+    is_training = bool(game) and (game.get("event_type") or "game") == "training"
+    if is_training and game.get("title"):
+        title = f"Тренировка: {game['title']}"[:32]
+        label = "Тренировка"
+        description = f"{game['title']} · бронь #{payment['booking_id']} на {amount:.0f} ₽"
+    elif is_training:
+        title = "Оплата тренировки"
+        label = "Тренировка"
+        description = f"Бронирование #{payment['booking_id']} на {amount:.0f} ₽"
+    else:
+        title = "Оплата игры в падел"
+        label = "Игра в падел"
+        description = f"Бронирование #{payment['booking_id']} на {amount:.0f} ₽"
     await message.answer_invoice(
-        title="Оплата игры в падел",
-        description=f"Бронирование #{payment['booking_id']} на {amount:.0f} ₽",
+        title=title,
+        description=description[:255],
         payload=f"payment:{payment['id']}",
         provider_token=provider_token,
         currency="RUB",
-        prices=[LabeledPrice(label="Игра в падел", amount=int(round(amount * 100)))],
+        prices=[LabeledPrice(label=label, amount=int(round(amount * 100)))],
     )
 
 
@@ -2013,11 +2098,18 @@ async def _ensure_yookassa_pay_url(
     game_dt = (
         f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
     )
+    is_training = (game.get("event_type") or "game") == "training"
+    if is_training and game.get("title"):
+        desc = f"Тренировка «{game['title']}»: бронь #{payment['booking_id']} ({game_dt})"
+    elif is_training:
+        desc = f"Тренировка: бронь #{payment['booking_id']} ({game_dt})"
+    else:
+        desc = f"Падел: бронь #{payment['booking_id']} ({game_dt})"
     yk = await payment_provider.create_yookassa_payment(
         amount=float(payment["amount"]),
         payment_id=int(payment["id"]),
         booking_id=int(payment["booking_id"]),
-        description=f"Падел: бронь #{payment['booking_id']} ({game_dt})",
+        description=desc[:250],
         return_url=await _payment_return_url(bot),
         customer_phone=user.get("phone"),
     )
@@ -2127,7 +2219,7 @@ async def process_pay_method_sbp(callback: CallbackQuery):
     if not pay_url and payment_provider.is_card_provider_configured():
         try:
             await db.set_payment_method_owned(payment_id, user["id"], "sbp")
-            await _send_telegram_invoice(callback.message, payment)
+            await _send_telegram_invoice(callback.message, payment, game)
         except Exception as e:
             logger.error("Не удалось отправить invoice #%s: %s", payment_id, e)
             await callback.message.answer(
@@ -2165,7 +2257,9 @@ async def process_pay_open(callback: CallbackQuery):
 
     try:
         await db.set_payment_method_owned(payment_id, user["id"], "sbp")
-        await _send_telegram_invoice(callback.message, payment)
+        booking = await db.get_booking_by_id(payment["booking_id"])
+        game = await db.get_game_by_id(booking["game_id"]) if booking else None
+        await _send_telegram_invoice(callback.message, payment, game)
     except Exception as e:
         logger.error("pay_open invoice failed #%s: %s", payment_id, e)
         await callback.message.answer("❌ Не удалось открыть счёт. Попробуй позже.")
@@ -2482,9 +2576,9 @@ async def process_paid_notify(callback: CallbackQuery):
 
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Telegram даёт ~10 секунд на ответ. Сначала быстро подтверждаем
-    наш payload (без тяжёлых round-trip к Neon), иначе PayMaster «висит»
-    и successful_payment может не дойти. Полная сверка — в successful_payment."""
+    """Telegram даёт ~10 секунд на ответ. Сверяем владельца/статус/сумму;
+    при таймауте или ошибке БД — отклоняем (fail-closed), чтобы не списать
+    деньги по невалидному/чужому платежу."""
     payload = pre_checkout_query.invoice_payload or ""
     try:
         prefix, raw_id = payload.split(":", 1)
@@ -2496,8 +2590,6 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
         await pre_checkout_query.answer(ok=False, error_message="Некорректный платёж.")
         return
 
-    # Быстрый путь: подтверждаем сразу. Если БД ответит быстро — дополнительно
-    # сверим сумму/статус и при расхождении отклоним.
     try:
         user = await asyncio.wait_for(
             _require_registered(pre_checkout_query.from_user.id),
@@ -2519,9 +2611,14 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
             return
     except (asyncio.TimeoutError, Exception) as e:
         logger.warning(
-            "pre_checkout: быстрая проверка не успела/упала (#%s): %s — подтверждаем по payload",
+            "pre_checkout: проверка не успела/упала (#%s): %s — отклоняем",
             payment_id, e,
         )
+        await pre_checkout_query.answer(
+            ok=False,
+            error_message="Временная ошибка. Попробуй ещё раз через минуту.",
+        )
+        return
 
     await pre_checkout_query.answer(ok=True)
 
@@ -2613,6 +2710,21 @@ async def process_successful_payment(message: Message):
         await message.answer(
             "⚠️ Сумма в чеке отличается от ожидаемой. Администратор проверит оплату вручную."
         )
+        try:
+            await _notify_admin_player_paid(
+                message.bot,
+                user=user,
+                payment=payment,
+                telegram_user=message.from_user,
+                source="PayMaster / Telegram Payments (MISMATCH)",
+                extra_lines=(
+                    f"⚠️ Сумма чека {paid_amount / 100:.0f} ₽ ≠ ожидаемым "
+                    f"{expected / 100:.0f} ₽ — не отмечено как оплачено автоматически."
+                ),
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить админа о mismatch #%s: %s", payment_id, e)
+        return
 
     if payment.get("status") == "подтверждена":
         return
@@ -2971,8 +3083,14 @@ async def _send_reminder_batch(
     for game in games:
         participants = await db.get_participants_for_game(game["id"])
         game_dt = f"{game['game_date'].strftime('%d.%m.%Y')} в {str(game['game_time'])[:5]}"
+        is_training = (game.get("event_type") or "game") == "training"
+        event_word = "тренировка" if is_training else "игра в падел"
         text = (
-            f"⏰ <b>Напоминание!</b> {label} у тебя игра в падел:\n"
+            f"⏰ <b>Напоминание!</b> {label} у тебя {event_word}:\n"
+        )
+        if is_training and game.get("title"):
+            text += f"<b>{_html(game['title'])}</b>\n"
+        text += (
             f"📅 {_html(game_dt)}\n"
             f"📍 {_html(game['location'])}\n\n"
             "Если не сможешь прийти — нажми «Не смогу», место освободится "
@@ -2981,7 +3099,8 @@ async def _send_reminder_batch(
         if include_refund_notice:
             deadline = _refund_deadline_str(game)
             text += (
-                "\n\n⚠️ Важно: при отмене менее чем за 12 часов до начала игры "
+                "\n\n⚠️ Важно: при отмене менее чем за 12 часов до начала "
+                f"{'тренировки' if is_training else 'игры'} "
                 f"возврат средств невозможен. Крайний срок для отмены с возвратом — "
                 f"<b>{_html(deadline)}</b>."
             )

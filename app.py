@@ -96,17 +96,20 @@ if not FLASK_SECRET_KEY:
     )
 app.secret_key = FLASK_SECRET_KEY
 
-# Render/прокси: реальный клиентский IP и HTTPS из X-Forwarded-*.
-# Нужно для корректного rate-limit (иначе все запросы = один IP прокси).
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+# ProxyFix только за реальным reverse-proxy (Render / TRUST_PROXY=1).
+# Иначе клиент может подделать X-Forwarded-For и обойти rate-limit.
+_TRUST_PROXY = _IS_RENDER or os.getenv("TRUST_PROXY", "0").lower() in {"1", "true", "yes"}
+if _TRUST_PROXY:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # Cookie сессии: недоступны из JS, не передаются на сторонние сайты.
-# SESSION_COOKIE_SECURE по умолчанию выключен, чтобы не сломать локальный
-# запуск по HTTP — в production (за HTTPS) обязательно включите
-# SESSION_COOKIE_SECURE=1 в .env.
+# На Render / при TRUST_PROXY по умолчанию Secure=1 (HTTPS). Локально HTTP — 0.
+_secure_default = "1" if _TRUST_PROXY else "0"
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
+app.config["SESSION_COOKIE_SECURE"] = os.getenv(
+    "SESSION_COOKIE_SECURE", _secure_default
+).lower() in {"1", "true", "yes"}
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
     hours=int(os.getenv("SESSION_LIFETIME_HOURS", "12"))
 )
@@ -932,6 +935,19 @@ def _render_events_list(event_type: str):
 def _event_form_context(event_type: str, game=None, values=None, actual_taken=None):
     clubs = db.get_all_clubs()
     coaches = db.get_all_coaches(active_only=True)
+    # При редактировании оставляем текущего тренера в списке, даже если он скрыт.
+    current_coach_id = None
+    if values and values.get("coach_id"):
+        try:
+            current_coach_id = int(values["coach_id"])
+        except (TypeError, ValueError):
+            current_coach_id = None
+    elif game and game.get("coach_id"):
+        current_coach_id = game["coach_id"]
+    if current_coach_id and not any(c["id"] == current_coach_id for c in coaches):
+        current = db.get_coach_by_id(current_coach_id)
+        if current:
+            coaches = list(coaches) + [current]
     ctx = {
         "game": game,
         "values": values if values is not None else _game_values_from_row(game, event_type),
@@ -1109,10 +1125,16 @@ def _event_delete(game_id: int, event_type: str):
     # или подтверждёнными платежами (история/возвраты пропадут).
     active_taken = db.count_bookings_for_game(game_id)
     if active_taken > 0:
-        flash(
-            f"Нельзя удалить {label.lower()} с активными записями. "
-            "Сначала отмените заявки в разделе «Заявки» или дождитесь автоотмены."
-        )
+        if event_type == "training":
+            flash(
+                f"Нельзя удалить {label.lower()} с активными записями. "
+                "Сначала отмените заявки в разделе «Заявки»."
+            )
+        else:
+            flash(
+                f"Нельзя удалить {label.lower()} с активными записями. "
+                "Сначала отмените заявки в разделе «Заявки» или дождитесь автоотмены."
+            )
         return redirect(url_for(list_endpoint))
     confirmed_sum = db.get_confirmed_payments_sum_for_game(game_id) or 0
     if float(confirmed_sum) > 0:
@@ -1202,6 +1224,7 @@ def coach_new():
             is_active=values["is_active"],
             sort_order=sort_order,
         )
+        cache.invalidate_games_cache()
         log_admin_action(
             "create", "coach", coach["id"],
             description=f"Тренер «{coach['name']}» добавлен",
@@ -1242,6 +1265,7 @@ def coach_edit(coach_id):
             is_active=values["is_active"],
             sort_order=sort_order,
         )
+        cache.invalidate_games_cache()
         log_admin_action(
             "update", "coach", coach_id,
             description=f"Тренер «{updated['name']}» обновлён",
@@ -1260,6 +1284,7 @@ def coach_hide(coach_id):
     if not coach:
         flash("Тренер не найден")
     else:
+        cache.invalidate_games_cache()
         log_admin_action(
             "update", "coach", coach_id,
             description=f"Тренер «{coach['name']}» скрыт из бота",
@@ -1296,6 +1321,14 @@ def booking_update_status(booking_id):
     if new_status not in BOOKING_STATUSES:
         flash("Недопустимый статус заявки")
         return redirect(url_for("bookings_list"))
+
+    if new_status == "отменена" and db.booking_has_notified_pending_payment(booking_id):
+        flash(
+            "Нельзя отменить заявку: игрок уже отправил оплату, "
+            "сначала подтвердите или оформите возврат в «Оплаты»."
+        )
+        return redirect(url_for("bookings_list"))
+
     # Один запрос вместо двух (get_booking_by_id + update_booking_status) —
     # old_status получаем прямо из UPDATE, см. update_booking_status_and_get.
     updated = db.update_booking_status_and_get(booking_id, new_status)
@@ -1322,9 +1355,12 @@ def booking_update_status(booking_id):
     cache.invalidate_games_cache()
     user_name = updated.get("user_name") or "—"
     if new_status == "отменена":
-        # Отмена до оплаты — убираем «висящий» платёж из раздела Оплаты.
+        # Отмена до оплаты — убираем «висящий» неоплаченный платёж.
         db.delete_pending_payments_for_booking(booking_id)
+        refunded = db.mark_confirmed_payments_refund_for_booking(booking_id)
         description = f"Бронирование №{booking_id} отменено (игрок: {user_name})"
+        if refunded:
+            description += f"; подтверждённых оплат к возврату: {refunded}"
     else:
         description = (
             f"Статус бронирования №{booking_id} изменён с «{old_status}» "
@@ -1375,10 +1411,13 @@ def payment_confirm(payment_id):
         # подтверждение не имеет смысла и могло бы затереть статус «возврат».
         flash(f"Платёж уже в статусе «{context['status']}» — подтверждение не требуется")
         return redirect(url_for("payments_list"))
+    if context.get("booking_status") == "отменена":
+        flash("Заявка уже отменена — подтвердить оплату нельзя. Оформите возврат.")
+        return redirect(url_for("payments_list"))
 
     updated = db.confirm_payment(payment_id)
     if not updated:
-        flash("Не удалось подтвердить оплату — статус уже изменился")
+        flash("Не удалось подтвердить оплату — статус уже изменился или заявка отменена")
         return redirect(url_for("payments_list"))
     description = (
         f"Статус оплаты для брони №{context['booking_id']} изменён с «ожидает» "
@@ -1668,15 +1707,23 @@ def payment_return():
 @csrf.exempt
 @limiter.limit(os.getenv("YOOKASSA_WEBHOOK_RATE_LIMIT", "60 per minute"))
 def yookassa_webhook():
-    """Webhook ЮKassa: payment.succeeded → подтверждаем платёж и пишем игроку.
+    """Webhook ЮKassa: payment.succeeded → отмечаем оплату для админа.
 
-    В кабинете ЮKassa укажи URL: https://<домен>/payments/yookassa
-    События: payment.succeeded (обязательно).
+    Не доверяем телу запроса: проверяем IP (опционально) и всегда
+    перечитываем платёж через API ЮKassa (shop_id + secret).
     """
     import payment_provider
 
     if not payment_provider.is_yookassa_configured():
         return {"status": "disabled"}, 503
+
+    enforce_ip = os.getenv("YOOKASSA_WEBHOOK_ENFORCE_IP", "1").lower() in {
+        "1", "true", "yes",
+    }
+    remote_ip = (request.remote_addr or "").strip()
+    if enforce_ip and not payment_provider.is_yookassa_webhook_ip(remote_ip):
+        logger.warning("YooKassa webhook rejected from IP %s", remote_ip)
+        return {"status": "forbidden"}, 403
 
     try:
         payload = request.get_json(force=True, silent=False) or {}
@@ -1687,7 +1734,7 @@ def yookassa_webhook():
     event = parsed.get("event") or ""
     provider_id = parsed.get("provider_payment_id")
     logger.info(
-        "YooKassa webhook event=%s provider_id=%s payment_id=%s",
+        "YooKassa webhook event=%s provider_id=%s (body payment_id=%s)",
         event, provider_id, parsed.get("payment_id"),
     )
 
@@ -1697,11 +1744,44 @@ def yookassa_webhook():
     if not provider_id:
         return {"status": "missing_provider_id"}, 400
 
+    # Главная защита: только то, что подтверждает API ЮKassa.
+    try:
+        verified = payment_provider.get_yookassa_payment_sync(str(provider_id))
+    except Exception as e:
+        logger.error("YooKassa API verify failed provider_id=%s: %s", provider_id, e)
+        return {"status": "verify_failed"}, 502
+
+    if verified.get("id") != provider_id:
+        logger.error("YooKassa verify id mismatch body=%s api=%s", provider_id, verified.get("id"))
+        return {"status": "verify_mismatch"}, 400
+
+    if verified.get("status") != "succeeded" and not verified.get("paid"):
+        return {"status": "ignored", "provider_status": verified.get("status")}, 200
+
+    meta = verified.get("metadata") or {}
+    try:
+        local_payment_id = int(meta["payment_id"]) if meta.get("payment_id") is not None else None
+    except (TypeError, ValueError):
+        local_payment_id = None
+    try:
+        expected_amount = float(verified["amount"]) if verified.get("amount") is not None else None
+    except (TypeError, ValueError):
+        expected_amount = None
+    if expected_amount is None:
+        return {"status": "missing_amount"}, 400
+
+    payment_method = None
+    raw = verified.get("raw") or {}
+    try:
+        payment_method = ((raw.get("payment_method") or {}).get("type"))
+    except Exception:
+        payment_method = None
+
     result = db.register_provider_payment_awaiting_admin(
-        provider_payment_id=provider_id,
-        local_payment_id=parsed.get("payment_id"),
-        expected_amount=parsed.get("amount"),
-        payment_method=parsed.get("payment_method"),
+        provider_payment_id=str(verified["id"]),
+        local_payment_id=local_payment_id,
+        expected_amount=expected_amount,
+        payment_method=payment_method or "yookassa",
     )
     status = result.get("status")
     payment = result.get("payment")
@@ -1709,7 +1789,7 @@ def yookassa_webhook():
     if status == "ok" and payment:
         description = (
             f"Оплата #{payment['id']} получена через ЮKassa ({provider_id}, "
-            f"метод: {parsed.get('payment_method') or '—'}) — ждёт подтверждения админа"
+            f"метод: {payment_method or '—'}) — ждёт подтверждения админа"
         )
         try:
             log_admin_action(
@@ -1731,6 +1811,13 @@ def yookassa_webhook():
             provider_id, payment,
         )
         return {"status": "mismatch"}, 200
+
+    if status == "cancelled":
+        logger.warning(
+            "YooKassa webhook: заявка уже отменена provider_id=%s payment=%s",
+            provider_id, payment,
+        )
+        return {"status": "cancelled"}, 200
 
     if status == "not_found":
         logger.warning("YooKassa webhook: платёж не найден provider_id=%s", provider_id)
@@ -1923,6 +2010,11 @@ def run_bot():
             webhook_endpoint = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
             # В проде секрет обязателен: иначе /webhook принимает чужие POST.
             enforce_secret = os.getenv("WEBHOOK_ENFORCE_SECRET", "1").lower() in {"1", "true", "yes"}
+            if _IS_RENDER and not enforce_secret:
+                raise RuntimeError(
+                    "На Render нельзя WEBHOOK_ENFORCE_SECRET=0 — "
+                    "любой сможет подделать апдейты Telegram."
+                )
             # resolve_used_update_types — чтобы pre_checkout_query / message
             # (successful_payment) точно попадали в webhook, а не терялись
             # из‑за устаревшего жёсткого списка.
@@ -1941,7 +2033,7 @@ def run_bot():
             if WEBHOOK_SECRET_TOKEN:
                 set_kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN
             elif enforce_secret:
-                logger.error(
+                raise RuntimeError(
                     "WEBHOOK_ENFORCE_SECRET=1, но WEBHOOK_SECRET_TOKEN/FLASK_SECRET_KEY пуст — "
                     "секрет вебхука не будет проверен"
                 )
