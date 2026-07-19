@@ -86,7 +86,7 @@
             {% endif %}
             <div class="game-card-head">
                 <button type="button" class="game-icon-btn" data-game-id="{{ g.id }}"
-                        title="Подробнее {% if is_training %}о тренировке{% else %}об игре{% endif %} №{{ g.id }}">{% if is_training %}💪{% else %}🎾{% endif %}</button>
+                        title="Подробнее {% if is_training %}о тренировке{% else %}об игре{% endif %} №{{ g.id }}">🎾</button>
                 <div class="game-card-head-main">
                     <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
                     <div class="game-card-number">№{{ g.id }}{% if is_training and g.coach_name %} · {{ g.coach_name }}{% endif %}</div>

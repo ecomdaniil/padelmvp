@@ -1728,29 +1728,49 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
 
 
 def confirm_payment(payment_id: int):
-    """Атомарно подтверждает только платёж в статусе «ожидает» у активной
-    (не отменённой) заявки. Возвращает обновлённую строку или None."""
+    """Атомарно подтверждает платёж «ожидает» у активной заявки и ставит
+    статус заявки «подтверждена». Возвращает обновлённую строку оплаты или None."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE payments p
-           SET status = 'подтверждена',
-               player_notified_at = COALESCE(p.player_notified_at, NOW())
-          FROM bookings b
-         WHERE p.id = %s
-           AND p.booking_id = b.id
-           AND p.status = 'ожидает'
-           AND b.status != 'отменена'
-         RETURNING p.*
-        """,
-        (payment_id,),
-    )
-    updated = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-    return updated
+    try:
+        cur.execute(
+            """
+            UPDATE payments p
+               SET status = 'подтверждена',
+                   player_notified_at = COALESCE(p.player_notified_at, NOW())
+              FROM bookings b
+             WHERE p.id = %s
+               AND p.booking_id = b.id
+               AND p.status = 'ожидает'
+               AND b.status != 'отменена'
+             RETURNING p.*, b.id AS booking_id, b.status AS booking_status_before
+            """,
+            (payment_id,),
+        )
+        updated = cur.fetchone()
+        if not updated:
+            conn.rollback()
+            return None
+        booking_id = updated["booking_id"]
+        # Заявка тоже становится подтверждённой (если ещё «новая»/иная, кроме отмены).
+        cur.execute(
+            """
+            UPDATE bookings
+               SET status = 'подтверждена'
+             WHERE id = %s
+               AND status != 'отменена'
+               AND status != 'посещена'
+            """,
+            (booking_id,),
+        )
+        conn.commit()
+        return updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
 def get_payment_by_id(payment_id: int):

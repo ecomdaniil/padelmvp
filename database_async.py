@@ -1595,21 +1595,34 @@ async def mark_payment_notified_owned(payment_id: int, user_id: int) -> Optional
 
 
 async def confirm_payment(payment_id: int) -> Optional[dict]:
-    """Атомарно подтверждает только «ожидает» у активной (не отменённой) заявки."""
+    """Атомарно подтверждает «ожидает» у активной заявки и ставит
+    статус заявки «подтверждена»."""
     pool = await get_pool()
-    row = await pool.fetchrow(
-        """UPDATE payments AS p
-           SET status = 'подтверждена',
-               player_notified_at = COALESCE(p.player_notified_at, NOW())
-           FROM bookings AS b
-           WHERE p.id = $1
-             AND p.booking_id = b.id
-             AND p.status = 'ожидает'
-             AND b.status != 'отменена'
-           RETURNING p.*""",
-        payment_id,
-    )
-    return _to_dict(row) if row else None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """UPDATE payments AS p
+                   SET status = 'подтверждена',
+                       player_notified_at = COALESCE(p.player_notified_at, NOW())
+                   FROM bookings AS b
+                   WHERE p.id = $1
+                     AND p.booking_id = b.id
+                     AND p.status = 'ожидает'
+                     AND b.status != 'отменена'
+                   RETURNING p.*""",
+                payment_id,
+            )
+            if not row:
+                return None
+            await conn.execute(
+                """UPDATE bookings
+                   SET status = 'подтверждена'
+                 WHERE id = $1
+                   AND status != 'отменена'
+                   AND status != 'посещена'""",
+                row["booking_id"],
+            )
+            return _to_dict(row)
 
 
 async def register_provider_payment_awaiting_admin(

@@ -1434,10 +1434,22 @@ def payment_confirm(payment_id):
         return redirect(url_for("payments_list"))
     db.clear_badge_cache()
     description = (
-        f"Статус оплаты для брони №{context['booking_id']} изменён с «ожидает» "
-        f"на «подтверждена» (игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
+        f"Статус оплаты и заявки №{context['booking_id']} изменён на «подтверждена» "
+        f"(игрок: {context['user_name']}, сумма: {_fmt_money(context['amount'])} руб.)"
     )
     log_admin_action("confirm", "payment", payment_id, description=description, old="ожидает", new="подтверждена")
+    if context.get("booking_status") and context["booking_status"] != "подтверждена":
+        log_admin_action(
+            "update_status",
+            "booking",
+            int(context["booking_id"]),
+            description=(
+                f"Заявка №{context['booking_id']} автоматически подтверждена "
+                f"вместе с оплатой #{payment_id}"
+            ),
+            old=context["booking_status"],
+            new="подтверждена",
+        )
 
     if context.get("telegram_id"):
         game_dt = f"{context['game_date'].strftime('%d.%m.%Y')} в {str(context['game_time'])[:5]}"
@@ -1448,11 +1460,11 @@ def payment_confirm(payment_id):
             f"💰 Сумма: {float(context['amount']):.0f} ₽\n"
             f"📅 {html.escape(game_dt, quote=False)}\n"
             f"📍 {loc}\n\n"
-            "Ждём тебя на корте! 🎾"
+            "Заявка подтверждена. Ждём тебя на корте! 🎾"
         )
         send_telegram_message(context["telegram_id"], text)
 
-    flash("Оплата подтверждена")
+    flash("Оплата и заявка подтверждены")
     return redirect(url_for("payments_list"))
 
 
