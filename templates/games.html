@@ -89,7 +89,7 @@
                         title="Подробнее {% if is_training %}о тренировке{% else %}об игре{% endif %} №{{ g.id }}">🎾</button>
                 <div class="game-card-head-main">
                     <div class="game-card-date">{{ g.game_date.strftime('%d.%m.%Y') }} · {{ g.game_time.strftime('%H:%M') }}</div>
-                    <div class="game-card-number">№{{ g.id }}{% if is_training and g.coach_name %} · {{ g.coach_name }}{% endif %}</div>
+                    <div class="game-card-number">№{{ g.id }}</div>
                 </div>
                 {% if g.is_live and effective_taken > 0 %}
                 <span class="badge badge-live" title="Игра уже началась и ещё не закончилась">🟢 Идёт сейчас</span>
@@ -108,6 +108,9 @@
 
             <div class="game-card-location">
                 📍 {{ g.location }}
+                {% if is_training and g.coach_name %}
+                <div class="muted-line">Тренер: {% if g.coach_emoji %}{{ g.coach_emoji }} {% endif %}{{ g.coach_name }}</div>
+                {% endif %}
                 {% if g.club_name %}<div class="muted-line">Клуб: {{ g.club_name }}</div>{% endif %}
                 <div class="muted-line">Длительность: {{ g.duration_minutes or 90 }} мин.</div>
             </div>
@@ -425,13 +428,13 @@
                 if (isTraining && g.title) {
                     html += detailRow('Название', g.title);
                 }
+                html += detailRow('Дата и время', g.game_date + ' в ' + g.game_time);
+                html += detailRow('Город', g.city);
+                html += detailRow('Адрес', g.address || g.location);
                 if (isTraining && g.coach_name) {
                     html += detailRow('Тренер', (g.coach_emoji ? g.coach_emoji + ' ' : '') + g.coach_name);
                 }
-                html += detailRow('Дата и время', g.game_date + ' в ' + g.game_time);
-                html += detailRow('Город', g.city);
                 html += detailRow('Клуб', g.club_name);
-                html += detailRow('Адрес', g.address || g.location);
                 html += detailRow('Длительность', (g.duration_minutes || 90) + ' мин.');
                 html += detailRow('Уровень', g.level || 'любой уровень');
                 html += detailRow('Цена за место', g.price + ' ₽');

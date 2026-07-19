@@ -49,8 +49,25 @@
         body.nav-pending { cursor: progress; }
         body.nav-pending .container {
             opacity: 0.55;
-            transition: opacity 0.12s ease;
+            transition: opacity 0.08s ease;
             pointer-events: none;
+        }
+        .nav-progress {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            width: 0;
+            z-index: 200;
+            background: linear-gradient(90deg, #38bdf8, #2563eb);
+            opacity: 0;
+            pointer-events: none;
+            transition: width 0.25s ease, opacity 0.15s ease;
+        }
+        body.nav-pending .nav-progress {
+            opacity: 1;
+            width: 78%;
+            transition: width 2.2s cubic-bezier(0.1, 0.7, 0.2, 1), opacity 0.1s ease;
         }
         body::before {
             content: "";
@@ -523,6 +540,7 @@
     </style>
 </head>
 <body>
+    <div class="nav-progress" aria-hidden="true"></div>
     <div class="cursor-glow" aria-hidden="true"></div>
     <nav>
         <div class="brand-block">
@@ -656,13 +674,33 @@
             setInterval(poll, 8000);
         })();
 
-        // Клик по пункту меню — мгновенная визуальная реакция до прихода HTML.
-        document.querySelectorAll('.nav-links a[href]').forEach(function (link) {
-            link.addEventListener('click', function (e) {
-                if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || link.target === '_blank') return;
-                document.body.classList.add('nav-pending');
+        // Мгновенный отклик меню: prefetch по наведению + индикатор при клике.
+        (function () {
+            const prefetched = new Set();
+            function prefetch(href) {
+                if (!href || prefetched.has(href)) return;
+                prefetched.add(href);
+                const tip = document.createElement('link');
+                tip.rel = 'prefetch';
+                tip.href = href;
+                tip.as = 'document';
+                document.head.appendChild(tip);
+            }
+            document.querySelectorAll('.nav-links a[href], .quick-card[href], .hero-actions a[href]').forEach(function (link) {
+                link.addEventListener('mouseenter', function () { prefetch(link.href); }, { passive: true });
+                link.addEventListener('touchstart', function () { prefetch(link.href); }, { passive: true });
+                link.addEventListener('click', function (e) {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || link.target === '_blank') return;
+                    document.body.classList.add('nav-pending');
+                    document.querySelectorAll('.nav-links a.active').forEach(function (a) {
+                        a.classList.remove('active');
+                    });
+                    if (link.classList.contains('active') || link.closest('.nav-links')) {
+                        link.classList.add('active');
+                    }
+                });
             });
-        });
+        })();
     </script>
     {% block extra_scripts %}{% endblock %}
 </body>

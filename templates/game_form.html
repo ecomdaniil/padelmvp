@@ -41,17 +41,19 @@
         </div>
 
         <div class="form-row">
-            <label for="city">Город *</label>
-            <input type="text" id="city" name="city" required maxlength="100"
-                   placeholder="Выберите клуб — заполнится автоматически"
-                   value="{{ values.city }}">
-        </div>
-
-        <div class="form-row">
-            <label for="address">Адрес *</label>
-            <input type="text" id="address" name="address" required maxlength="255"
-                   placeholder="Выберите клуб — заполнится автоматически"
-                   value="{{ values.address }}">
+            <label for="club_id">Клуб *</label>
+            <select id="club_id" name="club_id" required>
+                <option value="">— выберите клуб —</option>
+                {% for c in clubs %}
+                <option value="{{ c.id }}"
+                        data-city="{{ c.city or '' }}"
+                        data-address="{{ c.address }}"
+                        {% if values.club_id == c.id|string %}selected{% endif %}>
+                    {{ c.name }}{% if c.city %} ({{ c.city }}){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+            <small class="field-hint">Город и адрес подставятся из карточки клуба.</small>
         </div>
 
         {% if is_training %}
@@ -70,19 +72,17 @@
         {% endif %}
 
         <div class="form-row">
-            <label for="club_id">Клуб *</label>
-            <select id="club_id" name="club_id" required>
-                <option value="">— выберите клуб —</option>
-                {% for c in clubs %}
-                <option value="{{ c.id }}"
-                        data-city="{{ c.city or '' }}"
-                        data-address="{{ c.address }}"
-                        {% if values.club_id == c.id|string %}selected{% endif %}>
-                    {{ c.name }}{% if c.city %} ({{ c.city }}){% endif %}
-                </option>
-                {% endfor %}
-            </select>
-            <small class="field-hint">Город и адрес подставятся из карточки клуба.</small>
+            <label for="city">Город *</label>
+            <input type="text" id="city" name="city" required maxlength="100"
+                   placeholder="Выберите клуб — заполнится автоматически"
+                   value="{{ values.city }}">
+        </div>
+
+        <div class="form-row">
+            <label for="address">Адрес *</label>
+            <input type="text" id="address" name="address" required maxlength="255"
+                   placeholder="Выберите клуб — заполнится автоматически"
+                   value="{{ values.address }}">
         </div>
 
         <div class="form-row">

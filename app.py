@@ -533,21 +533,41 @@ def _mark_all_sections_seen() -> None:
     )
 
 
+_club_brand_cache = None  # (monotonic_ts, name)
+_CLUB_BRAND_TTL = 60.0
+
+
 def _club_brand_name() -> str:
+    """Имя клуба для шапки — с коротким кэшем, чтобы клик по меню не ждал Neon."""
+    global _club_brand_cache
+    now = time.monotonic()
+    if _club_brand_cache and (now - _club_brand_cache[0]) < _CLUB_BRAND_TTL:
+        return _club_brand_cache[1]
+    name = "Padel Club"
     try:
         info = db.get_club_info()
-        name = (info or {}).get("name") if info else None
-        if name and str(name).strip():
-            return str(name).strip()
+        raw = (info or {}).get("name") if info else None
+        if raw and str(raw).strip():
+            name = str(raw).strip()
     except Exception:
         pass
-    return "Padel Club"
+    _club_brand_cache = (now, name)
+    return name
+
+
+def invalidate_club_brand_cache() -> None:
+    global _club_brand_cache
+    _club_brand_cache = None
 
 
 @app.context_processor
 def inject_globals():
-    """Название клуба в шапке/логине и бейджи меню (без лишних запросов к БД)."""
-    extras = {"club_brand": _club_brand_name()}
+    """Название клуба и бейджи меню. Бейджи — только из in-memory кэша
+    (без round-trip к БД на каждый клик); цифры догоняет /api/activity."""
+    extras = {
+        "club_brand": _club_brand_name(),
+        "nav_badges": {"bookings": 0, "payments": 0},
+    }
     if not session.get("logged_in"):
         return extras
     try:
@@ -559,13 +579,11 @@ def inject_globals():
     except Exception as e:
         logger.error("Не удалось прочитать бейджи меню: %s", e)
         counts = None
-    if not counts:
-        extras["nav_badges"] = {"bookings": 0, "payments": 0}
-        return extras
-    extras["nav_badges"] = {
-        "bookings": counts["new_bookings"],
-        "payments": counts["new_payments"],
-    }
+    if counts:
+        extras["nav_badges"] = {
+            "bookings": counts["new_bookings"],
+            "payments": counts["new_payments"],
+        }
     return extras
 
 
@@ -1643,6 +1661,7 @@ def about_club_update():
         city=city,
         address=address,
     )
+    invalidate_club_brand_cache()
     # Инвалидация кэша списка игр — локация могла измениться.
     cache.invalidate_games_cache()
     new_info = db.get_club_info()
