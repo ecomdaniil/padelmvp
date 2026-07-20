@@ -1701,7 +1701,8 @@ def booking_has_notified_pending_payment(booking_id: int) -> bool:
 
 
 def get_payments_paginated(search: str = "", status: str = "", page: int = 1, per_page: int = 20):
-    """Оплаты с фильтрацией и пагинацией — для CRM."""
+    """Оплаты с фильтрацией и пагинацией — для CRM.
+    Сверху всегда «ожидает» и «возврат» (нужно действие админа), затем остальные."""
     page = max(1, page)
     offset = (page - 1) * per_page
 
@@ -1733,7 +1734,13 @@ def get_payments_paginated(search: str = "", status: str = "", page: int = 1, pe
         JOIN users u ON u.id = b.user_id
         JOIN games g ON g.id = b.game_id
         {where_clause}
-        ORDER BY p.created_at DESC
+        ORDER BY
+            CASE
+                WHEN p.status IN ('ожидает', 'возврат') THEN 0
+                ELSE 1
+            END,
+            COALESCE(p.admin_attention_at, p.created_at) DESC NULLS LAST,
+            p.id DESC
         LIMIT %s OFFSET %s
         """,
         params + [per_page, offset],
