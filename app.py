@@ -985,9 +985,6 @@ def _render_events_list(event_type: str):
     if fullness not in ("full", "available"):
         fullness = ""
     show_past = request.args.get("show_past") == "1"
-    # Прошедшие — всегда от последней к ранней.
-    if show_past:
-        sort_order = "desc"
     coach_id = None
     coach_raw = (request.args.get("coach_id") or "").strip()
     if event_type == "training" and coach_raw.isdigit():

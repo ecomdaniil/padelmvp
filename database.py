@@ -887,14 +887,24 @@ def get_games_paginated(
         """
 
     # Занятость = реальные бронирования + booked_places (мимо бота).
+    # «Сначала ближайшие» / «дальние» для прошедших инвертируются:
+    # ближайшие прошедшие = самые недавние (DESC), дальние = самые старые (ASC).
     if sort_order == "coach_asc":
         order_sql = "co.name ASC NULLS LAST, g.game_date ASC, g.game_time ASC"
     elif sort_order == "coach_desc":
         order_sql = "co.name DESC NULLS LAST, g.game_date DESC, g.game_time DESC"
     elif sort_order == "desc":
-        order_sql = "g.game_date DESC, g.game_time DESC"
+        order_sql = (
+            "g.game_date ASC, g.game_time ASC"
+            if show_past else
+            "g.game_date DESC, g.game_time DESC"
+        )
     else:
-        order_sql = "g.game_date ASC, g.game_time ASC"
+        order_sql = (
+            "g.game_date DESC, g.game_time DESC"
+            if show_past else
+            "g.game_date ASC, g.game_time ASC"
+        )
 
     if fullness == "full":
         fullness_clause = " AND (COALESCE(bk.taken, 0) + COALESCE(g.booked_places, 0)) >= g.total_slots"

@@ -75,7 +75,7 @@
                     <button class="btn btn-danger" type="submit">✓ Подтвердить</button>
                 </form>
                 {% elif p.status == 'возврат оформлен' %}
-                <span class="badge badge-refund-done">Возврат оформлен</span>
+                <span class="payment-refund-label">возврат</span>
                 {% else %}
                 <span style="color: #6b7280; font-size: 13px;">Оплачено</span>
                 {% endif %}
@@ -99,6 +99,11 @@
             border-radius: 999px;
             line-height: 1.3;
             white-space: nowrap;
+        }
+        .payment-refund-label {
+            color: #991b1b;
+            font-size: 13px;
+            font-weight: 600;
         }
     </style>
 {% endblock %}
