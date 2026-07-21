@@ -526,6 +526,11 @@ def _migrate_bookings_table(cur):
     cur.execute(
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS admin_extra_notify_message_id BIGINT;"
     )
+    # no_show — админ отметил «Не был» в CRM «Посещения»; в статистике бота
+    # такое посещение не засчитывается.
+    cur.execute(
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS no_show BOOLEAN NOT NULL DEFAULT FALSE;"
+    )
 
 
 def _migrate_payments_table(cur):
@@ -673,6 +678,19 @@ def _migrate_club_info_table(cur):
     cur.execute(
         "ALTER TABLE club_info ADD COLUMN IF NOT EXISTS address TEXT NOT NULL DEFAULT '';"
     )
+    # Какие поля «О клубе» показывать в боте (галочки в CRM).
+    for col, default in (
+        ("bot_show_name", "TRUE"),
+        ("bot_show_city", "TRUE"),
+        ("bot_show_address", "TRUE"),
+        ("bot_show_description", "TRUE"),
+        ("bot_show_phone", "TRUE"),
+        ("bot_show_email", "FALSE"),
+        ("bot_show_admin_username", "FALSE"),
+    ):
+        cur.execute(
+            f"ALTER TABLE club_info ADD COLUMN IF NOT EXISTS {col} BOOLEAN NOT NULL DEFAULT {default};"
+        )
     # Если город/адрес ещё пустые — подтянуть из первой площадки clubs.
     cur.execute(
         """
@@ -1453,10 +1471,29 @@ def get_game_details(game_id: int):
         """,
         (game_id,),
     )
-    participants = cur.fetchall()
+    rows = cur.fetchall()
     cur.close()
     conn.close()
-    return {"game": game, "participants": participants}
+
+    participants = []
+    cancelled = []
+    for row in rows:
+        item = dict(row)
+        pay = item.get("payment_status")
+        booking_status = item.get("booking_status")
+        is_cancelled = (
+            booking_status == "отменена"
+            or pay in ("возврат", "возврат оформлен")
+        )
+        if is_cancelled:
+            cancelled.append(item)
+        elif pay == "подтверждена" and booking_status != "отменена":
+            participants.append(item)
+    return {
+        "game": dict(game),
+        "participants": participants,
+        "cancelled": cancelled,
+    }
 
 
 def get_participants_for_game(game_id: int):
@@ -1491,9 +1528,16 @@ def get_user_statistics(user_id: int) -> dict:
             ) AS past_total,
             COUNT(*) FILTER (
                 WHERE b.status != 'отменена'
+                  AND COALESCE(b.no_show, FALSE) = FALSE
                   AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
                   AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
             ) AS attended,
+            COUNT(*) FILTER (
+                WHERE COALESCE(b.no_show, FALSE) = TRUE
+                  AND b.status != 'отменена'
+                  AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+                  AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+            ) AS no_shows,
             (
                 SELECT COUNT(DISTINCT b2.id)
                 FROM bookings b2
@@ -1513,6 +1557,7 @@ def get_user_statistics(user_id: int) -> dict:
     total = int(row["total"] or 0)
     cancelled = int(row["cancelled"] or 0)
     attended = int(row["attended"] or 0)
+    no_shows = int(row["no_shows"] or 0)
     past_total = int(row["past_total"] or 0)
     paid = int(row["paid"] or 0)
 
@@ -1523,6 +1568,7 @@ def get_user_statistics(user_id: int) -> dict:
         "total": total,
         "paid": paid,
         "attended": attended,
+        "no_shows": no_shows,
         "cancelled": cancelled,
         "attendance_rate": attendance_rate,
         "hours_played": hours_played,
@@ -2094,6 +2140,34 @@ def mark_booking_visited(booking_id: int):
     conn.close()
 
 
+def mark_booking_no_show(booking_id: int, no_show: bool = True):
+    """Отметка «Не был» в CRM. Возвращает бронь + данные для уведомления."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE bookings AS b
+        SET no_show = %s
+        FROM users u, games g
+        WHERE b.id = %s
+          AND u.id = b.user_id
+          AND g.id = b.game_id
+          AND b.status != 'отменена'
+        RETURNING b.*,
+                  u.name AS user_name,
+                  u.telegram_id,
+                  g.game_date, g.game_time, g.location,
+                  COALESCE(g.event_type, 'game') AS event_type, g.title
+        """,
+        (bool(no_show), booking_id),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row
+
+
 def mark_booking_visited_and_get(booking_id: int):
     """Как mark_booking_visited, но сразу возвращает обновлённую строку и имя
     игрока (для человекочитаемой записи в журнале действий) — без отдельного
@@ -2164,7 +2238,7 @@ def get_visits_paginated(page: int = 1, per_page: int = 20):
 
     cur.execute(
         f"""
-        SELECT b.*, u.name AS user_name, u.phone AS user_phone,
+        SELECT b.*, u.name AS user_name, u.phone AS user_phone, u.telegram_id,
                g.id AS game_id, g.game_date, g.game_time, g.location,
                COALESCE(g.event_type, 'game') AS event_type, g.title,
                COUNT(*) OVER() AS total_count
@@ -2787,11 +2861,12 @@ def update_club_info(
     admin_telegram_username=None,
     city: str = "",
     address: str = "",
+    bot_show: dict = None,
 ):
     """admin_telegram_id=None — не менять id; ''/0 — очистить.
     admin_telegram_username=None — не менять username; '' — очистить.
-    city/address сохраняются в club_info и синхронизируются в clubs
-    (выбор клуба в форме игры/тренировки подставляет эти значения)."""
+    city/address сохраняются в club_info и синхронизируются в clubs.
+    bot_show — dict флагов видимости полей в боте (bot_show_name и т.д.)."""
     conn = get_connection()
     cur = conn.cursor()
     sets = [
@@ -2804,6 +2879,15 @@ def update_club_info(
         "updated_at = NOW()",
     ]
     params = [name, description, contact_phone, contact_email, city or "", address or ""]
+    if bot_show:
+        for key in (
+            "bot_show_name", "bot_show_city", "bot_show_address",
+            "bot_show_description", "bot_show_phone", "bot_show_email",
+            "bot_show_admin_username",
+        ):
+            if key in bot_show:
+                sets.append(f"{key} = %s")
+                params.append(bool(bot_show[key]))
     if admin_telegram_id is not None:
         tid = None
         if admin_telegram_id not in ("", 0, "0"):

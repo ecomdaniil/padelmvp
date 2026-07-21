@@ -1025,12 +1025,16 @@ async def _show_past_bookings(message: Message):
 
     def _past_card(b: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
         # Список уже отфильтрован как CRM «Посещения» — это прошедшие записи.
+        if b.get("no_show"):
+            status_line = "❌ Не пришёл"
+        else:
+            status_line = "✅ Посещение"
         text = (
             f"{_event_card_header(b)}\n"
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
             f"👥 Мест: {b.get('slots_count', 1)}\n"
-            "✅ Посещение"
+            f"{status_line}"
         )
         return text, None
 
@@ -1064,6 +1068,7 @@ def _format_statistics(stats: dict) -> str:
         f"📝 Всего заявок подано: <b>{stats['total']}</b>\n"
         f"💳 Оплачено: <b>{stats['paid']}</b>\n"
         f"✅ Посещений: <b>{stats['attended']}</b>\n"
+        f"🚫 Неявок: <b>{stats.get('no_shows', 0)}</b>\n"
         f"❌ Отменено: <b>{stats['cancelled']}</b>\n\n"
         f"📈 Посещаемость: <b>{stats['attendance_rate']}%</b>\n"
         f"⏱ Сыграно часов: <b>{stats['hours_played']}</b>\n\n"
@@ -1111,6 +1116,39 @@ async def menu_past_games(message: Message, state: FSMContext):
     await _show_past_bookings(message)
 
 
+def _format_club_about_text(info: Optional[dict]) -> str:
+    """Текст «О клубе» из CRM с учётом галочек bot_show_*."""
+    if not info:
+        return PADEL_INFO_TEXT
+    lines = ["ℹ️ <b>О клубе</b>", "━━━━━━━━━━━━━━━━━━━━", ""]
+    shown = False
+    if info.get("bot_show_name") and (info.get("name") or "").strip():
+        lines.append(f"🏟 <b>{_html(info['name'])}</b>")
+        shown = True
+    if info.get("bot_show_description") and (info.get("description") or "").strip():
+        lines.append(_html(info["description"]))
+        shown = True
+    if info.get("bot_show_city") and (info.get("city") or "").strip():
+        lines.append(f"🏙 Город: {_html(info['city'])}")
+        shown = True
+    if info.get("bot_show_address") and (info.get("address") or "").strip():
+        lines.append(f"📍 Адрес: {_html(info['address'])}")
+        shown = True
+    if info.get("bot_show_phone") and (info.get("contact_phone") or "").strip():
+        lines.append(f"📞 Телефон: {_html(info['contact_phone'])}")
+        shown = True
+    if info.get("bot_show_email") and (info.get("contact_email") or "").strip():
+        lines.append(f"✉️ Email: {_html(info['contact_email'])}")
+        shown = True
+    if info.get("bot_show_admin_username") and (info.get("admin_telegram_username") or "").strip():
+        uname = str(info["admin_telegram_username"]).lstrip("@")
+        lines.append(f"👤 Администратор: @{_html(uname)}")
+        shown = True
+    if not shown:
+        return PADEL_INFO_TEXT
+    return "\n".join(lines)
+
+
 @router.message(F.text == BTN_ABOUT_PADEL)
 async def menu_about_padel(message: Message, state: FSMContext):
     await state.clear()
@@ -1122,8 +1160,9 @@ async def menu_about_padel(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove(),
         )
         return
+    info = await db.get_club_info()
     await message.answer(
-        PADEL_INFO_TEXT,
+        _format_club_about_text(info),
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
     )

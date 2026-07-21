@@ -1,44 +1,89 @@
 {% extends "base.html" %}
 {% block content %}
     <h1>О клубе</h1>
+    <p class="muted-line" style="margin: 0 0 14px; color: var(--muted); font-size: 14px;">
+        Галочка справа от поля — показывать этот пункт игрокам в боте («ℹ️ О клубе»).
+    </p>
     <div style="background: white; padding: 24px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
         <form method="post" action="{{ url_for('about_club_update') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Название клуба</label>
-                <input type="text" name="name" value="{{ club_info.name if club_info else '' }}" required style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 16px;">
+
+            {% macro field_row(label, name, value, field_type='text', required=false, placeholder='', hint='', bot_key='') %}
+            <div class="about-field-row">
+                <div class="about-field-main">
+                    <label style="display: block; margin-bottom: 6px; font-weight: 600;">{{ label }}{% if required %} *{% endif %}</label>
+                    {% if field_type == 'textarea' %}
+                    <textarea name="{{ name }}" rows="4" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;">{{ value }}</textarea>
+                    {% else %}
+                    <input type="{{ field_type }}" name="{{ name }}" value="{{ value }}"
+                           {% if required %}required{% endif %}
+                           {% if placeholder %}placeholder="{{ placeholder }}"{% endif %}
+                           style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
+                    {% endif %}
+                    {% if hint %}<p style="margin: 8px 0 0; color: #64748b; font-size: 13px;">{{ hint }}</p>{% endif %}
+                </div>
+                {% if bot_key %}
+                <label class="about-bot-check" title="Показывать в боте">
+                    <input type="checkbox" name="{{ bot_key }}" value="1"
+                           {% if club_info and club_info[bot_key] %}checked{% elif not club_info and bot_key in ['bot_show_name','bot_show_city','bot_show_address','bot_show_description','bot_show_phone'] %}checked{% endif %}>
+                    <span>В боте</span>
+                </label>
+                {% endif %}
             </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Город *</label>
-                <input type="text" name="city" value="{{ club_info.city if club_info and club_info.city else '' }}" required maxlength="100" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
+            {% endmacro %}
+
+            {{ field_row('Название клуба', 'name', club_info.name if club_info else '', required=true, bot_key='bot_show_name') }}
+            {{ field_row('Город', 'city', club_info.city if club_info and club_info.city else '', required=true, bot_key='bot_show_city') }}
+            {{ field_row('Адрес', 'address', club_info.address if club_info and club_info.address else '', required=true, bot_key='bot_show_address', hint='Город и адрес подставятся автоматически при выборе клуба в форме игры или тренировки.') }}
+            {{ field_row('Описание', 'description', club_info.description if club_info else '', field_type='textarea', bot_key='bot_show_description') }}
+            {{ field_row('Контактный телефон', 'contact_phone', club_info.contact_phone if club_info else '', bot_key='bot_show_phone') }}
+            {{ field_row('Контактный email', 'contact_email', club_info.contact_email if club_info else '', field_type='email', bot_key='bot_show_email') }}
+            {{ field_row('Telegram username администратора', 'admin_telegram_username', club_info.admin_telegram_username if club_info and club_info.admin_telegram_username else '', placeholder='club_admin', bot_key='bot_show_admin_username') }}
+
+            <div class="about-field-row">
+                <div class="about-field-main">
+                    <label style="display: block; margin-bottom: 6px; font-weight: 600;">Telegram ID администратора (для бота)</label>
+                    <input type="text" name="admin_telegram_id" inputmode="numeric" pattern="[0-9]*"
+                           value="{{ club_info.admin_telegram_id if club_info and club_info.admin_telegram_id else '' }}"
+                           placeholder="Например 5161234567"
+                           style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
+                    <p style="margin: 8px 0 0; color: #64748b; font-size: 13px;">ID нужен боту для доставки сообщений админу. Узнать у @userinfobot. В боте игрокам не показывается.</p>
+                </div>
             </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Адрес *</label>
-                <input type="text" name="address" value="{{ club_info.address if club_info and club_info.address else '' }}" required maxlength="255" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-                <p style="margin: 8px 0 0; color: #64748b; font-size: 13px;">Город и адрес подставятся автоматически при выборе клуба в форме игры или тренировки.</p>
-            </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Описание</label>
-                <textarea name="description" rows="4" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;">{{ club_info.description if club_info else '' }}</textarea>
-            </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Контактный телефон</label>
-                <input type="text" name="contact_phone" value="{{ club_info.contact_phone if club_info else '' }}" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-            </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Контактный email</label>
-                <input type="email" name="contact_email" value="{{ club_info.contact_email if club_info else '' }}" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-            </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Telegram username администратора</label>
-                <input type="text" name="admin_telegram_username" value="{{ club_info.admin_telegram_username if club_info and club_info.admin_telegram_username else '' }}" placeholder="club_admin" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-            </div>
-            <div style="margin-bottom: 16px;">
-                <label style="display: block; margin-bottom: 6px; font-weight: 600;">Telegram ID администратора (для бота)</label>
-                <input type="text" name="admin_telegram_id" inputmode="numeric" pattern="[0-9]*" value="{{ club_info.admin_telegram_id if club_info and club_info.admin_telegram_id else '' }}" placeholder="Например 5161234567" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-                <p style="margin: 8px 0 0; color: #64748b; font-size: 13px;">ID нужен боту для доставки сообщений. Узнать у @userinfobot.</p>
-            </div>
+
             <button type="submit" class="btn">Сохранить изменения</button>
         </form>
     </div>
+
+    <style>
+        .about-field-row {
+            display: flex;
+            gap: 14px;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+        .about-field-main { flex: 1; min-width: 0; }
+        .about-bot-check {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 28px;
+            padding: 8px 10px;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            background: #f8fafc;
+            font-size: 12px;
+            font-weight: 600;
+            color: #475569;
+            cursor: pointer;
+            white-space: nowrap;
+            user-select: none;
+        }
+        .about-bot-check input { margin: 0; }
+        @media (max-width: 640px) {
+            .about-field-row { flex-direction: column; gap: 8px; }
+            .about-bot-check { margin-top: 0; }
+        }
+    </style>
 {% endblock %}

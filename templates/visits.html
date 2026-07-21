@@ -3,6 +3,7 @@
     <h1>Посещения</h1>
     <p class="muted-line" style="margin: 0 0 14px; color: var(--muted); font-size: 14px;">
         Игроки, записавшиеся через бота на уже прошедшие (начавшиеся) игры и тренировки.
+        Кнопка «Не был» — если игрок фактически не пришёл: посещение не засчитывается в статистике.
     </p>
     <div class="table-scroll">
         <table>
@@ -11,6 +12,7 @@
                 <th>Телефон</th>
                 <th>Игра / тренировка</th>
                 <th>Дата</th>
+                <th></th>
             </tr>
             {% for v in visits %}
             <tr>
@@ -27,11 +29,50 @@
                     {% endif %}
                 </td>
                 <td>{{ v.game_date.strftime('%d.%m.%Y') }} {{ v.game_time.strftime('%H:%M') }}</td>
+                <td>
+                    {% if v.no_show %}
+                    <form method="post" action="{{ url_for('visit_no_show', booking_id=v.id) }}" style="margin:0;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="no_show" value="0">
+                        <button type="submit" class="btn-no-show is-active" title="Снять отметку">Не был</button>
+                    </form>
+                    {% else %}
+                    <form method="post" action="{{ url_for('visit_no_show', booking_id=v.id) }}" style="margin:0;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="no_show" value="1">
+                        <button type="submit" class="btn-no-show" title="Отметить неявку">Не был</button>
+                    </form>
+                    {% endif %}
+                </td>
             </tr>
             {% else %}
-            <tr><td colspan="4">Пока нет сыгравших игроков — они появятся после начала игр и тренировок, на которые были записи.</td></tr>
+            <tr><td colspan="5">Пока нет сыгравших игроков — они появятся после начала игр и тренировок, на которые были записи.</td></tr>
             {% endfor %}
         </table>
     </div>
     {% include "_pagination.html" %}
+
+    <style>
+        .btn-no-show {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 32px;
+            padding: 6px 14px;
+            border: none;
+            border-radius: 999px;
+            background: #2563eb;
+            color: #fff;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+        .btn-no-show:hover { background: #1d4ed8; }
+        .btn-no-show.is-active {
+            background: #dc2626;
+        }
+        .btn-no-show.is-active:hover { background: #b91c1c; }
+    </style>
 {% endblock %}

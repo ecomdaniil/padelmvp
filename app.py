@@ -358,6 +358,8 @@ ACTION_LABELS = {
     "update_status": "Изменение статуса",
     "confirm": "Подтверждение оплаты",
     "mark_visited": "Отметка посещения",
+    "no_show": "Неявка",
+    "no_show_clear": "Снятие неявки",
     "cleanup": "Автоочистка данных",
     "refund": "Возврат оплаты",
     "confirm_refund": "Оформление возврата",
@@ -766,6 +768,7 @@ def api_game_details(game_id):
     return jsonify({
         "game": _json_row(details["game"]),
         "participants": [_json_row(p) for p in details["participants"]],
+        "cancelled": [_json_row(p) for p in details.get("cancelled") or []],
     })
 
 
@@ -1601,6 +1604,55 @@ def visits_list():
     return render_template("visits.html", visits=result["items"], pagination=result)
 
 
+@app.route("/visits/<int:booking_id>/no-show", methods=["POST"])
+@login_required
+def visit_no_show(booking_id):
+    """Отметить / снять «Не был». При отметке — вежливое сообщение в Telegram."""
+    want_no_show = request.form.get("no_show", "1") != "0"
+    updated = db.mark_booking_no_show(booking_id, no_show=want_no_show)
+    if not updated:
+        flash("Заявка не найдена или уже отменена")
+        return redirect(url_for("visits_list"))
+
+    if want_no_show:
+        when = f"{_fmt_date(updated['game_date'])} в {_fmt_time(updated['game_time'])}"
+        is_training = (updated.get("event_type") or "game") == "training"
+        event_label = "тренировке" if is_training else "игре"
+        title = (updated.get("title") or "").strip()
+        title_bit = f" «{html.escape(title)}»" if title else ""
+        loc = html.escape(str(updated.get("location") or ""), quote=False)
+        text = (
+            f"👋 Мы не увидели вас на {event_label}{title_bit} "
+            f"<b>{html.escape(when, quote=False)}</b>"
+            + (f" ({loc})" if loc else "")
+            + ".\n\n"
+            "Если планы изменились — ничего страшного.\n"
+            "Новые игры и тренировки ждут вас во вкладке "
+            "<b>🎾 Игры</b> в меню бота. Будем рады увидеть снова!"
+        )
+        if updated.get("telegram_id"):
+            send_telegram_message(updated["telegram_id"], text)
+        log_admin_action(
+            "no_show", "booking", booking_id,
+            description=(
+                f"Отмечено «Не был» для брони №{booking_id} "
+                f"(игрок: {updated.get('user_name') or '—'})"
+            ),
+            new="не пришёл",
+        )
+        flash("Отмечено «Не был» — игроку отправлено сообщение")
+    else:
+        log_admin_action(
+            "no_show_clear", "booking", booking_id,
+            description=(
+                f"Снята отметка «Не был» для брони №{booking_id} "
+                f"(игрок: {updated.get('user_name') or '—'})"
+            ),
+        )
+        flash("Отметка «Не был» снята")
+    return redirect(url_for("visits_list"))
+
+
 @app.route("/visits/<int:booking_id>/mark", methods=["POST"])
 @login_required
 def visit_mark(booking_id):
@@ -1677,6 +1729,15 @@ def about_club_update():
         flash("Telegram ID администратора должен быть числом")
         return redirect(url_for("about_club"))
     raw_admin_user = (request.form.get("admin_telegram_username") or "").strip().lstrip("@")
+    bot_show = {
+        "bot_show_name": bool(request.form.get("bot_show_name")),
+        "bot_show_city": bool(request.form.get("bot_show_city")),
+        "bot_show_address": bool(request.form.get("bot_show_address")),
+        "bot_show_description": bool(request.form.get("bot_show_description")),
+        "bot_show_phone": bool(request.form.get("bot_show_phone")),
+        "bot_show_email": bool(request.form.get("bot_show_email")),
+        "bot_show_admin_username": bool(request.form.get("bot_show_admin_username")),
+    }
     db.update_club_info(
         name=name,
         description=request.form.get("description") or "",
@@ -1686,6 +1747,7 @@ def about_club_update():
         admin_telegram_username=raw_admin_user,
         city=city,
         address=address,
+        bot_show=bot_show,
     )
     invalidate_club_brand_cache()
     # Инвалидация кэша списка игр — локация могла измениться.

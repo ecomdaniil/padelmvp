@@ -799,7 +799,7 @@ async def get_past_bookings_for_user(user_id: int) -> list:
     rows = await pool.fetch(
         f"""
         SELECT b.*, g.game_date, g.game_time, g.location, g.price, g.total_slots,
-               g.event_type, g.title
+               g.event_type, g.title, COALESCE(b.no_show, FALSE) AS no_show
         FROM bookings b
         JOIN games g ON g.id = b.game_id
         WHERE b.user_id = $1
@@ -811,6 +811,15 @@ async def get_past_bookings_for_user(user_id: int) -> list:
         user_id,
     )
     return _to_dict_list(rows)
+
+
+async def get_club_info() -> Optional[dict]:
+    """Информация о клубе для экрана «О клубе» в боте."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM club_info ORDER BY id DESC LIMIT 1"
+    )
+    return _to_dict(row) if row else None
 
 
 async def get_club_admin_telegram_id() -> Optional[int]:
@@ -1766,9 +1775,16 @@ async def get_user_statistics(user_id: int) -> dict:
             ) AS past_total,
             COUNT(*) FILTER (
                 WHERE b.status != 'отменена'
+                  AND COALESCE(b.no_show, FALSE) = FALSE
                   AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
                   AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
             ) AS attended,
+            COUNT(*) FILTER (
+                WHERE COALESCE(b.no_show, FALSE) = TRUE
+                  AND b.status != 'отменена'
+                  AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
+                  AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}
+            ) AS no_shows,
             (
                 SELECT COUNT(DISTINCT b2.id)
                 FROM bookings b2
@@ -1785,6 +1801,7 @@ async def get_user_statistics(user_id: int) -> dict:
     total = int(row["total"] or 0)
     cancelled = int(row["cancelled"] or 0)
     attended = int(row["attended"] or 0)
+    no_shows = int(row["no_shows"] or 0)
     past_total = int(row["past_total"] or 0)
     paid = int(row["paid"] or 0)
 
@@ -1795,6 +1812,7 @@ async def get_user_statistics(user_id: int) -> dict:
         "total": total,
         "paid": paid,
         "attended": attended,
+        "no_shows": no_shows,
         "cancelled": cancelled,
         "attendance_rate": attendance_rate,
         "hours_played": hours_played,

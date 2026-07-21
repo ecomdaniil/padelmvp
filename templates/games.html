@@ -107,7 +107,7 @@
                 {% if g.is_live and effective_taken > 0 %}
                 <span class="badge badge-live" title="Игра уже началась и ещё не закончилась">🟢 Идёт сейчас</span>
                 {% elif show_past and effective_taken == 0 %}
-                <span class="badge" style="background:#f1f5f9; color:#64748b;" title="Игра началась/прошла без игроков">Пустая</span>
+                <span class="badge badge-empty" title="Игра/тренировка прошла без записавшихся игроков">Пустая</span>
                 {% endif %}
                 {% if is_full %}
                 <span class="badge badge-full" title="Все места заняты — бот не показывает эту игру пользователям">🚫 Мест нет</span>
@@ -306,6 +306,12 @@
             color: #991b1b;
             white-space: nowrap;
         }
+        .badge-empty {
+            background: #e2e8f0;
+            color: #475569;
+            white-space: nowrap;
+            font-weight: 700;
+        }
         .badge-live {
             background: #dcfce7;
             color: #166534;
@@ -461,7 +467,7 @@
 
                 html += '<h3>Участники (' + participants.length + ')</h3>';
                 if (!participants.length) {
-                    html += '<p class="muted-line">Пока никто не записался.</p>';
+                    html += '<p class="muted-line">Нет игроков с подтверждённой оплатой.</p>';
                 } else {
                     html += '<table class="details-table"><thead><tr>' +
                         '<th>Игрок</th><th>Телефон</th><th>Уровень</th><th>Мест</th>' +
@@ -479,6 +485,30 @@
                             '<td>' + esc(p.booking_status) + '</td>' +
                             '<td>' + paymentText + '</td>' +
                             '<td>' + esc(p.booked_at) + '</td>' +
+                            '</tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+
+                const cancelled = data.cancelled || [];
+                html += '<h3 style="margin-top:18px;">Отменённые (' + cancelled.length + ')</h3>';
+                if (!cancelled.length) {
+                    html += '<p class="muted-line">Нет отменённых заявок и возвратов.</p>';
+                } else {
+                    html += '<table class="details-table"><thead><tr>' +
+                        '<th>Игрок</th><th>Телефон</th><th>Мест</th>' +
+                        '<th>Статус брони</th><th>Оплата</th>' +
+                        '</tr></thead><tbody>';
+                    cancelled.forEach(function (p) {
+                        const paymentText = p.payment_status
+                            ? esc(p.payment_status) + (p.payment_amount ? ' (' + esc(p.payment_amount) + ' ₽)' : '')
+                            : '—';
+                        html += '<tr>' +
+                            '<td>' + esc(p.user_name) + '</td>' +
+                            '<td>' + esc(p.user_phone) + '</td>' +
+                            '<td>' + esc(p.slots_count) + '</td>' +
+                            '<td>' + esc(p.booking_status) + '</td>' +
+                            '<td>' + paymentText + '</td>' +
                             '</tr>';
                     });
                     html += '</tbody></table>';
