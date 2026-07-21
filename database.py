@@ -2599,6 +2599,7 @@ def get_dashboard_summary() -> dict:
             (SELECT COUNT(*) FROM bookings b
              JOIN games g ON g.id = b.game_id
              WHERE b.status != 'отменена'
+               AND COALESCE(b.no_show, FALSE) = FALSE
                AND COALESCE(g.underfill_cancelled, FALSE) = FALSE
                AND (g.game_date + g.game_time) <= {_LOCAL_NOW_EXPR}) AS visits,
             (SELECT COUNT(*) FROM clubs) AS clubs,
@@ -2802,6 +2803,8 @@ def count_active_bookings() -> int:
 
 
 def count_visits() -> int:
+    """Число фактических посещений (без неявок) — то же, что карточка
+    «Посещений» на главной CRM."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2810,6 +2813,7 @@ def count_visits() -> int:
         FROM bookings b
         JOIN games g ON g.id = b.game_id
         WHERE {_VISITS_WHERE}
+          AND COALESCE(b.no_show, FALSE) = FALSE
         """
     )
     total = cur.fetchone()["cnt"]

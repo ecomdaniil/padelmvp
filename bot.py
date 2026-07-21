@@ -1072,7 +1072,7 @@ def _format_statistics(stats: dict) -> str:
         f"❌ Отменено: <b>{stats['cancelled']}</b>\n\n"
         f"📈 Посещаемость: <b>{stats['attendance_rate']}%</b>\n"
         f"⏱ Сыграно часов: <b>{stats['hours_played']}</b>\n\n"
-        "Так держать 👏"
+        "Так держать! 👏"
     )
 
 
