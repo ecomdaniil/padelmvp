@@ -1538,9 +1538,19 @@ async def get_game_roster(
     exclude_user_id — не включать себя (для уведомлений «кому слать»)."""
     pool = await get_pool()
     rows = await pool.fetch(
-        """
-        SELECT u.telegram_id, u.name, u.telegram_username,
-               b.id AS booking_id, b.slots_count, b.user_id
+        f"""
+        SELECT u.telegram_id, u.name, u.telegram_username, u.level,
+               b.id AS booking_id, b.slots_count, b.user_id,
+               ROUND((
+                   SELECT COUNT(*)::numeric * 1.5
+                   FROM bookings bx
+                   JOIN games gx ON gx.id = bx.game_id
+                   WHERE bx.user_id = u.id
+                     AND bx.status != 'отменена'
+                     AND COALESCE(bx.no_show, FALSE) = FALSE
+                     AND COALESCE(gx.underfill_cancelled, FALSE) = FALSE
+                     AND (gx.game_date + gx.game_time) <= {_LOCAL_NOW_EXPR}
+               ), 1) AS hours_played
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         WHERE b.game_id = $1
@@ -1566,9 +1576,19 @@ async def get_rosters_by_game_ids(game_ids: list) -> dict:
         return {}
     pool = await get_pool()
     rows = await pool.fetch(
-        """
-        SELECT b.game_id, u.telegram_id, u.name, u.telegram_username,
-               b.id AS booking_id, b.slots_count, b.user_id
+        f"""
+        SELECT b.game_id, u.telegram_id, u.name, u.telegram_username, u.level,
+               b.id AS booking_id, b.slots_count, b.user_id,
+               ROUND((
+                   SELECT COUNT(*)::numeric * 1.5
+                   FROM bookings bx
+                   JOIN games gx ON gx.id = bx.game_id
+                   WHERE bx.user_id = u.id
+                     AND bx.status != 'отменена'
+                     AND COALESCE(bx.no_show, FALSE) = FALSE
+                     AND COALESCE(gx.underfill_cancelled, FALSE) = FALSE
+                     AND (gx.game_date + gx.game_time) <= {_LOCAL_NOW_EXPR}
+               ), 1) AS hours_played
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         WHERE b.game_id = ANY($1::int[])

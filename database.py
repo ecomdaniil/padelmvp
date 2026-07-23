@@ -2068,10 +2068,10 @@ def get_payment_notification_context(payment_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT p.id AS payment_id, p.amount, p.status, p.method,
                u.id AS user_id, u.telegram_id, u.name AS user_name,
-               u.phone AS user_phone, u.telegram_username,
+               u.phone AS user_phone, u.telegram_username, u.level AS user_level,
                b.id AS booking_id, b.slots_count, b.status AS booking_status,
                g.id AS game_id, g.game_date, g.game_time, g.location,
                g.event_type, g.title, g.price,
@@ -2080,7 +2080,17 @@ def get_payment_notification_context(payment_id: int):
                    WHERE p2.booking_id = b.id
                      AND p2.status = 'подтверждена'
                      AND p2.id != p.id
-               ) AS prior_confirmed_count
+               ) AS prior_confirmed_count,
+               ROUND((
+                   SELECT COUNT(*)::numeric * 1.5
+                   FROM bookings bx
+                   JOIN games gx ON gx.id = bx.game_id
+                   WHERE bx.user_id = u.id
+                     AND bx.status != 'отменена'
+                     AND COALESCE(bx.no_show, FALSE) = FALSE
+                     AND COALESCE(gx.underfill_cancelled, FALSE) = FALSE
+                     AND (gx.game_date + gx.game_time) <= {_LOCAL_NOW_EXPR}
+               ), 1) AS hours_played
         FROM payments p
         JOIN bookings b ON b.id = p.booking_id
         JOIN users u ON u.id = b.user_id
@@ -2100,9 +2110,19 @@ def get_paid_game_mates(game_id: int, exclude_user_id: int = None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
-        SELECT u.telegram_id, u.name, u.telegram_username,
-               b.id AS booking_id, b.slots_count, b.user_id
+        f"""
+        SELECT u.telegram_id, u.name, u.telegram_username, u.level,
+               b.id AS booking_id, b.slots_count, b.user_id,
+               ROUND((
+                   SELECT COUNT(*)::numeric * 1.5
+                   FROM bookings bx
+                   JOIN games gx ON gx.id = bx.game_id
+                   WHERE bx.user_id = u.id
+                     AND bx.status != 'отменена'
+                     AND COALESCE(bx.no_show, FALSE) = FALSE
+                     AND COALESCE(gx.underfill_cancelled, FALSE) = FALSE
+                     AND (gx.game_date + gx.game_time) <= {_LOCAL_NOW_EXPR}
+               ), 1) AS hours_played
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         WHERE b.game_id = %s

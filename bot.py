@@ -963,7 +963,7 @@ async def _show_my_bookings(message: Message):
     await message.answer(
         "📋 <b>Твои записи</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Только предстоящие игры. Можно докупить места, пока набор не полный, "
+        "Сначала ближайшие игры. Можно докупить места, пока набор не полный, "
         "или отменить запись:",
         parse_mode="HTML",
     )
@@ -997,16 +997,19 @@ async def _show_my_bookings(message: Message):
         keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
         return text, keyboard
 
-    sends = [_send_answer(message, *_booking_card(b)) for b in bookings]
-    results = await asyncio.gather(*sends, return_exceptions=True)
-    for b, result in zip(bookings, results):
-        if isinstance(result, Exception):
-            logger.error("Не удалось отправить карточку записи #%s: %s", b.get("id"), result)
+    sends = []
+    for b in bookings:
+        try:
+            await _send_answer(message, *_booking_card(b))
+        except Exception as e:
+            logger.error("Не удалось отправить карточку записи #%s: %s", b.get("id"), e)
 
 
 async def _show_past_bookings(message: Message):
     """История сыгранных / уже прошедших игр."""
-    user = await _require_registered(message.from_user.id)
+    user = await _require_registered(
+        message.from_user.id, username=message.from_user.username,
+    )
     if not user:
         await message.answer(
             "❌ Сначала заполни анкету.\n"
@@ -1024,10 +1027,12 @@ async def _show_past_bookings(message: Message):
         )
         return
 
+    rosters = await db.get_rosters_by_game_ids([b["game_id"] for b in bookings])
+
     await message.answer(
         "🏆 <b>Сыгранные игры</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "История прошедших записей:",
+        "История прошедших записей (сначала недавние):",
         parse_mode="HTML",
     )
 
@@ -1037,20 +1042,26 @@ async def _show_past_bookings(message: Message):
             status_line = "❌ Не пришёл"
         else:
             status_line = "✅ Посещение"
+        roster = rosters.get(int(b["game_id"]), [])
         text = (
             f"{_event_card_header(b)}\n"
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
             f"📍 {_html(b['location'])}\n"
             f"👥 Мест: {b.get('slots_count', 1)}\n"
+            f"{_format_roster_block(roster)}\n"
             f"{status_line}"
         )
         return text, None
 
-    sends = [_send_answer(message, *_past_card(b)) for b in bookings]
-    results = await asyncio.gather(*sends, return_exceptions=True)
-    for b, result in zip(bookings, results):
-        if isinstance(result, Exception):
-            logger.error("Не удалось отправить карточку сыгранной игры #%s: %s", b.get("id"), result)
+    # Последовательно — иначе Telegram перемешает порядок карточек.
+    for b in bookings:
+        try:
+            await _send_answer(message, *_past_card(b))
+        except Exception as e:
+            logger.error(
+                "Не удалось отправить карточку сыгранной игры #%s: %s",
+                b.get("id"), e,
+            )
 
 
 def _event_card_header(event: dict) -> str:
@@ -1495,17 +1506,33 @@ async def _require_registered(telegram_id: int, username: Optional[str] = None):
     return user
 
 
-def _player_label(name: str, username: Optional[str] = None) -> str:
-    """Имя + @username для уведомлений и состава."""
+def _player_label(
+    name: str,
+    username: Optional[str] = None,
+    level: Optional[str] = None,
+    hours_played=None,
+) -> str:
+    """Имя + @username + уровень + часы для состава и уведомлений."""
     label = _html(name or "Игрок")
     uname = (username or "").lstrip("@").strip()
     if uname:
         label += f" (@{_html(uname)})"
+    extras = []
+    if level:
+        extras.append(f"уровень: {_html(level)}")
+    if hours_played is not None and hours_played != "":
+        try:
+            hours_s = f"{float(hours_played):g}"
+        except (TypeError, ValueError):
+            hours_s = str(hours_played)
+        extras.append(f"{_html(hours_s)} ч")
+    if extras:
+        label += f" · {', '.join(extras)}"
     return label
 
 
 def _format_roster_block(roster: list) -> str:
-    """Блок «Состав» для карточки «Мои записи» (только оплатившие)."""
+    """Блок «Состав» для карточки записей (только оплатившие)."""
     if not roster:
         return "👥 Состав: пока только оплатившие появятся здесь"
     lines = ["👥 <b>Состав:</b>"]
@@ -1513,7 +1540,7 @@ def _format_roster_block(roster: list) -> str:
         slots = int(p.get("slots_count") or 1)
         slots_word = "место" if slots == 1 else "места" if slots < 5 else "мест"
         lines.append(
-            f"• {_player_label(p.get('name'), p.get('telegram_username'))}"
+            f"• {_player_label(p.get('name'), p.get('telegram_username'), p.get('level'), p.get('hours_played'))}"
             f" — {slots} {slots_word}"
         )
     return "\n".join(lines)
@@ -1546,7 +1573,16 @@ async def _notify_game_mates(
         title_bit = f" «{_html(game['title'])}»"
     actor_name = actor.get("name") or "Игрок"
     actor_uname = username if username is not None else actor.get("telegram_username")
-    who = _player_label(actor_name, actor_uname)
+    hours_played = actor.get("hours_played")
+    if hours_played is None:
+        try:
+            stats = await db.get_user_statistics(actor_user_id)
+            hours_played = stats.get("hours_played")
+        except Exception:
+            hours_played = None
+    who = _player_label(
+        actor_name, actor_uname, actor.get("level"), hours_played,
+    )
     slots = max(1, int(slots or 1))
     slots_word = "место" if slots == 1 else "места" if slots < 5 else "мест"
     location = _html(game.get("location") or "—")

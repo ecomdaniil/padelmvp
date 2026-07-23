@@ -292,6 +292,19 @@ def _notify_mates_after_payment_confirmed(context: dict) -> None:
     name = html.escape(str(context.get("user_name") or "Игрок"), quote=False)
     uname = (context.get("telegram_username") or "").lstrip("@").strip()
     who = f"{name} (@{html.escape(uname, quote=False)})" if uname else name
+    extras = []
+    level = (context.get("user_level") or "").strip()
+    if level:
+        extras.append(f"уровень: {html.escape(level, quote=False)}")
+    hours = context.get("hours_played")
+    if hours is not None and hours != "":
+        try:
+            hours_s = f"{float(hours):g}"
+        except (TypeError, ValueError):
+            hours_s = str(hours)
+        extras.append(f"{html.escape(hours_s, quote=False)} ч")
+    if extras:
+        who += f" · {', '.join(extras)}"
 
     price = float(context.get("price") or 0)
     amount = float(context.get("amount") or 0)
