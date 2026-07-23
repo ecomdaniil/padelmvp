@@ -143,13 +143,16 @@ async def create_user(
     city: Optional[str] = None,
     has_inventory: Optional[bool] = None,
     needs_rules: Optional[bool] = None,
+    telegram_username: Optional[str] = None,
 ) -> dict:
     pool = await get_pool()
+    uname = (telegram_username or "").lstrip("@").strip() or None
     row = await pool.fetchrow(
         """INSERT INTO users
-           (telegram_id, name, phone, level, age, city, has_inventory, needs_rules)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *""",
-        telegram_id, name, phone, level, age, city, has_inventory, needs_rules,
+           (telegram_id, name, phone, level, age, city, has_inventory, needs_rules,
+            telegram_username)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *""",
+        telegram_id, name, phone, level, age, city, has_inventory, needs_rules, uname,
     )
     return _to_dict(row)
 
@@ -163,17 +166,37 @@ async def update_user(
     city: Optional[str] = None,
     has_inventory: Optional[bool] = None,
     needs_rules: Optional[bool] = None,
+    telegram_username: Optional[str] = None,
 ) -> dict:
     pool = await get_pool()
+    uname = (telegram_username or "").lstrip("@").strip() or None
     row = await pool.fetchrow(
         """UPDATE users
            SET name = $1, phone = $2, level = $3,
                age = $4, city = COALESCE($5, city),
-               has_inventory = $6, needs_rules = $7
-           WHERE telegram_id = $8 RETURNING *""",
-        name, phone, level, age, city, has_inventory, needs_rules, telegram_id,
+               has_inventory = $6, needs_rules = $7,
+               telegram_username = COALESCE($8, telegram_username)
+           WHERE telegram_id = $9 RETURNING *""",
+        name, phone, level, age, city, has_inventory, needs_rules, uname, telegram_id,
     )
     return _to_dict(row)
+
+
+async def sync_user_telegram_username(
+    telegram_id: int, username: Optional[str],
+) -> None:
+    """Обновляет @username из Telegram (для состава игры и уведомлений)."""
+    uname = (username or "").lstrip("@").strip() or None
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE users
+           SET telegram_username = $1
+         WHERE telegram_id = $2
+           AND telegram_username IS DISTINCT FROM $1
+        """,
+        uname, telegram_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1407,7 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
             refund_eligible = refund_window and had_payment
             admin_notify_message_id = booking["admin_notify_message_id"]
             admin_extra_notify_message_id = booking.get("admin_extra_notify_message_id")
+            slots_cancelled = int(booking.get("slots_count") or 1)
             payment_deleted = False
 
             await conn.execute(
@@ -1437,6 +1461,7 @@ async def cancel_booking_owned(booking_id: int, user_id: int) -> dict:
                 "payment_deleted": payment_deleted,
                 "admin_notify_message_id": admin_notify_message_id,
                 "admin_extra_notify_message_id": admin_extra_notify_message_id,
+                "slots_cancelled": slots_cancelled,
                 "game": _to_dict(game),
                 "payment": _to_dict(payment_result) if payment_result else None,
             }
@@ -1494,14 +1519,73 @@ async def get_participants_for_game(game_id: int) -> list:
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT u.telegram_id, u.name, b.id AS booking_id
+        SELECT u.telegram_id, u.name, u.telegram_username,
+               b.id AS booking_id, b.slots_count, b.user_id
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         WHERE b.game_id = $1 AND b.status != 'отменена'
+        ORDER BY b.created_at, b.id
         """,
         game_id,
     )
     return _to_dict_list(rows)
+
+
+async def get_game_roster(
+    game_id: int, exclude_user_id: Optional[int] = None,
+) -> list:
+    """Оплаченный состав игры (есть платёж «подтверждена»).
+    exclude_user_id — не включать себя (для уведомлений «кому слать»)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT u.telegram_id, u.name, u.telegram_username,
+               b.id AS booking_id, b.slots_count, b.user_id
+        FROM bookings b
+        JOIN users u ON u.id = b.user_id
+        WHERE b.game_id = $1
+          AND b.status != 'отменена'
+          AND EXISTS (
+              SELECT 1 FROM payments p
+              WHERE p.booking_id = b.id AND p.status = 'подтверждена'
+          )
+        ORDER BY b.created_at, b.id
+        """,
+        game_id,
+    )
+    result = _to_dict_list(rows)
+    if exclude_user_id is None:
+        return result
+    return [r for r in result if int(r.get("user_id") or 0) != int(exclude_user_id)]
+
+
+async def get_rosters_by_game_ids(game_ids: list) -> dict:
+    """Оплаченные составы сразу для нескольких игр: {game_id: [players...]}."""
+    ids = sorted({int(g) for g in game_ids if g is not None})
+    if not ids:
+        return {}
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT b.game_id, u.telegram_id, u.name, u.telegram_username,
+               b.id AS booking_id, b.slots_count, b.user_id
+        FROM bookings b
+        JOIN users u ON u.id = b.user_id
+        WHERE b.game_id = ANY($1::int[])
+          AND b.status != 'отменена'
+          AND EXISTS (
+              SELECT 1 FROM payments p
+              WHERE p.booking_id = b.id AND p.status = 'подтверждена'
+          )
+        ORDER BY b.game_id, b.created_at, b.id
+        """,
+        ids,
+    )
+    result: dict = {gid: [] for gid in ids}
+    for row in rows:
+        item = _to_dict(row)
+        result.setdefault(int(item["game_id"]), []).append(item)
+    return result
 
 
 # ---------------------------------------------------------------------------

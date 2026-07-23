@@ -341,6 +341,8 @@ def _migrate_users_table(cur):
         ("city", "TEXT"),
         ("has_inventory", "BOOLEAN"),
         ("needs_rules", "BOOLEAN"),
+        # @username из Telegram — для состава игры в боте и уведомлений.
+        ("telegram_username", "TEXT"),
     ]
     for column, col_type in migrations:
         cur.execute(
@@ -761,14 +763,17 @@ def create_user(
     city: str = None,
     has_inventory: bool = None,
     needs_rules: bool = None,
+    telegram_username: str = None,
 ):
     conn = get_connection()
     cur = conn.cursor()
+    uname = (telegram_username or "").lstrip("@").strip() or None
     cur.execute(
         """INSERT INTO users
-           (telegram_id, name, phone, level, age, city, has_inventory, needs_rules)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
-        (telegram_id, name, phone, level, age, city, has_inventory, needs_rules),
+           (telegram_id, name, phone, level, age, city, has_inventory, needs_rules,
+            telegram_username)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+        (telegram_id, name, phone, level, age, city, has_inventory, needs_rules, uname),
     )
     user = cur.fetchone()
     conn.commit()
@@ -786,16 +791,19 @@ def update_user(
     city: str = None,
     has_inventory: bool = None,
     needs_rules: bool = None,
+    telegram_username: str = None,
 ):
     conn = get_connection()
     cur = conn.cursor()
+    uname = (telegram_username or "").lstrip("@").strip() or None
     cur.execute(
         """UPDATE users
            SET name = %s, phone = %s, level = %s,
                age = %s, city = COALESCE(%s, city),
-               has_inventory = %s, needs_rules = %s
+               has_inventory = %s, needs_rules = %s,
+               telegram_username = COALESCE(%s, telegram_username)
            WHERE telegram_id = %s RETURNING *""",
-        (name, phone, level, age, city, has_inventory, needs_rules, telegram_id),
+        (name, phone, level, age, city, has_inventory, needs_rules, uname, telegram_id),
     )
     user = cur.fetchone()
     conn.commit()
@@ -1501,10 +1509,12 @@ def get_participants_for_game(game_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT u.telegram_id, u.name, b.id AS booking_id
+        SELECT u.telegram_id, u.name, u.telegram_username,
+               b.id AS booking_id, b.slots_count, b.user_id
         FROM bookings b
         JOIN users u ON u.id = b.user_id
         WHERE b.game_id = %s AND b.status != 'отменена'
+        ORDER BY b.created_at, b.id
     """, (game_id,))
     participants = cur.fetchall()
     cur.close()
@@ -2060,9 +2070,17 @@ def get_payment_notification_context(payment_id: int):
     cur.execute(
         """
         SELECT p.id AS payment_id, p.amount, p.status, p.method,
-               u.telegram_id, u.name AS user_name, u.phone AS user_phone,
+               u.id AS user_id, u.telegram_id, u.name AS user_name,
+               u.phone AS user_phone, u.telegram_username,
                b.id AS booking_id, b.slots_count, b.status AS booking_status,
-               g.game_date, g.game_time, g.location, g.event_type, g.title
+               g.id AS game_id, g.game_date, g.game_time, g.location,
+               g.event_type, g.title, g.price,
+               (
+                   SELECT COUNT(*)::int FROM payments p2
+                   WHERE p2.booking_id = b.id
+                     AND p2.status = 'подтверждена'
+                     AND p2.id != p.id
+               ) AS prior_confirmed_count
         FROM payments p
         JOIN bookings b ON b.id = p.booking_id
         JOIN users u ON u.id = b.user_id
@@ -2075,6 +2093,33 @@ def get_payment_notification_context(payment_id: int):
     cur.close()
     conn.close()
     return row
+
+
+def get_paid_game_mates(game_id: int, exclude_user_id: int = None):
+    """Игроки с подтверждённой оплатой на игре (кроме exclude_user_id)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT u.telegram_id, u.name, u.telegram_username,
+               b.id AS booking_id, b.slots_count, b.user_id
+        FROM bookings b
+        JOIN users u ON u.id = b.user_id
+        WHERE b.game_id = %s
+          AND b.status != 'отменена'
+          AND (%s::int IS NULL OR b.user_id != %s)
+          AND EXISTS (
+              SELECT 1 FROM payments p
+              WHERE p.booking_id = b.id AND p.status = 'подтверждена'
+          )
+        ORDER BY b.created_at, b.id
+        """,
+        (game_id, exclude_user_id, exclude_user_id),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 
 def get_confirmed_payments_sum_for_game(game_id: int):

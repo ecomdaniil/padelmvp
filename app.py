@@ -262,6 +262,66 @@ def send_telegram_message(chat_id, text: str) -> bool:
         logger.error("Не удалось отправить сообщение игроку (chat_id=%s): %s", chat_id, e)
         return False
 
+
+def _notify_mates_after_payment_confirmed(context: dict) -> None:
+    """После подтверждения оплаты в CRM — сообщить уже оплатившим соседям."""
+    game_id = context.get("game_id")
+    user_id = context.get("user_id")
+    if not game_id or not user_id:
+        return
+    try:
+        mates = db.get_paid_game_mates(int(game_id), exclude_user_id=int(user_id))
+    except Exception as e:
+        logger.error("Не удалось получить состав игры #%s: %s", game_id, e)
+        return
+    if not mates:
+        return
+
+    gd = context.get("game_date")
+    gt = context.get("game_time")
+    when = (
+        f"{gd.strftime('%d.%m.%Y')} в {str(gt)[:5]}"
+        if gd is not None else "—"
+    )
+    is_training = (context.get("event_type") or "game") == "training"
+    event_word = "тренировку" if is_training else "игру"
+    title_bit = ""
+    if is_training and context.get("title"):
+        title_bit = f" «{html.escape(str(context['title']), quote=False)}»"
+
+    name = html.escape(str(context.get("user_name") or "Игрок"), quote=False)
+    uname = (context.get("telegram_username") or "").lstrip("@").strip()
+    who = f"{name} (@{html.escape(uname, quote=False)})" if uname else name
+
+    price = float(context.get("price") or 0)
+    amount = float(context.get("amount") or 0)
+    if price > 0.009:
+        slots = max(1, int(round(amount / price)))
+    else:
+        slots = max(1, int(context.get("slots_count") or 1))
+    slots_word = "место" if slots == 1 else "места" if slots < 5 else "мест"
+    location = html.escape(str(context.get("location") or "—"), quote=False)
+    when_safe = html.escape(when, quote=False)
+
+    prior = int(context.get("prior_confirmed_count") or 0)
+    if prior > 0:
+        text = (
+            f"👥 {who} докупил места на {event_word}{title_bit} <b>{when_safe}</b>.\n"
+            f"Добавлено мест: <b>{slots}</b> {slots_word}\n"
+            f"📍 {location}"
+        )
+    else:
+        text = (
+            f"👥 На {event_word}{title_bit} <b>{when_safe}</b> записался {who}.\n"
+            f"Выкуплено мест: <b>{slots}</b> {slots_word}\n"
+            f"📍 {location}"
+        )
+
+    for mate in mates:
+        tid = mate.get("telegram_id") if isinstance(mate, dict) else mate["telegram_id"]
+        if tid:
+            send_telegram_message(tid, text)
+
 DEFAULT_PAGE_SIZE = int(os.getenv("CRM_PAGE_SIZE", "20"))
 
 # БД хранит created_at как naive-время в UTC (сессия Postgres — UTC).
@@ -1554,6 +1614,14 @@ def payment_confirm(payment_id):
             "Заявка подтверждена. Ждём тебя на корте! 🎾"
         )
         send_telegram_message(context["telegram_id"], text)
+
+    # Соседям по игре — только после реальной оплаты (не в момент записи).
+    try:
+        _notify_mates_after_payment_confirmed(dict(context))
+    except Exception as e:
+        logger.error(
+            "Не удалось уведомить состав игры о платеже #%s: %s", payment_id, e,
+        )
 
     flash("Оплата и заявка подтверждены")
     return redirect(url_for("payments_list"))

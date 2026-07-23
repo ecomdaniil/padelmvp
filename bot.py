@@ -422,6 +422,7 @@ async def _save_profile(message: Message, state: FSMContext):
             city=None,
             has_inventory=data.get("has_inventory"),
             needs_rules=data.get("needs_rules"),
+            telegram_username=message.from_user.username,
         )
         title = "Анкета обновлена! ✅"
     else:
@@ -434,6 +435,7 @@ async def _save_profile(message: Message, state: FSMContext):
             city=None,
             has_inventory=data.get("has_inventory"),
             needs_rules=data.get("needs_rules"),
+            telegram_username=message.from_user.username,
         )
         title = "Спасибо, анкета заполнена! ✅"
 
@@ -936,7 +938,9 @@ async def _show_trainings(message: Message, telegram_id: Optional[int] = None):
 
 async def _show_my_bookings(message: Message):
     """Показывает предстоящие (ещё не начавшиеся) записи пользователя."""
-    user = await _require_registered(message.from_user.id)
+    user = await _require_registered(
+        message.from_user.id, username=message.from_user.username,
+    )
     if not user:
         await message.answer(
             "❌ Сначала заполни анкету.\n"
@@ -954,6 +958,8 @@ async def _show_my_bookings(message: Message):
         )
         return
 
+    rosters = await db.get_rosters_by_game_ids([b["game_id"] for b in bookings])
+
     await message.answer(
         "📋 <b>Твои записи</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -966,6 +972,7 @@ async def _show_my_bookings(message: Message):
         status_emoji = "✅" if b['status'] == 'подтверждена' else "⏳"
         free_slots = int(b.get("free_slots") or 0)
         total_slots = int(b.get("total_slots") or 0)
+        roster = rosters.get(int(b["game_id"]), [])
         text = (
             f"{_event_card_header(b)}\n"
             f"📅 <b>{b['game_date'].strftime('%d.%m.%Y')}</b> в {str(b['game_time'])[:5]}\n"
@@ -975,6 +982,7 @@ async def _show_my_bookings(message: Message):
         if total_slots:
             taken = max(0, total_slots - free_slots)
             text += f"📊 Набор: {taken}/{total_slots}\n"
+        text += f"{_format_roster_block(roster)}\n"
         text += f"📌 Статус: {status_emoji} {_html(b['status'])}"
         rows = []
         if free_slots > 0:
@@ -1462,17 +1470,125 @@ def _invalidate_user_cache(telegram_id: int) -> None:
     cache.delete(f"{USER_CACHE_PREFIX}{telegram_id}")
 
 
-async def _require_registered(telegram_id: int):
+async def _require_registered(telegram_id: int, username: Optional[str] = None):
     """Возвращает пользователя или None. Кэш на USER_CACHE_TTL — иначе
     каждый клик по меню ReplyKeyboard ждёт ~1с round-trip к Neon только
-    ради проверки анкеты."""
+    ради проверки анкеты. Опционально обновляет @username из Telegram."""
     key = f"{USER_CACHE_PREFIX}{telegram_id}"
     cached = cache.get(key)
     if cached is not None:
-        return None if cached == _USER_NONE else cached
-    user = await db.get_user_by_telegram_id(telegram_id)
-    cache.set(key, _USER_NONE if user is None else user, USER_CACHE_TTL)
+        user = None if cached == _USER_NONE else cached
+    else:
+        user = await db.get_user_by_telegram_id(telegram_id)
+        cache.set(key, _USER_NONE if user is None else user, USER_CACHE_TTL)
+    if user and username is not None:
+        current = (user.get("telegram_username") or "").lstrip("@") or None
+        incoming = (username or "").lstrip("@").strip() or None
+        if current != incoming:
+            try:
+                await db.sync_user_telegram_username(telegram_id, username)
+                user = dict(user)
+                user["telegram_username"] = incoming
+                cache.set(key, user, USER_CACHE_TTL)
+            except Exception as e:
+                logger.debug("Не удалось обновить username %s: %s", telegram_id, e)
     return user
+
+
+def _player_label(name: str, username: Optional[str] = None) -> str:
+    """Имя + @username для уведомлений и состава."""
+    label = _html(name or "Игрок")
+    uname = (username or "").lstrip("@").strip()
+    if uname:
+        label += f" (@{_html(uname)})"
+    return label
+
+
+def _format_roster_block(roster: list) -> str:
+    """Блок «Состав» для карточки «Мои записи» (только оплатившие)."""
+    if not roster:
+        return "👥 Состав: пока только оплатившие появятся здесь"
+    lines = ["👥 <b>Состав:</b>"]
+    for p in roster:
+        slots = int(p.get("slots_count") or 1)
+        slots_word = "место" if slots == 1 else "места" if slots < 5 else "мест"
+        lines.append(
+            f"• {_player_label(p.get('name'), p.get('telegram_username'))}"
+            f" — {slots} {slots_word}"
+        )
+    return "\n".join(lines)
+
+
+async def _notify_game_mates(
+    bot: Bot,
+    game: dict,
+    actor: dict,
+    *,
+    action: str,
+    slots: int,
+    username: Optional[str] = None,
+) -> None:
+    """Пишет остальным записанным: кто записался / докупил / отменил."""
+    game_id = int(game.get("id") or 0)
+    actor_user_id = int(actor.get("id") or 0)
+    if not game_id or not actor_user_id:
+        return
+
+    mates = await db.get_game_roster(game_id, exclude_user_id=actor_user_id)
+    if not mates:
+        return
+
+    when = _format_game_when(game)
+    is_training = (game.get("event_type") or "game") == "training"
+    event_word = "тренировку" if is_training else "игру"
+    title_bit = ""
+    if is_training and game.get("title"):
+        title_bit = f" «{_html(game['title'])}»"
+    actor_name = actor.get("name") or "Игрок"
+    actor_uname = username if username is not None else actor.get("telegram_username")
+    who = _player_label(actor_name, actor_uname)
+    slots = max(1, int(slots or 1))
+    slots_word = "место" if slots == 1 else "места" if slots < 5 else "мест"
+    location = _html(game.get("location") or "—")
+
+    if action == "join":
+        text = (
+            f"👥 На {event_word}{title_bit} <b>{_html(when)}</b> записался {who}.\n"
+            f"Выкуплено мест: <b>{slots}</b> {slots_word}\n"
+            f"📍 {location}"
+        )
+    elif action == "buy_more":
+        text = (
+            f"👥 {who} докупил места на {event_word}{title_bit} <b>{_html(when)}</b>.\n"
+            f"Добавлено мест: <b>{slots}</b> {slots_word}\n"
+            f"📍 {location}"
+        )
+    elif action == "cancel":
+        text = (
+            f"❌ {who} отменил запись на {event_word}{title_bit} <b>{_html(when)}</b>.\n"
+            f"Освободилось мест: <b>{slots}</b> {slots_word}\n"
+            f"📍 {location}"
+        )
+    else:
+        return
+
+    sends = []
+    recipients = []
+    for mate in mates:
+        tid = mate.get("telegram_id")
+        if not tid:
+            continue
+        recipients.append(tid)
+        sends.append(bot.send_message(int(tid), text, parse_mode="HTML"))
+    if not sends:
+        return
+    results = await asyncio.gather(*sends, return_exceptions=True)
+    for tid, result in zip(recipients, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "Не удалось уведомить игрока %s об %s на игре #%s: %s",
+                tid, action, game_id, result,
+            )
 
 
 async def _notify_admin_new_booking(
@@ -1727,7 +1843,9 @@ async def process_booking_confirm(callback: CallbackQuery):
 
 
 async def _do_booking_confirm(callback: CallbackQuery) -> None:
-    user = await _require_registered(callback.from_user.id)
+    user = await _require_registered(
+        callback.from_user.id, username=callback.from_user.username,
+    )
     if not user:
         await callback.message.answer(
             "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
@@ -1957,7 +2075,9 @@ async def process_buy_more_confirm(callback: CallbackQuery):
 
 
 async def _do_buy_more_confirm(callback: CallbackQuery) -> None:
-    user = await _require_registered(callback.from_user.id)
+    user = await _require_registered(
+        callback.from_user.id, username=callback.from_user.username,
+    )
     if not user:
         await callback.message.answer(
             "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
@@ -2387,7 +2507,9 @@ async def process_pay_cancel_no(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pay_cancel_yes:"))
 async def process_pay_cancel_yes(callback: CallbackQuery):
     await callback.answer("Отменяю…")
-    user = await _require_registered(callback.from_user.id)
+    user = await _require_registered(
+        callback.from_user.id, username=callback.from_user.username,
+    )
     if not user:
         await callback.message.answer(
             "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
@@ -2469,6 +2591,17 @@ async def process_pay_cancel_yes(callback: CallbackQuery):
         await callback.message.answer(
             "Запись отменена. Если передумаешь — загляни в «🎾 Игры».",
             reply_markup=main_menu_keyboard(),
+        )
+
+    if result.get("game") and result.get("had_payment"):
+        _fire_and_forget(
+            _notify_game_mates(
+                callback.bot, result["game"], user,
+                action="cancel",
+                slots=int(result.get("slots_cancelled") or 1),
+                username=callback.from_user.username,
+            ),
+            name=f"mates_cancel_pay:{booking_id}",
         )
 
 
@@ -2729,7 +2862,9 @@ async def process_cancel_no(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("cancel_yes:"))
 async def process_cancel_yes(callback: CallbackQuery):
     await callback.answer("Отменяю…")
-    user = await _require_registered(callback.from_user.id)
+    user = await _require_registered(
+        callback.from_user.id, username=callback.from_user.username,
+    )
     if not user:
         await callback.message.answer(
             "❌ Сначала заполни анкету.\nОтправь команду /start для регистрации.",
@@ -2795,6 +2930,17 @@ async def process_cancel_yes(callback: CallbackQuery):
         await callback.message.answer(
             "Запись отменена. Если передумаешь — загляни в «🎾 Игры».",
             reply_markup=main_menu_keyboard(),
+        )
+
+    if result.get("game") and result.get("had_payment"):
+        _fire_and_forget(
+            _notify_game_mates(
+                callback.bot, result["game"], user,
+                action="cancel",
+                slots=int(result.get("slots_cancelled") or 1),
+                username=callback.from_user.username,
+            ),
+            name=f"mates_cancel:{booking_id}",
         )
 
 
